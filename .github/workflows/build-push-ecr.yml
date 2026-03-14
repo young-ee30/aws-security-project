@@ -1,0 +1,405 @@
+name: Build & Deploy to ECS
+
+# =============================================================
+# 앱 자동 배포 파이프라인
+#
+# 흐름:
+#   services 코드 수정
+#   → git push to main
+#   → 변경된 서비스만 자동 감지
+#   → Docker build (linux/amd64)
+#   → ECR push (git SHA 태그 + latest)
+#   → AWS에서 현재 Task Definition 다운로드
+#   → 이미지 URI만 교체 (환경변수/시크릿/로그설정 유지)
+#   → 새 Task Definition 등록
+#   → ECS Service 롤링 배포
+#   → 서비스 안정화 대기
+#
+# ECS 리소스 이름 (terraform name_prefix = "devsecops-dev"):
+#   cluster:        devsecops-dev-cluster
+#   service:        devsecops-dev-{service}  (e.g. devsecops-dev-api-node)
+#   task-def:       devsecops-dev-{service}
+#   container:      {service}                (e.g. api-node)
+#   ecr-repo:       devsecops-dev/{service}
+#
+# 필요한 GitHub Secrets:
+#   AWS_ROLE_ARN  - ECR + ECS 권한을 가진 IAM Role ARN
+# =============================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/ecommerce-app-node/**"
+      - "services/ecommerce-app-fastapi/**"
+      - "services/ecommerce-app-spring/**"
+      - "services/frontend/**"
+
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "배포할 서비스"
+        required: true
+        type: choice
+        options:
+          - api-node
+          - api-python
+          - api-spring
+          - frontend
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_PREFIX: devsecops-dev
+  CLUSTER: devsecops-dev-cluster
+
+# =============================================================
+# JOB 1: 변경된 서비스 감지
+# =============================================================
+jobs:
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      api-node: ${{ steps.filter.outputs.api-node }}
+      api-python: ${{ steps.filter.outputs.api-python }}
+      api-spring: ${{ steps.filter.outputs.api-spring }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changed paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api-node:
+              - 'services/ecommerce-app-node/**'
+            api-python:
+              - 'services/ecommerce-app-fastapi/**'
+            api-spring:
+              - 'services/ecommerce-app-spring/**'
+            frontend:
+              - 'services/frontend/**'
+
+  # =============================================================
+  # JOB 2: api-node 빌드 & ECS 배포
+  # =============================================================
+  deploy-api-node:
+    name: "Deploy api-node"
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && needs.detect-changes.outputs.api-node == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.service == 'api-node')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      SERVICE_NAME: api-node
+      DOCKERFILE_PATH: services/ecommerce-app-node/api-server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # OIDC 인증
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ECR 로그인
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Docker 빌드 & ECR push (git SHA + latest 두 태그)
+      - name: Build & Push to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="${ECR_REGISTRY}/${{ env.ECR_PREFIX }}/${{ env.SERVICE_NAME }}"
+
+          docker build \
+            --platform linux/amd64 \
+            -t "${REPO}:${IMAGE_TAG}" \
+            ${{ env.DOCKERFILE_PATH }}
+
+          docker tag "${REPO}:${IMAGE_TAG}" "${REPO}:latest"
+
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:latest"
+
+          echo "image=${REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "✅ ECR push 완료: ${REPO}:${IMAGE_TAG}"
+
+      # 현재 Task Definition 다운로드 (환경변수/시크릿/로그설정 보존)
+      - name: Download current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }} \
+            --query taskDefinition \
+            --region ${{ env.AWS_REGION }} \
+            > task-definition.json
+          echo "✅ Task Definition 다운로드 완료"
+
+      # 이미지 URI만 교체 (나머지 설정은 AWS가 source of truth)
+      - name: Render new Task Definition (image URI 교체)
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.SERVICE_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # ECS Service 롤링 배포 + 안정화 대기
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deploy complete
+        run: |
+          echo "============================================="
+          echo "  ✅ ${{ env.SERVICE_NAME }} 배포 완료"
+          echo "  이미지: ${{ steps.build-image.outputs.image }}"
+          echo "============================================="
+
+  # =============================================================
+  # JOB 3: api-python 빌드 & ECS 배포
+  # =============================================================
+  deploy-api-python:
+    name: "Deploy api-python"
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && needs.detect-changes.outputs.api-python == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.service == 'api-python')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      SERVICE_NAME: api-python
+      DOCKERFILE_PATH: services/ecommerce-app-fastapi/api-server-fastapi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check Dockerfile
+        run: |
+          if [ ! -f "${{ env.DOCKERFILE_PATH }}/Dockerfile" ]; then
+            echo "❌ Dockerfile 없음: ${{ env.DOCKERFILE_PATH }}/Dockerfile"
+            exit 1
+          fi
+
+      - name: Build & Push to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="${ECR_REGISTRY}/${{ env.ECR_PREFIX }}/${{ env.SERVICE_NAME }}"
+          docker build --platform linux/amd64 -t "${REPO}:${IMAGE_TAG}" ${{ env.DOCKERFILE_PATH }}
+          docker tag "${REPO}:${IMAGE_TAG}" "${REPO}:latest"
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:latest"
+          echo "image=${REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Download current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }} \
+            --query taskDefinition \
+            --region ${{ env.AWS_REGION }} \
+            > task-definition.json
+
+      - name: Render new Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.SERVICE_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER }}
+          wait-for-service-stability: true
+
+  # =============================================================
+  # JOB 4: api-spring 빌드 & ECS 배포
+  # =============================================================
+  deploy-api-spring:
+    name: "Deploy api-spring"
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && needs.detect-changes.outputs.api-spring == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.service == 'api-spring')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      SERVICE_NAME: api-spring
+      DOCKERFILE_PATH: services/ecommerce-app-spring/api-server-spring
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check Dockerfile
+        run: |
+          if [ ! -f "${{ env.DOCKERFILE_PATH }}/Dockerfile" ]; then
+            echo "❌ Dockerfile 없음: ${{ env.DOCKERFILE_PATH }}/Dockerfile"
+            exit 1
+          fi
+
+      - name: Build & Push to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="${ECR_REGISTRY}/${{ env.ECR_PREFIX }}/${{ env.SERVICE_NAME }}"
+          docker build --platform linux/amd64 -t "${REPO}:${IMAGE_TAG}" ${{ env.DOCKERFILE_PATH }}
+          docker tag "${REPO}:${IMAGE_TAG}" "${REPO}:latest"
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:latest"
+          echo "image=${REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Download current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }} \
+            --query taskDefinition \
+            --region ${{ env.AWS_REGION }} \
+            > task-definition.json
+
+      - name: Render new Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.SERVICE_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER }}
+          wait-for-service-stability: true
+
+  # =============================================================
+  # JOB 5: frontend 빌드 & ECS 배포
+  # =============================================================
+  deploy-frontend:
+    name: "Deploy frontend"
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && needs.detect-changes.outputs.frontend == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.service == 'frontend')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      SERVICE_NAME: frontend
+      DOCKERFILE_PATH: services/frontend/ecommerce-app-frontend/frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check Dockerfile
+        run: |
+          if [ ! -f "${{ env.DOCKERFILE_PATH }}/Dockerfile" ]; then
+            echo "❌ Dockerfile 없음: ${{ env.DOCKERFILE_PATH }}/Dockerfile"
+            exit 1
+          fi
+
+      - name: Build & Push to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="${ECR_REGISTRY}/${{ env.ECR_PREFIX }}/${{ env.SERVICE_NAME }}"
+          docker build --platform linux/amd64 -t "${REPO}:${IMAGE_TAG}" ${{ env.DOCKERFILE_PATH }}
+          docker tag "${REPO}:${IMAGE_TAG}" "${REPO}:latest"
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:latest"
+          echo "image=${REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Download current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }} \
+            --query taskDefinition \
+            --region ${{ env.AWS_REGION }} \
+            > task-definition.json
+
+      - name: Render new Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.SERVICE_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECR_PREFIX }}-${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER }}
+          wait-for-service-stability: true

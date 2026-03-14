@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.6.0"
+  required_version = ">= 1.10.0" # S3 native lockfile 지원 최소 버전
 
   required_providers {
     aws = {

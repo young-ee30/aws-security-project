@@ -43,11 +43,15 @@ resource "aws_security_group" "ecs_service" {
   description = "ECS service security group"
   vpc_id      = var.vpc_id
 
-  ingress {
-    from_port       = var.app_port
-    to_port         = var.app_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+  # 서비스별 포트마다 ALB → ECS 인바운드 허용
+  dynamic "ingress" {
+    for_each = var.app_ports
+    content {
+      from_port       = ingress.value
+      to_port         = ingress.value
+      protocol        = "tcp"
+      security_groups = [aws_security_group.alb.id]
+    }
   }
 
   egress {

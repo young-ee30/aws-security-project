@@ -1,0 +1,203 @@
+name: Terraform CI/CD
+
+# =============================================================
+# 인프라 자동 배포 파이프라인
+#
+# 트리거:
+#   - PR to main   (terraform/** 변경)  → plan 만 실행 (안전 확인용)
+#   - push to main (terraform/** 변경)  → plan + apply 자동 실행
+#   - workflow_dispatch                 → 수동 실행 (plan/apply/destroy 선택)
+#
+# S3 State 흐름:
+#   bootstrap S3 버킷 생성 (최초 1회, 로컬)
+#     → TF_STATE_BUCKET secret 등록
+#     → CI 실행 시 backend.hcl 동적 생성
+#     → terraform init -backend-config=backend.hcl
+#     → S3에서 현재 state 읽기
+#     → plan/apply 실행
+#     → S3에 state 업데이트
+#
+# 필요한 GitHub Secrets:
+#   AWS_ROLE_ARN_TERRAFORM  - Terraform 전용 IAM Role ARN
+#   TF_STATE_BUCKET         - bootstrap으로 생성된 S3 버킷 이름
+# =============================================================
+
+on:
+  # PR: plan 만 실행 (변경 미리보기)
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+  # main 머지: plan + apply 자동 실행
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+  # 수동 실행 (destroy 등 특수 작업)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "실행할 작업"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+      environment:
+        description: "대상 환경"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+        default: dev
+
+env:
+  AWS_REGION: ap-northeast-2
+  TF_VERSION: "1.10.0"
+  # push/PR 시 기본 환경 = dev
+  TF_ENV: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  terraform:
+    name: >-
+      Terraform
+      ${{ github.event_name == 'pull_request' && 'Plan (PR)' || '' }}
+      ${{ github.event_name == 'push' && 'Plan + Apply' || '' }}
+      ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action || '' }}
+      (${{ github.event.inputs.environment || 'dev' }})
+
+    runs-on: ubuntu-latest
+
+    # OIDC 인증에 필요한 권한
+    permissions:
+      id-token: write   # OIDC 토큰 발행
+      contents: read    # 코드 체크아웃
+      pull-requests: write  # PR에 plan 결과 코멘트
+
+    defaults:
+      run:
+        working-directory: terraform/envs/${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. 코드 체크아웃
+      # ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────
+      # 2. OIDC 인증 (Access Key 없음)
+      # ─────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_TERRAFORM }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ─────────────────────────────────────────────
+      # 3. Terraform 설치 (>= 1.10.0: S3 native lockfile)
+      # ─────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ─────────────────────────────────────────────
+      # 4. backend.hcl 동적 생성
+      #    S3 버킷 이름은 .gitignore 되어 있어서
+      #    GitHub Secret(TF_STATE_BUCKET)에서 읽어서 생성
+      # ─────────────────────────────────────────────
+      - name: Create backend.hcl
+        run: |
+          cat > backend.hcl << 'EOF'
+          bucket = "${{ secrets.TF_STATE_BUCKET }}"
+          EOF
+          echo "✅ backend.hcl 생성: bucket = ${{ secrets.TF_STATE_BUCKET }}"
+
+      # ─────────────────────────────────────────────
+      # 5. terraform init
+      #    S3에서 현재 state를 읽어서 로컬에 캐싱
+      # ─────────────────────────────────────────────
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config=backend.hcl \
+            -reconfigure
+          echo "✅ S3 state 연결 완료 (bucket: ${{ secrets.TF_STATE_BUCKET }})"
+
+      # ─────────────────────────────────────────────
+      # 6. terraform plan
+      #    현재 S3 state와 코드 diff 계산
+      # ─────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "destroy" ]; then
+            terraform plan -input=false -destroy -out=tfplan -no-color 2>&1 | tee plan_output.txt
+          else
+            terraform plan -input=false -out=tfplan -no-color 2>&1 | tee plan_output.txt
+          fi
+
+      # ─────────────────────────────────────────────
+      # 7. PR에 plan 결과 코멘트 (PR 이벤트일 때만)
+      # ─────────────────────────────────────────────
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('terraform/envs/${{ env.TF_ENV }}/plan_output.txt', 'utf8');
+            const truncated = output.length > 60000
+              ? output.substring(0, 60000) + '\n... (출력 너무 길어서 잘림)'
+              : output;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan 결과 (dev)\n\`\`\`\n${truncated}\n\`\`\``
+            });
+
+      # ─────────────────────────────────────────────
+      # 8-A. terraform apply
+      #   - push to main: 자동 실행
+      #   - workflow_dispatch + action=apply: 수동 실행
+      # ─────────────────────────────────────────────
+      - name: Terraform Apply
+        if: |
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          terraform apply -input=false -auto-approve tfplan
+          echo ""
+          echo "============================================="
+          echo "  ✅ Terraform Apply 완료"
+          echo "  S3 state 업데이트됨: ${{ secrets.TF_STATE_BUCKET }}"
+          echo "============================================="
+
+      # ─────────────────────────────────────────────
+      # 8-B. terraform destroy (수동 실행 전용)
+      # ─────────────────────────────────────────────
+      - name: Terraform Destroy
+        if: |
+          github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          terraform destroy -input=false -auto-approve
+          echo "✅ 인프라 삭제 완료"
+
+      # ─────────────────────────────────────────────
+      # 9. apply 후 주요 output 출력
+      # ─────────────────────────────────────────────
+      - name: Terraform Output
+        if: |
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          echo "=== Terraform Outputs ==="
+          terraform output -no-color || true

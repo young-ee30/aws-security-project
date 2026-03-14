@@ -35,14 +35,18 @@ module "security" {
   source      = "../../modules/security"
   name_prefix = var.name_prefix
   vpc_id      = module.network.vpc_id
-  app_port    = 3000
-  tags        = var.tags
+  # 전체 서비스 포트 목록 (ALB → ECS 인바운드 허용)
+  # frontend:80, api-node:5000, api-python:8000, api-spring:8080
+  app_ports = [80, 5000, 8000, 8080]
+  tags      = var.tags
 }
 
 module "ecr" {
   source       = "../../modules/ecr"
   name_prefix  = var.name_prefix
   repositories = var.ecr_repositories
+  # dev: 이미지가 있어도 terraform destroy 가능하게 설정
+  force_delete = true
   tags         = var.tags
 }
 
