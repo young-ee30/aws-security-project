@@ -144,12 +144,9 @@ terraform apply (로컬 또는 GitHub Actions)
    → amazon-ecs-deploy-task-definition action 사용
 7. 새 태스크가 안정화될 때까지 대기
 ```
-
-**4~6번이 중요한 이유**: Task Definition에는 이미지 URI 외에도 환경변수, 시크릿, 로그 설정 등 많은 값이 있습니다. 새로 만들면 이 값들이 초기화될 수 있습니다. 그래서 **AWS에 있는 현재 Task Definition을 가져와서 이미지 URI만 바꾸는 방식**을 씁니다. AWS가 source of truth입니다.
-
 ---
 
-## 6. Terraform이 만드는 것 vs GitHub Actions가 하는 것
+## 5. Terraform이 만드는 것 vs GitHub Actions가 하는 것
 
 | 역할 | 담당 |
 |---|---|
@@ -166,7 +163,7 @@ terraform apply (로컬 또는 GitHub Actions)
 
 ---
 
-## 7. dev 환경과 prod 환경의 차이
+## 6. dev 환경과 prod 환경의 차이
 
 ### 왜 나눴는가
 
@@ -216,7 +213,7 @@ jobs:
 
 ---
 
-## 8. 새 서비스 추가할 때 해야 하는 것
+## 7. 새 서비스 추가할 때 해야 하는 것
 
 예: `api-python` 서비스를 실제로 배포하고 싶을 때
 
@@ -239,7 +236,7 @@ GitHub Actions `build-push-ecr.yml`이 트리거되어 이미지를 빌드하고
 
 ---
 
-## 9. OIDC 인증 설정 (현재 미완 - 해야 할 것)
+## 8. OIDC 인증 설정 (현재 미완 - 해야 할 것)
 
 GitHub Actions에서 AWS에 접근할 때 Access Key 대신 OIDC(OpenID Connect)를 사용합니다. 키를 GitHub에 저장하지 않아도 되므로 유출 위험이 없습니다.
 
@@ -296,7 +293,7 @@ GitHub Actions 실행
 
 ---
 
-## 10. GitHub Secrets 등록
+## 9. GitHub Secrets 등록
 
 레포 → Settings → Secrets and variables → Actions → New repository secret
 
@@ -311,7 +308,7 @@ GitHub Actions 실행
 
 ---
 
-## 11. 현재 서비스 상태
+## 10. 현재 서비스 상태
 
 | 서비스 | ECS desired_count | 이미지 | 포트 | 헬스체크 |
 |---|---|---|---|---|
@@ -322,7 +319,7 @@ GitHub Actions 실행
 
 ---
 
-## 12. 테스트 순서 (OIDC 설정 완료 후)
+## 11. 테스트 순서 (OIDC 설정 완료 후)
 
 ```
 1. services/ecommerce-app-node/ 파일 아무거나 수정
@@ -342,7 +339,7 @@ GitHub Actions 실행
 
 ---
 
-## 13. 문제 발생 시
+## 12. 문제 발생 시
 
 | 증상 | 원인 | 해결 |
 |---|---|---|
