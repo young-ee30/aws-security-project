@@ -131,42 +131,6 @@ terraform apply (로컬 또는 GitHub Actions)
 
 ---
 
-## 5. GitHub Actions 워크플로우 동작 원리
-
-### terraform.yml - 인프라 변경 자동화
-
-**언제 실행되는가:**
-
-| 이벤트 | 동작 |
-|---|---|
-| `terraform/**` 경로 PR 생성 | plan만 실행 → PR에 결과 코멘트 |
-| `terraform/**` 경로 main push | plan + apply 자동 실행 |
-| 수동 실행 (Actions 탭) | plan / apply / destroy 선택 가능 |
-
-**실행 순서:**
-```
-1. OIDC 인증 (AWS 임시 자격증명 발급)
-2. backend.hcl 동적 생성 (TF_STATE_BUCKET secret 사용)
-3. terraform init -backend-config=backend.hcl
-   → S3에서 현재 state 로드
-4. terraform plan (변경사항 미리보기)
-5. terraform apply (실제 인프라 변경)
-   → S3 state 업데이트
-```
-
----
-
-### build-push-ecr.yml - 앱 배포 자동화
-
-**언제 실행되는가:** `services/**` 경로에 main push가 발생할 때
-
-**어떤 서비스가 변경됐는지 감지 (`dorny/paths-filter`)**:
-```
-services/ecommerce-app-node/ 변경 → api-node 잡만 실행
-services/ecommerce-app-python/ 변경 → api-python 잡만 실행
-(변경 없는 서비스는 스킵)
-```
-
 **각 서비스 배포 순서:**
 ```
 1. OIDC 인증
