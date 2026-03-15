@@ -163,6 +163,6 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 .terraform.tfstate.lock.info
-
-#GEMINI
-GEMINI.md
+# backend.hcl: 버킷 이름이 담긴 파일, setup.sh가 자동 생성 (커밋 금지)
+backend.hcl
+*.tflock
