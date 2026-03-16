@@ -152,9 +152,21 @@ cleanup_orphan_efs() {
       --region "${aws_region}" \
       --file-system-id "${fs_id}"
 
-    aws efs wait file-system-deleted \
-      --region "${aws_region}" \
-      --file-system-id "${fs_id}"
+    while true; do
+      file_system_state="$(
+        aws efs describe-file-systems \
+          --region "${aws_region}" \
+          --file-system-id "${fs_id}" \
+          --query 'FileSystems[0].LifeCycleState' \
+          --output text 2>/dev/null || true
+      )"
+
+      if [ -z "${file_system_state}" ] || [ "${file_system_state}" = "None" ]; then
+        break
+      fi
+
+      sleep 10
+    done
   done
 }
 

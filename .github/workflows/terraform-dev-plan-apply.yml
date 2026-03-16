@@ -307,9 +307,21 @@ jobs:
               --region "${{ env.AWS_REGION }}" \
               --file-system-id "${FS_ID}"
 
-            aws efs wait file-system-deleted \
-              --region "${{ env.AWS_REGION }}" \
-              --file-system-id "${FS_ID}"
+            while true; do
+              FILE_SYSTEM_STATE=$(
+                aws efs describe-file-systems \
+                  --region "${{ env.AWS_REGION }}" \
+                  --file-system-id "${FS_ID}" \
+                  --query 'FileSystems[0].LifeCycleState' \
+                  --output text 2>/dev/null || true
+              )
+
+              if [ -z "${FILE_SYSTEM_STATE}" ] || [ "${FILE_SYSTEM_STATE}" = "None" ]; then
+                break
+              fi
+
+              sleep 10
+            done
           done
 
       - name: Terraform Apply
