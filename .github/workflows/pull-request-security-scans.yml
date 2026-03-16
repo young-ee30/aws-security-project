@@ -1,0 +1,76 @@
+name: Pull Request Security Scans
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # 1. Gitleaks - 하드코딩된 시크릿 탐지
+  secret-scan:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 전체 히스토리 스캔
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 2. Trivy IaC - Terraform 설정 오류 및 시크릿 스캔
+  trivy-iac-scan:
+    name: Trivy IaC Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in IaC mode
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          hide-progress: false
+          format: 'table'
+          exit-code: '1' # 취약점 발견 시 빌드 실패
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+  # 3. Trivy SCA - 라이브러리/의존성 패키지 취약점 스캔
+  trivy-sca-scan:
+    name: Trivy SCA Scan (Node.js)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in fs mode
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './services/ecommerce-app-node'
+          hide-progress: false
+          format: 'table'
+          exit-code: '1' # 취약점 발견 시 빌드 실패
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+  # 4. Checkov - Terraform 심화 설정 오류 탐지
+  checkov-scan:
+    name: Checkov IaC Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov action
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: cli
+          soft_fail: true # 경고성 이슈로 빌드가 실패하지 않도록 설정 (필요시 false)

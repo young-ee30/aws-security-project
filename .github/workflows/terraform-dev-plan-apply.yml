@@ -1,0 +1,157 @@
+name: Terraform Dev Plan and Apply
+
+on:
+  workflow_run:
+    workflows: ["Bootstrap Terraform State"]
+    types: [completed]
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-2
+  TF_VERSION: "1.11.0"
+  TF_WORKING_DIR: terraform/envs/dev
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan & Security Scan
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check state bucket variable
+        run: |
+          if [ -z "${{ vars.TF_STATE_BUCKET }}" ]; then
+            echo "TF_STATE_BUCKET repository variable is not set."
+            echo "Run the bootstrap-terraform-state.yml workflow first."
+            exit 1
+          fi
+
+      - name: Check Terraform secrets
+        run: |
+          if [ -z "$TF_VAR_db_password" ]; then
+            echo "TF_VAR_DB_PASSWORD repository secret is not set."
+            exit 1
+          fi
+
+      - name: Create backend config
+        run: |
+          cat > backend.hcl << EOF
+          bucket         = "${{ vars.TF_STATE_BUCKET }}"
+          region         = "${{ env.AWS_REGION }}"
+          encrypt        = true
+          EOF
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive ../../
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Checkov IaC Scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: cli
+          soft_fail: true
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check state bucket variable
+        run: |
+          if [ -z "${{ vars.TF_STATE_BUCKET }}" ]; then
+            echo "TF_STATE_BUCKET repository variable is not set."
+            echo "Run the bootstrap-terraform-state.yml workflow first."
+            exit 1
+          fi
+
+      - name: Check Terraform secrets
+        run: |
+          if [ -z "$TF_VAR_db_password" ]; then
+            echo "TF_VAR_DB_PASSWORD repository secret is not set."
+            exit 1
+          fi
+
+      - name: Create backend config
+        run: |
+          cat > backend.hcl << EOF
+          bucket         = "${{ vars.TF_STATE_BUCKET }}"
+          region         = "${{ env.AWS_REGION }}"
+          encrypt        = true
+          EOF
+
+      - name: Terraform Init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color

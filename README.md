@@ -5,10 +5,14 @@ my-devsecops-platform/
 │
 ├── .github/                        # GitHub Actions CI/CD 자동화
 │   └── workflows/
-│       ├── build-push-ecr.yml      # 서비스 코드 변경 시 자동 실행
+│       ├── bootstrap-terraform-state.yml
+│       │                           # Terraform state S3 버킷 1회 생성/재사용
+│       ├── deploy-node-api-ecs.yml # 서비스 코드 변경 시 자동 실행
 │       │                           # Docker 빌드 → ECR push → ECS 롤링 배포
-│       └── terraform.yml           # 인프라 코드 변경 시 자동 실행
-│                                   # PR → plan 결과 코멘트 / main push → apply
+│       ├── terraform-dev-plan-apply.yml
+│       │                           # bootstrap 이후 Terraform dev 인프라 적용
+│       └── pull-request-security-scans.yml
+│                                   # PR 보안 스캔 전용
 │
 ├── services/                       # 배포 대상 애플리케이션
 │   ├── ecommerce-app-node/         # Node.js 백엔드 (현재 배포 중, port 5000)

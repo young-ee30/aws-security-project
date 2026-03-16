@@ -1,0 +1,130 @@
+name: Bootstrap Terraform State
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "services/ecommerce-app-node/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: AWS region for the Terraform state bucket
+        required: true
+        default: ap-northeast-2
+      project_name:
+        description: Prefix used when naming the Terraform state bucket
+        required: true
+        default: devsecops
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+env:
+  TF_VERSION: "1.11.0"
+  DEFAULT_AWS_REGION: ap-northeast-2
+  DEFAULT_PROJECT_NAME: devsecops
+
+jobs:
+  bootstrap-state:
+    name: Create or Reuse Terraform State Bucket
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/bootstrap
+    env:
+      EXISTING_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region || env.DEFAULT_AWS_REGION }}
+
+      - name: Reuse existing state bucket if configured
+        id: existing
+        shell: bash
+        run: |
+          if [ -z "$EXISTING_STATE_BUCKET" ]; then
+            echo "bucket_name=" >> "$GITHUB_OUTPUT"
+            echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if aws s3api head-bucket --bucket "$EXISTING_STATE_BUCKET" >/dev/null 2>&1; then
+            echo "bucket_name=$EXISTING_STATE_BUCKET" >> "$GITHUB_OUTPUT"
+            echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "TF_STATE_BUCKET is set to '$EXISTING_STATE_BUCKET', but the bucket does not exist." >&2
+          exit 1
+
+      - name: Setup Terraform
+        if: steps.existing.outputs.needs_bootstrap == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        if: steps.existing.outputs.needs_bootstrap == 'true'
+        run: terraform init
+
+      - name: Terraform Apply
+        if: steps.existing.outputs.needs_bootstrap == 'true'
+        run: >
+          terraform apply -auto-approve -input=false
+          -var="aws_region=${{ inputs.aws_region || env.DEFAULT_AWS_REGION }}"
+          -var="project_name=${{ inputs.project_name || env.DEFAULT_PROJECT_NAME }}"
+
+      - name: Capture created bucket name
+        if: steps.existing.outputs.needs_bootstrap == 'true'
+        id: created
+        shell: bash
+        run: |
+          echo "bucket_name=$(terraform output -raw s3_bucket_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve state bucket name
+        id: resolved
+        shell: bash
+        run: |
+          if [ -n "${{ steps.existing.outputs.bucket_name }}" ]; then
+            echo "bucket_name=${{ steps.existing.outputs.bucket_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "bucket_name=${{ steps.created.outputs.bucket_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save repository variable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BUCKET: ${{ steps.resolved.outputs.bucket_name }}
+        shell: bash
+        run: |
+          gh variable set TF_STATE_BUCKET --repo "${{ github.repository }}" --body "$STATE_BUCKET"
+          echo "Saved TF_STATE_BUCKET=$STATE_BUCKET"
+
+      - name: Write workflow summary
+        env:
+          STATE_BUCKET: ${{ steps.resolved.outputs.bucket_name }}
+          NEEDS_BOOTSTRAP: ${{ steps.existing.outputs.needs_bootstrap }}
+        shell: bash
+        run: |
+          {
+            echo "## Terraform state bootstrap"
+            echo ""
+            echo "- Bucket: \`$STATE_BUCKET\`"
+            if [ "$NEEDS_BOOTSTRAP" = "true" ]; then
+              echo "- Result: created a new S3 state bucket."
+            else
+              echo "- Result: reused the existing S3 state bucket."
+            fi
+            echo "- Repository variable updated: \`TF_STATE_BUCKET\`"
+            echo "- Next step: run \`terraform-dev-plan-apply.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
