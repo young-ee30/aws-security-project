@@ -21,7 +21,6 @@ on:
 permissions:
   id-token: write
   contents: read
-  actions: write
 
 env:
   TF_VERSION: "1.11.0"
@@ -101,15 +100,6 @@ jobs:
             echo "bucket_name=${{ steps.created.outputs.bucket_name }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Save repository variable
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STATE_BUCKET: ${{ steps.resolved.outputs.bucket_name }}
-        shell: bash
-        run: |
-          gh variable set TF_STATE_BUCKET --repo "${{ github.repository }}" --body "$STATE_BUCKET"
-          echo "Saved TF_STATE_BUCKET=$STATE_BUCKET"
-
       - name: Write workflow summary
         env:
           STATE_BUCKET: ${{ steps.resolved.outputs.bucket_name }}
@@ -125,6 +115,6 @@ jobs:
             else
               echo "- Result: reused the existing S3 state bucket."
             fi
-            echo "- Repository variable updated: \`TF_STATE_BUCKET\`"
+            echo "- Downstream Terraform workflow can still discover this bucket automatically."
             echo "- Next step: run \`terraform-dev-plan-apply.yml\`."
           } >> "$GITHUB_STEP_SUMMARY"

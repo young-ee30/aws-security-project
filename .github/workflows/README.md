@@ -29,7 +29,7 @@
 
 1. Terraform state 저장용 S3 버킷이 있는지 확인합니다.
 2. 없으면 만들고, 있으면 재사용합니다.
-3. 버킷 이름을 GitHub repository variable `TF_STATE_BUCKET`에 저장합니다.
+3. 다음 Terraform 워크플로우가 S3에서 state bucket을 자동 탐색합니다.
 4. `terraform/envs/dev` 기준으로 `terraform fmt`, `init`, `validate`, `plan`, `apply`를 실행합니다.
 5. Terraform 적용이 성공하면 Node API Docker 이미지를 빌드합니다.
 6. 이미지를 ECR에 push합니다.
@@ -52,7 +52,7 @@
 - AWS OIDC 인증
 - 기존 state 버킷 존재 여부 확인
 - 필요 시 `terraform/bootstrap` 실행
-- `TF_STATE_BUCKET` repository variable 저장
+- 다음 Terraform 워크플로우가 쓸 수 있도록 버킷 이름 출력
 
 필요한 값:
 - GitHub Secret: `AWS_ROLE_ARN`
@@ -70,6 +70,7 @@
 주요 동작:
 - AWS OIDC 인증
 - `TF_STATE_BUCKET` 변수 확인
+- `TF_STATE_BUCKET`이 없으면 S3에서 state bucket 자동 탐색
 - `TF_VAR_DB_PASSWORD` secret 확인
 - `backend.hcl` 생성
 - `terraform fmt`
@@ -82,12 +83,14 @@
 필요한 값:
 - GitHub Secret: `AWS_ROLE_ARN`
 - GitHub Secret: `TF_VAR_DB_PASSWORD`
-- GitHub Variable: `TF_STATE_BUCKET`
+- GitHub Variable: `TF_STATE_BUCKET` (선택)
 
 중요:
 - `TF_VAR_DB_PASSWORD`는 GitHub repository secret 이름입니다.
 - 워크플로우 안에서는 이 값을 `TF_VAR_db_password` 환경변수로 매핑합니다.
 - Terraform은 `TF_VAR_<변수명>` 규칙에 따라 이를 자동으로 `var.db_password`로 읽습니다.
+- `TF_STATE_BUCKET` repository variable이 없어도, `devsecops-tfstate-` prefix로 S3 버킷을 자동 찾도록 되어 있습니다.
+- 버킷이 여러 개면 어떤 버킷을 써야 할지 애매하므로, 그 경우에는 `TF_STATE_BUCKET`을 수동으로 지정해야 합니다.
 
 ### `deploy-node-api-ecs.yml`
 
@@ -148,8 +151,9 @@
   Terraform state 저장용 S3 버킷 이름
 
 설명:
-- `TF_STATE_BUCKET`은 처음부터 직접 넣지 않아도 됩니다.
-- `bootstrap-terraform-state.yml`가 처음 실행되면 자동으로 저장합니다.
+- `TF_STATE_BUCKET`은 필수는 아닙니다.
+- 값이 없으면 Terraform 워크플로우가 `devsecops-tfstate-` prefix로 S3 버킷을 자동 찾습니다.
+- 같은 prefix 버킷이 여러 개일 때는 이 값을 수동으로 넣어 특정 버킷을 고정하면 됩니다.
 
 ## 4. 상황별로 어떻게 동작하나
 
@@ -184,7 +188,7 @@
 
 1. `AWS_ROLE_ARN` secret이 있는지
 2. `TF_VAR_DB_PASSWORD` secret이 있는지
-3. `TF_STATE_BUCKET` variable이 생성됐는지
+3. state bucket이 S3에 실제로 생성됐는지
 4. Terraform apply가 성공했는지
 5. ECS 서비스와 ECR 리포지토리 이름이 Terraform 값과 일치하는지
 

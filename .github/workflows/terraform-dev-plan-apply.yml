@@ -20,6 +20,7 @@ env:
   AWS_REGION: ap-northeast-2
   TF_VERSION: "1.11.0"
   TF_WORKING_DIR: terraform/envs/dev
+  DEFAULT_PROJECT_NAME: devsecops
 
 jobs:
   terraform-plan:
@@ -50,13 +51,33 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Check state bucket variable
+      - name: Resolve state bucket
+        id: state-bucket
+        shell: bash
         run: |
-          if [ -z "${{ vars.TF_STATE_BUCKET }}" ]; then
-            echo "TF_STATE_BUCKET repository variable is not set."
-            echo "Run the bootstrap-terraform-state.yml workflow first."
+          if [ -n "${{ vars.TF_STATE_BUCKET }}" ]; then
+            echo "bucket_name=${{ vars.TF_STATE_BUCKET }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREFIX="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-"
+          mapfile -t BUCKETS < <(aws s3api list-buckets \
+            --query "Buckets[?starts_with(Name, '${PREFIX}')].Name" \
+            --output text | tr '\t' '\n' | grep -v '^$')
+
+          if [ "${#BUCKETS[@]}" -eq 0 ]; then
+            echo "No Terraform state bucket found."
+            echo "Run bootstrap-terraform-state.yml first or set TF_STATE_BUCKET manually."
             exit 1
           fi
+
+          if [ "${#BUCKETS[@]}" -gt 1 ]; then
+            echo "Multiple Terraform state buckets found: ${BUCKETS[*]}"
+            echo "Set TF_STATE_BUCKET repository variable to select one explicitly."
+            exit 1
+          fi
+
+          echo "bucket_name=${BUCKETS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Check Terraform secrets
         run: |
@@ -68,7 +89,7 @@ jobs:
       - name: Create backend config
         run: |
           cat > backend.hcl << EOF
-          bucket         = "${{ vars.TF_STATE_BUCKET }}"
+          bucket         = "${{ steps.state-bucket.outputs.bucket_name }}"
           region         = "${{ env.AWS_REGION }}"
           encrypt        = true
           EOF
@@ -127,13 +148,33 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Check state bucket variable
+      - name: Resolve state bucket
+        id: state-bucket
+        shell: bash
         run: |
-          if [ -z "${{ vars.TF_STATE_BUCKET }}" ]; then
-            echo "TF_STATE_BUCKET repository variable is not set."
-            echo "Run the bootstrap-terraform-state.yml workflow first."
+          if [ -n "${{ vars.TF_STATE_BUCKET }}" ]; then
+            echo "bucket_name=${{ vars.TF_STATE_BUCKET }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREFIX="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-"
+          mapfile -t BUCKETS < <(aws s3api list-buckets \
+            --query "Buckets[?starts_with(Name, '${PREFIX}')].Name" \
+            --output text | tr '\t' '\n' | grep -v '^$')
+
+          if [ "${#BUCKETS[@]}" -eq 0 ]; then
+            echo "No Terraform state bucket found."
+            echo "Run bootstrap-terraform-state.yml first or set TF_STATE_BUCKET manually."
             exit 1
           fi
+
+          if [ "${#BUCKETS[@]}" -gt 1 ]; then
+            echo "Multiple Terraform state buckets found: ${BUCKETS[*]}"
+            echo "Set TF_STATE_BUCKET repository variable to select one explicitly."
+            exit 1
+          fi
+
+          echo "bucket_name=${BUCKETS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Check Terraform secrets
         run: |
@@ -145,7 +186,7 @@ jobs:
       - name: Create backend config
         run: |
           cat > backend.hcl << EOF
-          bucket         = "${{ vars.TF_STATE_BUCKET }}"
+          bucket         = "${{ steps.state-bucket.outputs.bucket_name }}"
           region         = "${{ env.AWS_REGION }}"
           encrypt        = true
           EOF
