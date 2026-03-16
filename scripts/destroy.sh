@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DEV_DIR="${PROJECT_ROOT}/terraform/envs/dev"
 BACKEND_HCL="${DEV_DIR}/backend.hcl"
+DEV_TFVARS="${DEV_DIR}/terraform.tfvars"
 STATE_KEY="dev/terraform.tfstate"
 STATE_BUCKET_PREFIX="devsecops-tfstate-"
 
@@ -73,6 +74,90 @@ resolve_state_bucket() {
     --output text
 }
 
+read_tfvars_value() {
+  local key="$1"
+
+  if [ ! -f "${DEV_TFVARS}" ]; then
+    echo ""
+    return 0
+  fi
+
+  sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\\(.*\\)\"/\\1/p" "${DEV_TFVARS}" | head -n 1
+}
+
+cleanup_orphan_efs() {
+  local aws_region="$1"
+  local name_prefix="$2"
+  local creation_token="${name_prefix}-efs"
+  local resource_address="module.storage.aws_efs_file_system.shared"
+
+  if terraform state list 2>/dev/null | grep -qx "${resource_address}"; then
+    echo "EFS is already tracked in Terraform state."
+    return 0
+  fi
+
+  mapfile -t file_system_ids < <(
+    aws efs describe-file-systems \
+      --region "${aws_region}" \
+      --query "FileSystems[?CreationToken=='${creation_token}'].FileSystemId" \
+      --output text | tr '\t' '\n' | grep -v '^$'
+  )
+
+  if [ "${#file_system_ids[@]}" -eq 0 ]; then
+    echo "No orphan EFS found for creation token: ${creation_token}"
+    return 0
+  fi
+
+  echo "Found orphan EFS resources for creation token '${creation_token}'."
+
+  local fs_id=""
+  local mount_target_id=""
+  local remaining_mount_targets=""
+
+  for fs_id in "${file_system_ids[@]}"; do
+    echo "Deleting mount targets for ${fs_id}..."
+
+    mapfile -t mount_target_ids < <(
+      aws efs describe-mount-targets \
+        --region "${aws_region}" \
+        --file-system-id "${fs_id}" \
+        --query 'MountTargets[].MountTargetId' \
+        --output text | tr '\t' '\n' | grep -v '^$'
+    )
+
+    for mount_target_id in "${mount_target_ids[@]}"; do
+      aws efs delete-mount-target \
+        --region "${aws_region}" \
+        --mount-target-id "${mount_target_id}"
+    done
+
+    while true; do
+      remaining_mount_targets="$(
+        aws efs describe-mount-targets \
+          --region "${aws_region}" \
+          --file-system-id "${fs_id}" \
+          --query 'MountTargets[].MountTargetId' \
+          --output text 2>/dev/null || true
+      )"
+
+      if [ -z "${remaining_mount_targets}" ] || [ "${remaining_mount_targets}" = "None" ]; then
+        break
+      fi
+
+      sleep 10
+    done
+
+    echo "Deleting orphan EFS ${fs_id}..."
+    aws efs delete-file-system \
+      --region "${aws_region}" \
+      --file-system-id "${fs_id}"
+
+    aws efs wait file-system-deleted \
+      --region "${aws_region}" \
+      --file-system-id "${fs_id}"
+  done
+}
+
 echo ""
 echo "========================================="
 echo "  Destroy Terraform Dev Resources"
@@ -102,6 +187,17 @@ if ! command -v terraform >/dev/null 2>&1; then
   exit 1
 fi
 
+AWS_REGION="$(read_tfvars_value "aws_region")"
+if [ -z "${AWS_REGION}" ]; then
+  AWS_REGION="${AWS_REGION:-ap-northeast-2}"
+fi
+
+NAME_PREFIX="$(read_tfvars_value "name_prefix")"
+if [ -z "${NAME_PREFIX}" ]; then
+  echo "Could not read name_prefix from ${DEV_TFVARS}."
+  exit 1
+fi
+
 echo ""
 echo "[0/2] Resolving Terraform state bucket..."
 STATE_BUCKET="$(resolve_state_bucket)"
@@ -123,6 +219,10 @@ terraform init \
   -input=false \
   -backend-config=backend.hcl \
   -reconfigure
+
+echo ""
+echo "[1.5/2] Cleaning orphan EFS if needed..."
+cleanup_orphan_efs "${AWS_REGION}" "${NAME_PREFIX}"
 
 echo ""
 echo "[2/2] terraform destroy... (may take several minutes)"
