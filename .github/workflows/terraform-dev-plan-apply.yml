@@ -241,5 +241,76 @@ jobs:
       - name: Terraform Init
         run: terraform init -backend-config=backend.hcl
 
+      - name: Clean orphan EFS before apply
+        shell: bash
+        run: |
+          NAME_PREFIX=$(sed -n 's/^name_prefix[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' terraform.tfvars | head -n 1)
+          CREATION_TOKEN="${NAME_PREFIX}-efs"
+          RESOURCE_ADDRESS="module.storage.aws_efs_file_system.shared"
+
+          if [ -z "$NAME_PREFIX" ]; then
+            echo "Could not read name_prefix from terraform.tfvars"
+            exit 1
+          fi
+
+          if terraform state list 2>/dev/null | grep -qx "$RESOURCE_ADDRESS"; then
+            echo "EFS is already tracked in Terraform state."
+            exit 0
+          fi
+
+          mapfile -t FILE_SYSTEM_IDS < <(
+            aws efs describe-file-systems \
+              --region "${{ env.AWS_REGION }}" \
+              --query "FileSystems[?CreationToken=='${CREATION_TOKEN}'].FileSystemId" \
+              --output text | tr '\t' '\n' | grep -v '^$'
+          )
+
+          if [ "${#FILE_SYSTEM_IDS[@]}" -eq 0 ]; then
+            echo "No orphan EFS found for creation token: ${CREATION_TOKEN}"
+            exit 0
+          fi
+
+          echo "Found orphan EFS resources for creation token '${CREATION_TOKEN}'. Cleaning them up before apply."
+
+          for FS_ID in "${FILE_SYSTEM_IDS[@]}"; do
+            mapfile -t MOUNT_TARGET_IDS < <(
+              aws efs describe-mount-targets \
+                --region "${{ env.AWS_REGION }}" \
+                --file-system-id "${FS_ID}" \
+                --query 'MountTargets[].MountTargetId' \
+                --output text | tr '\t' '\n' | grep -v '^$'
+            )
+
+            for MOUNT_TARGET_ID in "${MOUNT_TARGET_IDS[@]}"; do
+              aws efs delete-mount-target \
+                --region "${{ env.AWS_REGION }}" \
+                --mount-target-id "${MOUNT_TARGET_ID}"
+            done
+
+            while true; do
+              REMAINING_MOUNT_TARGETS=$(
+                aws efs describe-mount-targets \
+                  --region "${{ env.AWS_REGION }}" \
+                  --file-system-id "${FS_ID}" \
+                  --query 'MountTargets[].MountTargetId' \
+                  --output text 2>/dev/null || true
+              )
+
+              if [ -z "${REMAINING_MOUNT_TARGETS}" ] || [ "${REMAINING_MOUNT_TARGETS}" = "None" ]; then
+                break
+              fi
+
+              sleep 10
+            done
+
+            aws efs delete-file-system \
+              --region "${{ env.AWS_REGION }}" \
+              --file-system-id "${FS_ID}"
+
+            aws efs wait file-system-deleted \
+              --region "${{ env.AWS_REGION }}" \
+              --file-system-id "${FS_ID}"
+          done
+
       - name: Terraform Apply
         run: terraform apply -lock-timeout=10m -auto-approve -no-color
