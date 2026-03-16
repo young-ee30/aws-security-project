@@ -29,7 +29,7 @@ services = {
       NODE_ENV = "development"
       PORT     = "5000"
     }
-    priority      = 10
+    priority = 10
     # 앱 실제 라우트: /api/health, /api/auth, /api/products, /api/cart ...
     # /uploads/*: 파일 업로드/다운로드 요청도 api-node로 라우팅
     # 다른 서비스 이미지 준비되면 경로 분리 예정

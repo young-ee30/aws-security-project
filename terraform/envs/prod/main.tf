@@ -86,9 +86,9 @@ module "ecs" {
 }
 
 module "monitoring" {
-  source       = "../../modules/monitoring"
-  name_prefix  = var.name_prefix
-  cluster_name = module.ecs.cluster_name
+  source        = "../../modules/monitoring"
+  name_prefix   = var.name_prefix
+  cluster_name  = module.ecs.cluster_name
   service_names = module.ecs.service_names
-  tags         = var.tags
+  tags          = var.tags
 }
