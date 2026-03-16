@@ -138,6 +138,7 @@ jobs:
         with:
           directory: terraform/
           framework: terraform
+          external_checks_dirs: security/checkov/custom_policies
           output_format: cli
           soft_fail: true
 
