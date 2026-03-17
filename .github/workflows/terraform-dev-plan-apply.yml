@@ -271,6 +271,45 @@ jobs:
           import_role_if_needed "module.security.aws_iam_role.ecs_task_execution" "${NAME_PREFIX}-ecs-task-execution-role"
           import_role_if_needed "module.security.aws_iam_role.ecs_task" "${NAME_PREFIX}-ecs-task-role"
 
+      - name: Import orphan CloudWatch log groups before apply
+        shell: bash
+        run: |
+          NAME_PREFIX=$(sed -n 's/^name_prefix[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' terraform.tfvars | head -n 1)
+
+          if [ -z "$NAME_PREFIX" ]; then
+            echo "Could not read name_prefix from terraform.tfvars"
+            exit 1
+          fi
+
+          import_log_group_if_needed() {
+            local service_name="$1"
+            local tf_address="module.logging.aws_cloudwatch_log_group.service[\"${service_name}\"]"
+            local log_group_name="/ecs/${NAME_PREFIX}/${service_name}"
+
+            if terraform state list 2>/dev/null | grep -qF "${tf_address}"; then
+              echo "Log group already in Terraform state: ${log_group_name}"
+              return 0
+            fi
+
+            FOUND=$(aws logs describe-log-groups \
+              --log-group-name-prefix "${log_group_name}" \
+              --query "logGroups[?logGroupName=='${log_group_name}'].logGroupName" \
+              --output text 2>/dev/null || true)
+
+            if [ -n "$FOUND" ] && [ "$FOUND" != "None" ]; then
+              echo "Found existing log group '${log_group_name}'. Importing into Terraform state."
+              terraform import "${tf_address}" "${log_group_name}"
+            else
+              echo "No pre-existing log group found for '${log_group_name}'."
+            fi
+          }
+
+          mapfile -t SERVICES < <(grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' terraform.tfvars)
+
+          for SERVICE in "${SERVICES[@]}"; do
+            import_log_group_if_needed "$SERVICE"
+          done
+
       - name: Clean orphan EFS before apply
         shell: bash
         run: |
