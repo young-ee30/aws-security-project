@@ -61,6 +61,7 @@ locals {
       # 백엔드: tfvars 환경변수 + RDS 접속 정보 merge
       environment = name == "frontend" ? merge(svc.environment, {
         VITE_API_URL = "http://${module.alb.alb_dns_name}"
+        API_UPSTREAM = module.alb.alb_dns_name
       }) : merge(svc.environment, local.service_db_envs[name])
       command = try(svc.command, null)
     }
