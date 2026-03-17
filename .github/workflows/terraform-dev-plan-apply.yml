@@ -286,22 +286,26 @@ jobs:
             local tf_address="module.logging.aws_cloudwatch_log_group.service[\"${service_name}\"]"
             local log_group_name="/ecs/${NAME_PREFIX}/${service_name}"
 
-            if terraform state list 2>/dev/null | grep -qF "${tf_address}"; then
-              echo "Log group already in Terraform state: ${log_group_name}"
-              return 0
-            fi
-
             FOUND=$(aws logs describe-log-groups \
               --log-group-name-prefix "${log_group_name}" \
               --query "logGroups[?logGroupName=='${log_group_name}'].logGroupName" \
               --output text 2>/dev/null || true)
 
-            if [ -n "$FOUND" ] && [ "$FOUND" != "None" ]; then
-              echo "Found existing log group '${log_group_name}'. Importing into Terraform state."
-              terraform import "${tf_address}" "${log_group_name}"
-            else
+            if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
               echo "No pre-existing log group found for '${log_group_name}'."
+              return 0
             fi
+
+            echo "Found existing log group '${log_group_name}'. Attempting import..."
+            IMPORT_OUTPUT=$(terraform import "${tf_address}" "${log_group_name}" 2>&1) || {
+              if echo "$IMPORT_OUTPUT" | grep -q "Resource already managed by Terraform"; then
+                echo "Log group '${log_group_name}' is already managed by Terraform, skipping."
+                return 0
+              fi
+              echo "$IMPORT_OUTPUT"
+              return 1
+            }
+            echo "$IMPORT_OUTPUT"
           }
 
           mapfile -t SERVICES < <(grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' terraform.tfvars)
