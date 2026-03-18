@@ -2,9 +2,10 @@
 # =============================================================
 # scripts/destroy.sh
 # Purpose: destroy Terraform-managed dev resources.
+# If Terraform destroy fails midway, continue with best-effort AWS cleanup.
 # =============================================================
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -13,6 +14,16 @@ BACKEND_HCL="${DEV_DIR}/backend.hcl"
 DEV_TFVARS="${DEV_DIR}/terraform.tfvars"
 STATE_KEY="dev/terraform.tfstate"
 STATE_BUCKET_PREFIX="devsecops-tfstate-"
+TMP_DIR="${PROJECT_ROOT}/.tmp-destroy"
+mkdir -p "${TMP_DIR}"
+
+warn() {
+  echo "[warn] $*" >&2
+}
+
+info() {
+  echo "[info] $*"
+}
 
 write_backend_hcl() {
   local bucket_name="$1"
@@ -38,7 +49,7 @@ resolve_state_bucket() {
   mapfile -t buckets < <(
     aws s3api list-buckets \
       --query "Buckets[?starts_with(Name, '${STATE_BUCKET_PREFIX}')].Name" \
-      --output text | tr '\t' '\n' | grep -v '^$'
+      --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$'
   )
 
   if [ "${#buckets[@]}" -eq 0 ]; then
@@ -57,7 +68,7 @@ resolve_state_bucket() {
         --key "${STATE_KEY}" \
         --query 'LastModified' \
         --output text 2>/dev/null || true
-    )"
+    ))"
 
     if [ -n "${last_modified}" ] && [ "${last_modified}" != "None" ]; then
       stateful_buckets+=("${last_modified}|${bucket}")
@@ -71,7 +82,7 @@ resolve_state_bucket() {
 
   aws s3api list-buckets \
     --query "reverse(sort_by(Buckets[?starts_with(Name, '${STATE_BUCKET_PREFIX}')], &CreationDate))[0].Name" \
-    --output text
+    --output text 2>/dev/null || true
 }
 
 read_tfvars_value() {
@@ -82,63 +93,63 @@ read_tfvars_value() {
     return 0
   fi
 
-  sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\\(.*\\)\"/\\1/p" "${DEV_TFVARS}" | head -n 1
+  sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\(.*\)\"/\1/p" "${DEV_TFVARS}" | head -n 1
 }
 
-cleanup_orphan_efs() {
+read_service_names() {
+  if [ ! -f "${DEV_TFVARS}" ]; then
+    return 0
+  fi
+
+  grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' "${DEV_TFVARS}" || true
+}
+
+cleanup_efs_by_creation_token() {
   local aws_region="$1"
   local name_prefix="$2"
   local creation_token="${name_prefix}-efs"
-  local resource_address="module.storage.aws_efs_file_system.shared"
-
-  if terraform state list 2>/dev/null | grep -qx "${resource_address}"; then
-    echo "EFS is already tracked in Terraform state."
-    return 0
-  fi
 
   mapfile -t file_system_ids < <(
     aws efs describe-file-systems \
       --region "${aws_region}" \
       --query "FileSystems[?CreationToken=='${creation_token}'].FileSystemId" \
-      --output text | tr '\t' '\n' | grep -v '^$'
+      --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$'
   )
 
   if [ "${#file_system_ids[@]}" -eq 0 ]; then
-    echo "No orphan EFS found for creation token: ${creation_token}"
+    info "No EFS found for creation token: ${creation_token}"
     return 0
   fi
-
-  echo "Found orphan EFS resources for creation token '${creation_token}'."
 
   local fs_id=""
   local mount_target_id=""
   local remaining_mount_targets=""
 
   for fs_id in "${file_system_ids[@]}"; do
-    echo "Deleting mount targets for ${fs_id}..."
+    info "Deleting EFS mount targets for ${fs_id}"
 
     mapfile -t mount_target_ids < <(
       aws efs describe-mount-targets \
         --region "${aws_region}" \
         --file-system-id "${fs_id}" \
         --query 'MountTargets[].MountTargetId' \
-        --output text | tr '\t' '\n' | grep -v '^$'
+        --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$'
     )
 
     for mount_target_id in "${mount_target_ids[@]}"; do
       aws efs delete-mount-target \
         --region "${aws_region}" \
-        --mount-target-id "${mount_target_id}"
+        --mount-target-id "${mount_target_id}" >/dev/null 2>&1 || true
     done
 
-    while true; do
+    for _ in {1..30}; do
       remaining_mount_targets="$(
         aws efs describe-mount-targets \
           --region "${aws_region}" \
           --file-system-id "${fs_id}" \
           --query 'MountTargets[].MountTargetId' \
           --output text 2>/dev/null || true
-      )"
+      ))"
 
       if [ -z "${remaining_mount_targets}" ] || [ "${remaining_mount_targets}" = "None" ]; then
         break
@@ -147,27 +158,306 @@ cleanup_orphan_efs() {
       sleep 10
     done
 
-    echo "Deleting orphan EFS ${fs_id}..."
+    info "Deleting EFS ${fs_id}"
     aws efs delete-file-system \
       --region "${aws_region}" \
-      --file-system-id "${fs_id}"
+      --file-system-id "${fs_id}" >/dev/null 2>&1 || true
+  done
+}
 
-    while true; do
-      file_system_state="$(
-        aws efs describe-file-systems \
-          --region "${aws_region}" \
-          --file-system-id "${fs_id}" \
-          --query 'FileSystems[0].LifeCycleState' \
-          --output text 2>/dev/null || true
-      )"
+empty_and_delete_bucket() {
+  local bucket="$1"
+  local delete_file="${TMP_DIR}/delete-objects.json"
+  local versions_json=""
+  local markers_json=""
 
-      if [ -z "${file_system_state}" ] || [ "${file_system_state}" = "None" ]; then
-        break
-      fi
+  if ! aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+    info "Bucket not found: ${bucket}"
+    return 0
+  fi
 
-      sleep 10
+  info "Emptying bucket ${bucket}"
+  aws s3 rm "s3://${bucket}" --recursive >/dev/null 2>&1 || true
+
+  while true; do
+    versions_json="$(aws s3api list-object-versions --bucket "${bucket}" --output json --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}, Quiet: true}' 2>/dev/null || true)"
+    markers_json="$(aws s3api list-object-versions --bucket "${bucket}" --output json --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}, Quiet: true}' 2>/dev/null || true)"
+
+    if [[ "${versions_json}" == *'"Objects": null'* ]] && [[ "${markers_json}" == *'"Objects": null'* ]]; then
+      break
+    fi
+
+    if [[ "${versions_json}" != *'"Objects": null'* ]]; then
+      printf '%s' "${versions_json}" > "${delete_file}"
+      aws s3api delete-objects --bucket "${bucket}" --delete "file://${delete_file}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${markers_json}" != *'"Objects": null'* ]]; then
+      printf '%s' "${markers_json}" > "${delete_file}"
+      aws s3api delete-objects --bucket "${bucket}" --delete "file://${delete_file}" >/dev/null 2>&1 || true
+    fi
+  done
+
+  info "Deleting bucket ${bucket}"
+  aws s3api delete-bucket --bucket "${bucket}" >/dev/null 2>&1 || true
+}
+
+delete_cloudwatch_log_group() {
+  local log_group_name="$1"
+  aws logs delete-log-group --log-group-name "${log_group_name}" >/dev/null 2>&1 || true
+}
+
+delete_alarm_if_exists() {
+  local alarm_name="$1"
+  aws cloudwatch delete-alarms --alarm-names "${alarm_name}" >/dev/null 2>&1 || true
+}
+
+delete_sns_topic_by_name() {
+  local topic_name="$1"
+  local topic_arn=""
+
+  topic_arn="$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':${topic_name}')].TopicArn | [0]" --output text 2>/dev/null || true)"
+  if [ -n "${topic_arn}" ] && [ "${topic_arn}" != "None" ]; then
+    aws sns delete-topic --topic-arn "${topic_arn}" >/dev/null 2>&1 || true
+  fi
+}
+
+delete_ecr_repo_if_exists() {
+  local repo_name="$1"
+  aws ecr delete-repository --repository-name "${repo_name}" --force >/dev/null 2>&1 || true
+}
+
+delete_dynamodb_table_if_exists() {
+  local table_name="$1"
+  aws dynamodb delete-table --table-name "${table_name}" >/dev/null 2>&1 || true
+}
+
+delete_rds_instance_if_exists() {
+  local identifier="$1"
+  aws rds delete-db-instance \
+    --db-instance-identifier "${identifier}" \
+    --skip-final-snapshot \
+    --delete-automated-backups >/dev/null 2>&1 || true
+}
+
+wait_rds_deleted() {
+  local identifier="$1"
+  aws rds wait db-instance-deleted --db-instance-identifier "${identifier}" >/dev/null 2>&1 || true
+}
+
+delete_db_subnet_group_if_exists() {
+  local group_name="$1"
+  aws rds delete-db-subnet-group --db-subnet-group-name "${group_name}" >/dev/null 2>&1 || true
+}
+
+terminate_bastion_if_exists() {
+  local name="$1"
+  local instance_ids=""
+
+  instance_ids="$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${name}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' \
+    --output text 2>/dev/null || true)"
+
+  if [ -n "${instance_ids}" ] && [ "${instance_ids}" != "None" ]; then
+    aws ec2 terminate-instances --instance-ids ${instance_ids} >/dev/null 2>&1 || true
+    aws ec2 wait instance-terminated --instance-ids ${instance_ids} >/dev/null 2>&1 || true
+  fi
+}
+
+delete_ecs_service_if_exists() {
+  local cluster_name="$1"
+  local service_name="$2"
+
+  aws ecs update-service --cluster "${cluster_name}" --service "${service_name}" --desired-count 0 >/dev/null 2>&1 || true
+  aws ecs delete-service --cluster "${cluster_name}" --service "${service_name}" --force >/dev/null 2>&1 || true
+}
+
+delete_ecs_cluster_if_exists() {
+  local cluster_name="$1"
+  aws ecs delete-cluster --cluster "${cluster_name}" >/dev/null 2>&1 || true
+}
+
+deregister_task_definitions() {
+  local family_prefix="$1"
+  mapfile -t task_defs < <(aws ecs list-task-definitions --family-prefix "${family_prefix}" --query 'taskDefinitionArns' --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$')
+
+  local task_def_arn=""
+  for task_def_arn in "${task_defs[@]}"; do
+    aws ecs deregister-task-definition --task-definition "${task_def_arn}" >/dev/null 2>&1 || true
+  done
+}
+
+delete_alb_and_target_groups() {
+  local alb_name="$1"
+  shift
+  local tg_names=("$@")
+  local alb_arn=""
+  local tg_name=""
+  local tg_arn=""
+
+  alb_arn="$(aws elbv2 describe-load-balancers --names "${alb_name}" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)"
+  if [ -n "${alb_arn}" ] && [ "${alb_arn}" != "None" ]; then
+    aws elbv2 delete-load-balancer --load-balancer-arn "${alb_arn}" >/dev/null 2>&1 || true
+    aws elbv2 wait load-balancers-deleted --load-balancer-arns "${alb_arn}" >/dev/null 2>&1 || true
+  fi
+
+  for tg_name in "${tg_names[@]}"; do
+    tg_arn="$(aws elbv2 describe-target-groups --names "${tg_name}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || true)"
+    if [ -n "${tg_arn}" ] && [ "${tg_arn}" != "None" ]; then
+      aws elbv2 delete-target-group --target-group-arn "${tg_arn}" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+delete_iam_roles() {
+  local execution_role="$1"
+  local task_role="$2"
+  local task_policy="$3"
+
+  aws iam delete-role-policy --role-name "${task_role}" --policy-name "${task_policy}" >/dev/null 2>&1 || true
+  aws iam detach-role-policy --role-name "${execution_role}" --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" >/dev/null 2>&1 || true
+  aws iam delete-role --role-name "${execution_role}" >/dev/null 2>&1 || true
+  aws iam delete-role --role-name "${task_role}" >/dev/null 2>&1 || true
+}
+
+delete_security_group_by_name() {
+  local sg_name="$1"
+  local sg_ids=""
+
+  sg_ids="$(aws ec2 describe-security-groups --filters "Name=group-name,Values=${sg_name}" --query 'SecurityGroups[].GroupId' --output text 2>/dev/null || true)"
+  if [ -n "${sg_ids}" ] && [ "${sg_ids}" != "None" ]; then
+    for sg_id in ${sg_ids}; do
+      aws ec2 delete-security-group --group-id "${sg_id}" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+cleanup_network() {
+  local name_prefix="$1"
+  local vpc_name="${name_prefix}-vpc"
+  local igw_name="${name_prefix}-igw"
+  local public_rt_name="${name_prefix}-public-rt"
+  local private_rt_name="${name_prefix}-private-rt"
+  local nat_name="${name_prefix}-nat"
+  local eip_name="${name_prefix}-nat-eip"
+  local subnet_names=("${name_prefix}-public-A" "${name_prefix}-public-C" "${name_prefix}-private-A" "${name_prefix}-private-C")
+
+  local nat_gateways=""
+  local nat_gateway_id=""
+  nat_gateways="$(aws ec2 describe-nat-gateways --filter "Name=tag:Name,Values=${nat_name}" --query 'NatGateways[?State!=`deleted`].NatGatewayId' --output text 2>/dev/null || true)"
+  for nat_gateway_id in ${nat_gateways}; do
+    aws ec2 delete-nat-gateway --nat-gateway-id "${nat_gateway_id}" >/dev/null 2>&1 || true
+  done
+  for nat_gateway_id in ${nat_gateways}; do
+    aws ec2 wait nat-gateway-deleted --nat-gateway-ids "${nat_gateway_id}" >/dev/null 2>&1 || true
+  done
+
+  local alloc_ids=""
+  local alloc_id=""
+  alloc_ids="$(aws ec2 describe-addresses --filters "Name=tag:Name,Values=${eip_name}" --query 'Addresses[].AllocationId' --output text 2>/dev/null || true)"
+  for alloc_id in ${alloc_ids}; do
+    aws ec2 release-address --allocation-id "${alloc_id}" >/dev/null 2>&1 || true
+  done
+
+  local route_table_name=""
+  local route_table_ids=""
+  local route_table_id=""
+  local assoc_ids=""
+  local assoc_id=""
+  for route_table_name in "${public_rt_name}" "${private_rt_name}"; do
+    route_table_ids="$(aws ec2 describe-route-tables --filters "Name=tag:Name,Values=${route_table_name}" --query 'RouteTables[].RouteTableId' --output text 2>/dev/null || true)"
+    for route_table_id in ${route_table_ids}; do
+      assoc_ids="$(aws ec2 describe-route-tables --route-table-ids "${route_table_id}" --query 'RouteTables[0].Associations[?Main!=`true`].RouteTableAssociationId' --output text 2>/dev/null || true)"
+      for assoc_id in ${assoc_ids}; do
+        aws ec2 disassociate-route-table --association-id "${assoc_id}" >/dev/null 2>&1 || true
+      done
+      aws ec2 delete-route-table --route-table-id "${route_table_id}" >/dev/null 2>&1 || true
     done
   done
+
+  local subnet_name=""
+  local subnet_ids=""
+  local subnet_id=""
+  for subnet_name in "${subnet_names[@]}"; do
+    subnet_ids="$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=${subnet_name}" --query 'Subnets[].SubnetId' --output text 2>/dev/null || true)"
+    for subnet_id in ${subnet_ids}; do
+      aws ec2 delete-subnet --subnet-id "${subnet_id}" >/dev/null 2>&1 || true
+    done
+  done
+
+  local vpc_ids=""
+  local vpc_id=""
+  local igw_ids=""
+  local igw_id=""
+  vpc_ids="$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=${vpc_name}" --query 'Vpcs[].VpcId' --output text 2>/dev/null || true)"
+  for vpc_id in ${vpc_ids}; do
+    igw_ids="$(aws ec2 describe-internet-gateways --filters "Name=tag:Name,Values=${igw_name}" --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null || true)"
+    for igw_id in ${igw_ids}; do
+      aws ec2 detach-internet-gateway --internet-gateway-id "${igw_id}" --vpc-id "${vpc_id}" >/dev/null 2>&1 || true
+      aws ec2 delete-internet-gateway --internet-gateway-id "${igw_id}" >/dev/null 2>&1 || true
+    done
+    aws ec2 delete-vpc --vpc-id "${vpc_id}" >/dev/null 2>&1 || true
+  done
+}
+
+best_effort_cleanup() {
+  local aws_region="$1"
+  local name_prefix="$2"
+  local cluster_name="${name_prefix}-cluster"
+  local alb_name="${name_prefix}-alb"
+  local rds_identifier="${name_prefix}-mysql"
+  local db_subnet_group="${name_prefix}-db-subnet-group"
+  local reviews_table="${name_prefix}-reviews"
+  local artifacts_bucket
+  local reviews_bucket
+  local alerts_topic="${name_prefix}-alerts"
+  local execution_role="${name_prefix}-ecs-task-execution-role"
+  local task_role="${name_prefix}-ecs-task-role"
+  local task_policy="${name_prefix}-ecs-task-reviews-policy"
+
+  artifacts_bucket="$(echo "${name_prefix}-artifacts" | tr '[:upper:]_' '[:lower:]-')"
+  reviews_bucket="$(echo "${name_prefix}-reviews" | tr '[:upper:]_' '[:lower:]-')"
+
+  mapfile -t services < <(read_service_names)
+  local service=""
+  local tg_names=()
+
+  info "Running best-effort AWS cleanup for prefix ${name_prefix}"
+
+  for service in "${services[@]}"; do
+    delete_ecs_service_if_exists "${cluster_name}" "${name_prefix}-${service}"
+    deregister_task_definitions "${name_prefix}-${service}"
+    delete_cloudwatch_log_group "/ecs/${name_prefix}/${service}"
+    delete_alarm_if_exists "${name_prefix}-${service}-high-cpu"
+    tg_names+=("${name_prefix}-${service}-tg")
+    delete_ecr_repo_if_exists "${name_prefix}/${service}"
+  done
+
+  delete_sns_topic_by_name "${alerts_topic}"
+  delete_alb_and_target_groups "${alb_name}" "${tg_names[@]}"
+
+  terminate_bastion_if_exists "${name_prefix}-bastion"
+
+  delete_rds_instance_if_exists "${rds_identifier}"
+  wait_rds_deleted "${rds_identifier}"
+  delete_db_subnet_group_if_exists "${db_subnet_group}"
+
+  cleanup_efs_by_creation_token "${aws_region}" "${name_prefix}"
+
+  delete_dynamodb_table_if_exists "${reviews_table}"
+  empty_and_delete_bucket "${artifacts_bucket}"
+  empty_and_delete_bucket "${reviews_bucket}"
+
+  delete_iam_roles "${execution_role}" "${task_role}" "${task_policy}"
+
+  delete_security_group_by_name "${name_prefix}-rds-sg"
+  delete_security_group_by_name "${name_prefix}-bastion-sg"
+  delete_security_group_by_name "${name_prefix}-ecs-sg"
+  delete_security_group_by_name "${name_prefix}-alb-sg"
+
+  delete_ecs_cluster_if_exists "${cluster_name}"
+  cleanup_network "${name_prefix}"
 }
 
 echo ""
@@ -181,6 +471,7 @@ echo "  - ECS services / tasks"
 echo "  - ECR repositories and images"
 echo "  - VPC / subnets / security groups"
 echo "  - S3 artifacts / EFS / CloudWatch / IAM"
+echo "  - Best-effort cleanup will continue even if one step fails"
 echo ""
 
 read -r -p "  Continue? Type 'yes': " CONFIRM
@@ -201,7 +492,7 @@ fi
 
 AWS_REGION="$(read_tfvars_value "aws_region")"
 if [ -z "${AWS_REGION}" ]; then
-  AWS_REGION="${AWS_REGION:-ap-northeast-2}"
+  AWS_REGION="ap-northeast-2"
 fi
 
 NAME_PREFIX="$(read_tfvars_value "name_prefix")"
@@ -211,39 +502,54 @@ if [ -z "${NAME_PREFIX}" ]; then
 fi
 
 echo ""
-echo "[0/2] Resolving Terraform state bucket..."
+echo "[0/3] Resolving Terraform state bucket..."
 STATE_BUCKET="$(resolve_state_bucket)"
+USE_TERRAFORM_DESTROY=1
 
 if [ -z "${STATE_BUCKET}" ] || [ "${STATE_BUCKET}" = "None" ]; then
-  echo "Could not find a Terraform state bucket with prefix '${STATE_BUCKET_PREFIX}'."
-  echo "Run bootstrap/setup first or create backend.hcl with the correct bucket."
-  exit 1
+  warn "Could not find a Terraform state bucket with prefix '${STATE_BUCKET_PREFIX}'."
+  warn "Skipping terraform destroy and moving to best-effort AWS cleanup."
+  USE_TERRAFORM_DESTROY=0
+else
+  write_backend_hcl "${STATE_BUCKET}"
+  info "Using state bucket: ${STATE_BUCKET}"
 fi
 
-write_backend_hcl "${STATE_BUCKET}"
-echo "Using state bucket: ${STATE_BUCKET}"
+if [ "${USE_TERRAFORM_DESTROY}" -eq 1 ]; then
+  cd "${DEV_DIR}"
 
-cd "${DEV_DIR}"
+  echo ""
+  echo "[1/3] terraform init..."
+  if ! terraform init -input=false -backend-config=backend.hcl -reconfigure; then
+    warn "terraform init failed. Continuing to best-effort AWS cleanup."
+    USE_TERRAFORM_DESTROY=0
+  fi
+fi
+
+TERRAFORM_DESTROY_EXIT=0
+if [ "${USE_TERRAFORM_DESTROY}" -eq 1 ]; then
+  echo ""
+  echo "[2/3] terraform destroy... (may take several minutes)"
+  echo ""
+  terraform destroy -input=false -auto-approve || TERRAFORM_DESTROY_EXIT=$?
+
+  if [ "${TERRAFORM_DESTROY_EXIT}" -ne 0 ]; then
+    warn "terraform destroy exited with code ${TERRAFORM_DESTROY_EXIT}. Continuing cleanup."
+  fi
+fi
 
 echo ""
-echo "[1/2] terraform init..."
-terraform init \
-  -input=false \
-  -backend-config=backend.hcl \
-  -reconfigure
-
-echo ""
-echo "[1.5/2] Cleaning orphan EFS if needed..."
-cleanup_orphan_efs "${AWS_REGION}" "${NAME_PREFIX}"
-
-echo ""
-echo "[2/2] terraform destroy... (may take several minutes)"
-echo ""
-terraform destroy -input=false
+echo "[3/3] best-effort AWS cleanup..."
+best_effort_cleanup "${AWS_REGION}" "${NAME_PREFIX}"
 
 echo ""
 echo "========================================="
-echo "  Destroy complete"
+echo "  Cleanup flow complete"
 echo "========================================="
 echo ""
-echo "  The bootstrap S3 state bucket is preserved."
+echo "  Note: The bootstrap S3 state bucket is preserved."
+if [ "${TERRAFORM_DESTROY_EXIT}" -ne 0 ]; then
+  echo "  Terraform destroy had errors, so verify remaining AWS resources once more."
+fi
+
+
