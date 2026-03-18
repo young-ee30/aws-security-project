@@ -64,9 +64,9 @@ resource "aws_efs_file_system" "shared" {
 
 resource "aws_efs_mount_target" "this" {
   # Keep static subnet keys and use apply-time subnet IDs only as values.
-  for_each = var.private_subnet_ids_by_key
+  for_each = var.private_subnet_keys
 
   file_system_id  = aws_efs_file_system.shared.id
-  subnet_id       = each.value
+  subnet_id       = var.private_subnet_ids_by_key[each.key]
   security_groups = [var.ecs_sg_id]
 }
