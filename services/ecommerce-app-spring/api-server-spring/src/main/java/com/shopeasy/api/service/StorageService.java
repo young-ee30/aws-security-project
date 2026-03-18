@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
@@ -49,13 +50,13 @@ public class StorageService {
         if (originalFilename != null && originalFilename.contains(".")) {
             extension = originalFilename.substring(originalFilename.lastIndexOf("."));
         }
-        String fileName = UUID.randomUUID().toString() + extension;
+        String fileName = UUID.randomUUID() + extension;
 
         if ("s3".equals(storageType)) {
             return uploadToS3(fileName, file.getBytes(), file.getContentType());
-        } else {
-            return uploadToLocal(fileName, file);
         }
+
+        return uploadToLocal(fileName, file);
     }
 
     private String uploadToLocal(String fileName, MultipartFile file) throws IOException {
@@ -75,6 +76,7 @@ public class StorageService {
                 .bucket(s3Bucket)
                 .key(key)
                 .contentType(contentType)
+                .acl(ObjectCannedACL.PUBLIC_READ)
                 .build();
 
         s3Client.putObject(putRequest, RequestBody.fromBytes(data));
@@ -87,13 +89,14 @@ public class StorageService {
         if (fileName != null && fileName.contains(".")) {
             extension = fileName.substring(fileName.lastIndexOf("."));
         }
-        String key = "uploads/" + UUID.randomUUID().toString() + extension;
+        String key = "uploads/" + UUID.randomUUID() + extension;
 
         if ("s3".equals(storageType)) {
             PutObjectRequest putRequest = PutObjectRequest.builder()
                     .bucket(s3Bucket)
                     .key(key)
                     .contentType(fileType)
+                    .acl(ObjectCannedACL.PUBLIC_READ)
                     .build();
 
             PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
@@ -105,9 +108,9 @@ public class StorageService {
             String fileUrl = String.format("https://%s.s3.%s.amazonaws.com/%s", s3Bucket, s3Region, key);
 
             return Map.of("uploadUrl", uploadUrl, "fileUrl", fileUrl);
-        } else {
-            String fileUrl = "/uploads/" + key.replace("uploads/", "");
-            return Map.of("uploadUrl", "/api/upload", "fileUrl", fileUrl);
         }
+
+        String fileUrl = "/uploads/" + key.replace("uploads/", "");
+        return Map.of("uploadUrl", "/api/upload", "fileUrl", fileUrl);
     }
 }

@@ -37,6 +37,7 @@ runs:
   using: composite
   steps:
     - name: Run Gitleaks
+      if: ${{ github.event_name != 'workflow_run' }}
       uses: gitleaks/gitleaks-action@v2
       continue-on-error: true
       env:

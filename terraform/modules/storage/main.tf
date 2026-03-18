@@ -26,12 +26,30 @@ resource "aws_s3_bucket" "reviews" {
   tags = merge(var.tags, { Name = "${var.name_prefix}-reviews" })
 }
 
+resource "aws_s3_bucket_ownership_controls" "reviews" {
+  bucket = aws_s3_bucket.reviews.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
 resource "aws_s3_bucket_public_access_block" "reviews" {
   bucket                  = aws_s3_bucket.reviews.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+resource "aws_s3_bucket_acl" "reviews" {
+  bucket = aws_s3_bucket.reviews.id
+  acl    = "public-read"
+
+  depends_on = [
+    aws_s3_bucket_ownership_controls.reviews,
+    aws_s3_bucket_public_access_block.reviews,
+  ]
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "reviews" {

@@ -43,7 +43,6 @@ resource "aws_security_group" "ecs_service" {
   description = "ECS service security group"
   vpc_id      = var.vpc_id
 
-  # 서비스별 포트마다 ALB → ECS 인바운드 허용
   dynamic "ingress" {
     for_each = var.app_ports
     content {
@@ -95,6 +94,7 @@ resource "aws_iam_role_policy" "ecs_task_reviews" {
         Effect = "Allow"
         Action = [
           "s3:PutObject",
+          "s3:PutObjectAcl",
           "s3:GetObject",
           "s3:DeleteObject"
         ]
