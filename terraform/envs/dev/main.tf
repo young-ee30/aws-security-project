@@ -1,3 +1,5 @@
+data "aws_caller_identity" "current" {}
+
 locals {
   alb_services = {
     for name, svc in var.services : name => {
@@ -7,6 +9,11 @@ locals {
       port          = svc.container_port
     }
   }
+
+  reviews_bucket_name = lower(replace("${var.name_prefix}-reviews", "_", "-"))
+  reviews_bucket_arn  = "arn:aws:s3:::${local.reviews_bucket_name}"
+  reviews_table_name  = "${var.name_prefix}-reviews"
+  reviews_table_arn   = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/${local.reviews_table_name}"
 
   # =============================================================
   # 서비스별 DB 환경변수
@@ -42,9 +49,18 @@ locals {
     SPRING_DATASOURCE_PASSWORD = var.db_password
   }
 
+  reviews_env_node = {
+    STORAGE_TYPE    = "s3"
+    S3_BUCKET       = local.reviews_bucket_name
+    S3_REGION       = var.aws_region
+    REVIEW_STORE    = "dynamodb"
+    DYNAMODB_TABLE  = local.reviews_table_name
+    DYNAMODB_REGION = var.aws_region
+  }
+
   # 서비스 이름 → DB 환경변수 매핑
   service_db_envs = {
-    "api-node"   = local.db_env_node
+    "api-node"   = merge(local.db_env_node, local.reviews_env_node)
     "api-python" = local.db_env_python
     "api-spring" = local.db_env_spring
     "frontend"   = {}
@@ -84,8 +100,10 @@ module "security" {
   vpc_id      = module.network.vpc_id
   # 전체 서비스 포트 목록 (ALB → ECS 인바운드 허용)
   # frontend:80, api-node:5000, api-python:8000, api-spring:8080
-  app_ports = [80, 5000, 8000, 8080]
-  tags      = var.tags
+  app_ports                  = [80, 5000, 8000, 8080]
+  reviews_bucket_arn         = local.reviews_bucket_arn
+  reviews_dynamodb_table_arn = local.reviews_table_arn
+  tags                       = var.tags
 }
 
 module "ecr" {
@@ -120,6 +138,12 @@ module "storage" {
   private_subnet_ids = module.network.private_subnet_ids
   ecs_sg_id          = module.security.ecs_sg_id
   tags               = var.tags
+}
+
+module "dynamodb" {
+  source      = "../../modules/dynamodb"
+  name_prefix = var.name_prefix
+  tags        = var.tags
 }
 
 module "rds" {

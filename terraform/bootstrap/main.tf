@@ -20,10 +20,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
   }
 
   # bootstrap은 로컬 state 사용 (S3 버킷이 아직 없기 때문)
@@ -34,13 +30,12 @@ provider "aws" {
   region = var.aws_region
 }
 
-# 버킷 이름 충돌 방지용 랜덤 suffix
-resource "random_id" "suffix" {
-  byte_length = 4
-}
+data "aws_caller_identity" "current" {}
 
 locals {
-  bucket_name = "${var.project_name}-tfstate-${random_id.suffix.hex}"
+  # Terraform state bucket은 한 번 만든 뒤 계속 재사용하므로
+  # 계정/리전 단위에서 예측 가능한 고정 이름을 사용한다.
+  bucket_name = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
 }
 
 # S3 버킷
@@ -84,5 +79,3 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
-
-data "aws_caller_identity" "current" {}

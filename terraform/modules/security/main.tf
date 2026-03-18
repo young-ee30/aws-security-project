@@ -82,3 +82,43 @@ resource "aws_iam_role" "ecs_task" {
 
   tags = var.tags
 }
+
+resource "aws_iam_role_policy" "ecs_task_reviews" {
+  name = "${var.name_prefix}-ecs-task-reviews-policy"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReviewsS3Objects"
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "${var.reviews_bucket_arn}/uploads/*"
+      },
+      {
+        Sid      = "ReviewsS3ListBucket"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = var.reviews_bucket_arn
+      },
+      {
+        Sid    = "ReviewsDynamoDB"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:Scan",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = var.reviews_dynamodb_table_arn
+      }
+    ]
+  })
+}

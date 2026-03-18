@@ -9,6 +9,14 @@ variable "app_ports" {
   type        = list(number)
   default     = [3000]
 }
+variable "reviews_bucket_arn" {
+  description = "리뷰 이미지 S3 버킷 ARN (ECS Task Role 정책용)"
+  type        = string
+}
+variable "reviews_dynamodb_table_arn" {
+  description = "Reviews DynamoDB 테이블 ARN (ECS Task Role 정책용)"
+  type        = string
+}
 variable "tags" {
   type    = map(string)
   default = {}

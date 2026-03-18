@@ -65,45 +65,16 @@ jobs:
             exit 0
           fi
 
-          PREFIX="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-"
-          mapfile -t BUCKETS < <(aws s3api list-buckets \
-            --query "Buckets[?starts_with(Name, '${PREFIX}')].Name" \
-            --output text | tr '\t' '\n' | grep -v '^$')
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          TARGET_BUCKET="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-${ACCOUNT_ID}-${{ env.AWS_REGION }}"
 
-          if [ "${#BUCKETS[@]}" -eq 0 ]; then
-            echo "No Terraform state bucket found."
+          if ! aws s3api head-bucket --bucket "$TARGET_BUCKET" >/dev/null 2>&1; then
+            echo "No Terraform state bucket found at '$TARGET_BUCKET'."
             echo "Run bootstrap-terraform-state.yml first or set TF_STATE_BUCKET manually."
             exit 1
           fi
 
-          if [ "${#BUCKETS[@]}" -gt 1 ]; then
-            STATEFUL_BUCKETS=()
-            for BUCKET in "${BUCKETS[@]}"; do
-              LAST_MODIFIED=$(aws s3api head-object \
-                --bucket "$BUCKET" \
-                --key "dev/terraform.tfstate" \
-                --query 'LastModified' \
-                --output text 2>/dev/null || true)
-
-              if [ -n "$LAST_MODIFIED" ] && [ "$LAST_MODIFIED" != "None" ]; then
-                STATEFUL_BUCKETS+=("${LAST_MODIFIED}|${BUCKET}")
-              fi
-            done
-
-            if [ "${#STATEFUL_BUCKETS[@]}" -gt 0 ]; then
-              LATEST_BUCKET=$(printf '%s\n' "${STATEFUL_BUCKETS[@]}" | sort | tail -n 1 | cut -d'|' -f2)
-            else
-              LATEST_BUCKET=$(aws s3api list-buckets \
-                --query "reverse(sort_by(Buckets[?starts_with(Name, '${PREFIX}')], &CreationDate))[0].Name" \
-                --output text)
-            fi
-            echo "Multiple Terraform state buckets found: ${BUCKETS[*]}"
-            echo "Reusing the most recent bucket: $LATEST_BUCKET"
-            echo "bucket_name=$LATEST_BUCKET" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "bucket_name=${BUCKETS[0]}" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=$TARGET_BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Check Terraform secrets
         run: |
@@ -184,45 +155,16 @@ jobs:
             exit 0
           fi
 
-          PREFIX="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-"
-          mapfile -t BUCKETS < <(aws s3api list-buckets \
-            --query "Buckets[?starts_with(Name, '${PREFIX}')].Name" \
-            --output text | tr '\t' '\n' | grep -v '^$')
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          TARGET_BUCKET="${{ env.DEFAULT_PROJECT_NAME }}-tfstate-${ACCOUNT_ID}-${{ env.AWS_REGION }}"
 
-          if [ "${#BUCKETS[@]}" -eq 0 ]; then
-            echo "No Terraform state bucket found."
+          if ! aws s3api head-bucket --bucket "$TARGET_BUCKET" >/dev/null 2>&1; then
+            echo "No Terraform state bucket found at '$TARGET_BUCKET'."
             echo "Run bootstrap-terraform-state.yml first or set TF_STATE_BUCKET manually."
             exit 1
           fi
 
-          if [ "${#BUCKETS[@]}" -gt 1 ]; then
-            STATEFUL_BUCKETS=()
-            for BUCKET in "${BUCKETS[@]}"; do
-              LAST_MODIFIED=$(aws s3api head-object \
-                --bucket "$BUCKET" \
-                --key "dev/terraform.tfstate" \
-                --query 'LastModified' \
-                --output text 2>/dev/null || true)
-
-              if [ -n "$LAST_MODIFIED" ] && [ "$LAST_MODIFIED" != "None" ]; then
-                STATEFUL_BUCKETS+=("${LAST_MODIFIED}|${BUCKET}")
-              fi
-            done
-
-            if [ "${#STATEFUL_BUCKETS[@]}" -gt 0 ]; then
-              LATEST_BUCKET=$(printf '%s\n' "${STATEFUL_BUCKETS[@]}" | sort | tail -n 1 | cut -d'|' -f2)
-            else
-              LATEST_BUCKET=$(aws s3api list-buckets \
-                --query "reverse(sort_by(Buckets[?starts_with(Name, '${PREFIX}')], &CreationDate))[0].Name" \
-                --output text)
-            fi
-            echo "Multiple Terraform state buckets found: ${BUCKETS[*]}"
-            echo "Reusing the most recent bucket: $LATEST_BUCKET"
-            echo "bucket_name=$LATEST_BUCKET" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "bucket_name=${BUCKETS[0]}" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=$TARGET_BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Check Terraform secrets
         run: |
