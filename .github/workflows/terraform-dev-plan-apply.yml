@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "terraform/**"
+      - ".github/actions/**"
       - ".github/workflows/**"
   workflow_dispatch:
 
@@ -140,7 +141,7 @@ jobs:
           framework: terraform
           external_checks_dirs: security/checkov/custom_policies
           output_format: cli
-          soft_fail: true
+          soft_fail: false
 
       - name: Terraform Plan
         id: plan

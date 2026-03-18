@@ -1,0 +1,125 @@
+name: Deploy ECS Service
+description: Build, scan, push, and deploy a single ECS service image.
+
+inputs:
+  aws_region:
+    description: AWS region used for ECR and ECS operations.
+    required: true
+  aws_role_arn:
+    description: AWS IAM role to assume via GitHub OIDC.
+    required: true
+  github_token:
+    description: GitHub token used by security scanning actions.
+    required: true
+  image_tag:
+    description: Image tag to publish and deploy.
+    required: true
+  app_path:
+    description: Build context path for the Docker image.
+    required: true
+  ecr_repository:
+    description: ECR repository name.
+    required: true
+  ecs_service:
+    description: ECS service name.
+    required: true
+  ecs_cluster:
+    description: ECS cluster name.
+    required: true
+  ecs_task_definition:
+    description: ECS task definition family.
+    required: true
+  container_name:
+    description: Container name inside the task definition.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run Gitleaks
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.aws_role_arn }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and tag Docker image
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ inputs.image_tag }}
+      run: |
+        docker build --platform linux/amd64 \
+          -t "$ECR_REGISTRY/${{ inputs.ecr_repository }}:$IMAGE_TAG" \
+          -t "$ECR_REGISTRY/${{ inputs.ecr_repository }}:latest" \
+          "${{ inputs.app_path }}"
+
+    - name: Run Trivy vulnerability scanner on local image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag }}
+        format: table
+        exit-code: "1"
+        ignore-unfixed: true
+        vuln-type: os,library
+        severity: CRITICAL,HIGH
+
+    - name: Push image to Amazon ECR
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ inputs.image_tag }}
+      run: |
+        docker push "$ECR_REGISTRY/${{ inputs.ecr_repository }}:$IMAGE_TAG"
+        docker push "$ECR_REGISTRY/${{ inputs.ecr_repository }}:latest"
+
+    - name: Download current task definition
+      shell: bash
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition "${{ inputs.ecs_task_definition }}" \
+          --query taskDefinition \
+          > task-definition.json
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: ${{ inputs.container_name }}
+        image: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag }}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ inputs.ecs_service }}
+        cluster: ${{ inputs.ecs_cluster }}
+        wait-for-service-stability: true
+
+    - name: Scale service from zero if needed
+      shell: bash
+      run: |
+        CURRENT_DESIRED_COUNT=$(aws ecs describe-services \
+          --cluster "${{ inputs.ecs_cluster }}" \
+          --services "${{ inputs.ecs_service }}" \
+          --query 'services[0].desiredCount' \
+          --output text)
+
+        if [ "$CURRENT_DESIRED_COUNT" = "0" ]; then
+          aws ecs update-service \
+            --cluster "${{ inputs.ecs_cluster }}" \
+            --service "${{ inputs.ecs_service }}" \
+            --desired-count 1 >/dev/null
+          aws ecs wait services-stable \
+            --cluster "${{ inputs.ecs_cluster }}" \
+            --services "${{ inputs.ecs_service }}"
+        fi
