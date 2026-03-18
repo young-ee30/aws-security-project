@@ -18,6 +18,8 @@ STATE_BUCKET_PREFIX="${TF_STATE_BUCKET_PREFIX:-${DEFAULT_STATE_PROJECT_NAME}-tfs
 TMP_DIR="${PROJECT_ROOT}/.tmp-destroy"
 DELETE_STATE_BUCKET=0
 mkdir -p "${TMP_DIR}"
+AWS_CMD=""
+TERRAFORM_CMD=""
 
 warn() {
   echo "[warn] $*" >&2
@@ -25,6 +27,63 @@ warn() {
 
 info() {
   echo "[info] $*"
+}
+
+resolve_cli_path() {
+  local candidate=""
+  local resolved=""
+
+  for candidate in "$@"; do
+    if [ -z "${candidate}" ]; then
+      continue
+    fi
+
+    if [[ "${candidate}" == */* ]]; then
+      if [ -x "${candidate}" ]; then
+        printf '%s\n' "${candidate}"
+        return 0
+      fi
+      continue
+    fi
+
+    resolved="$(type -P "${candidate}" 2>/dev/null || true)"
+    if [ -n "${resolved}" ]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_required_clis() {
+  AWS_CMD="$(resolve_cli_path \
+    aws \
+    aws.exe \
+    /c/Program\ Files/Amazon/AWSCLIV2/aws.exe \
+    /c/Program\ Files/Amazon/AWSCLIV2/aws
+  )" || {
+    echo "aws CLI not found in PATH or common Windows install paths."
+    exit 1
+  }
+
+  TERRAFORM_CMD="$(resolve_cli_path \
+    terraform \
+    terraform.exe \
+    /c/ProgramData/chocolatey/bin/terraform.exe \
+    /c/HashiCorp/Terraform/terraform.exe
+  )" || {
+    echo "terraform not found in PATH or common Windows install paths."
+    exit 1
+  }
+}
+
+aws() {
+  "${AWS_CMD}" "$@"
+}
+
+terraform() {
+  "${TERRAFORM_CMD}" "$@"
 }
 
 usage() {
@@ -161,7 +220,7 @@ read_tfvars_value() {
     return 0
   fi
 
-  sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\(.*\)\"/\1/p" "${DEV_TFVARS}" | head -n 1
+  sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\(.*\)\"/\1/p" "${DEV_TFVARS}" | head -n 1 | tr -d '\r'
 }
 
 read_service_names() {
@@ -169,7 +228,7 @@ read_service_names() {
     return 0
   fi
 
-  grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' "${DEV_TFVARS}" || true
+  grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' "${DEV_TFVARS}" | tr -d '\r' || true
 }
 
 cleanup_efs_by_creation_token() {
@@ -558,15 +617,7 @@ if [ "${CONFIRM}" != "yes" ]; then
   exit 0
 fi
 
-if ! command -v aws >/dev/null 2>&1; then
-  echo "aws CLI not found in PATH."
-  exit 1
-fi
-
-if ! command -v terraform >/dev/null 2>&1; then
-  echo "terraform not found in PATH."
-  exit 1
-fi
+resolve_required_clis
 
 AWS_REGION="$(read_tfvars_value "aws_region")"
 if [ -z "${AWS_REGION}" ]; then
@@ -646,5 +697,3 @@ fi
 if [ "${TERRAFORM_DESTROY_EXIT}" -ne 0 ]; then
   echo "  Terraform destroy had errors, so verify remaining AWS resources once more."
 fi
-
-
