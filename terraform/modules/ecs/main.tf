@@ -84,6 +84,14 @@ resource "aws_ecs_service" "service" {
     rollback = true
   }
 
+  # GitHub Actions 배포 워크플로우가 task_definition과 desired_count를 독립적으로 관리.
+  # terraform apply가 이 값들을 덮어쓰지 않도록 무시.
+  # - task_definition: Deploy Selected Services to ECS 워크플로우가 최신 이미지로 갱신
+  # - desired_count:   Scale from zero 로직이 서비스 기동 후 조정
+  lifecycle {
+    ignore_changes = [task_definition, desired_count]
+  }
+
   depends_on = [aws_ecs_task_definition.service]
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-${each.key}-svc" })

@@ -39,6 +39,7 @@ jobs:
     env:
       EXISTING_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       PROJECT_NAME: ${{ inputs.project_name || 'devsecops' }}
+      AWS_REGION: ${{ inputs.aws_region || 'ap-northeast-2' }}
 
     steps:
       - name: Checkout code
@@ -50,7 +51,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region || 'ap-northeast-2' }}
 
-      - name: Reuse existing state bucket if configured
+      - name: Reuse existing or derive deterministic state bucket
         id: existing
         shell: bash
         run: |
@@ -65,45 +66,17 @@ jobs:
             exit 1
           fi
 
-          PREFIX="${PROJECT_NAME}-tfstate-"
-          mapfile -t BUCKETS < <(aws s3api list-buckets \
-            --query "Buckets[?starts_with(Name, '${PREFIX}')].Name" \
-            --output text | tr '\t' '\n' | grep -v '^$')
-          MATCH_COUNT=${#BUCKETS[@]}
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          TARGET_BUCKET="${PROJECT_NAME}-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
 
-          if [ "$MATCH_COUNT" = "0" ]; then
-            echo "bucket_name=" >> "$GITHUB_OUTPUT"
-            echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
+          if aws s3api head-bucket --bucket "$TARGET_BUCKET" >/dev/null 2>&1; then
+            echo "bucket_name=$TARGET_BUCKET" >> "$GITHUB_OUTPUT"
+            echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          STATEFUL_BUCKETS=()
-          for BUCKET in "${BUCKETS[@]}"; do
-            LAST_MODIFIED=$(aws s3api head-object \
-              --bucket "$BUCKET" \
-              --key "dev/terraform.tfstate" \
-              --query 'LastModified' \
-              --output text 2>/dev/null || true)
-
-            if [ -n "$LAST_MODIFIED" ] && [ "$LAST_MODIFIED" != "None" ]; then
-              STATEFUL_BUCKETS+=("${LAST_MODIFIED}|${BUCKET}")
-            fi
-          done
-
-          if [ "${#STATEFUL_BUCKETS[@]}" -gt 0 ]; then
-            LATEST_BUCKET=$(printf '%s\n' "${STATEFUL_BUCKETS[@]}" | sort | tail -n 1 | cut -d'|' -f2)
-          else
-            LATEST_BUCKET=$(aws s3api list-buckets \
-              --query "reverse(sort_by(Buckets[?starts_with(Name, '${PREFIX}')], &CreationDate))[0].Name" \
-              --output text)
-          fi
-
-          if [ "$MATCH_COUNT" != "1" ]; then
-            echo "Found $MATCH_COUNT existing Terraform state buckets with prefix '${PREFIX}'. Reusing the most recent bucket: $LATEST_BUCKET"
-          fi
-
-          echo "bucket_name=$LATEST_BUCKET" >> "$GITHUB_OUTPUT"
-          echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=$TARGET_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Setup Terraform

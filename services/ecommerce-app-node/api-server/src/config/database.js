@@ -44,6 +44,17 @@ async function initDatabase() {
     console.log('[DB] SQLite 데이터베이스 초기화 완료 (sql.js)');
   } else if (DB_TYPE === 'mysql') {
     const mysql = require('mysql2/promise');
+
+    // DB가 없으면 먼저 생성 (RDS 초기 DB는 'ecommerce'이므로 서비스별 DB는 직접 생성)
+    const tempConn = await mysql.createConnection({
+      host: process.env.DB_HOST,
+      port: parseInt(process.env.DB_PORT) || 3306,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+    });
+    await tempConn.execute(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME}\``);
+    await tempConn.end();
+
     pool = mysql.createPool({
       host: process.env.DB_HOST,
       port: parseInt(process.env.DB_PORT) || 3306,

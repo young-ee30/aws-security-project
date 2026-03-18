@@ -74,7 +74,7 @@ manual run
 
 여기서 가장 많이 헷갈리는 부분은 마지막 줄입니다.
 
-[`.github/actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml) 은 GitHub Actions 탭에서 혼자 시작되지 않습니다.
+[`.github/actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml) 은 GitHub Actions 탭에서 혼자 시작되지 않습니다.  
 항상 [`.github/workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) 안에서 `uses: ./.github/actions/deploy-ecs-service` 로 호출될 때만 실행됩니다.
 
 ## 3. 이벤트별 전체 흐름
@@ -363,11 +363,11 @@ PR에서 아래 경로가 바뀌었을 때만 시작됩니다.
 
 즉:
 
-- PR에서 서비스 코드만 바뀐 경우
-  `pull-request-security-scans.yml` 은 실행되지만
+- PR에서 서비스 코드만 바뀐 경우  
+  `pull-request-security-scans.yml` 은 실행되지만  
   `terraform-dev-plan-apply.yml` 은 아예 시작되지 않을 수 있습니다.
 
-- PR에서 Terraform 또는 GitHub Actions 관련 코드가 바뀐 경우
+- PR에서 Terraform 또는 GitHub Actions 관련 코드가 바뀐 경우  
   `terraform-dev-plan-apply.yml` 이 실행되고 `terraform-plan` 까지 수행합니다.
 
 PR에서 이 workflow가 시작되더라도:

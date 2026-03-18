@@ -19,7 +19,7 @@ resource "aws_db_subnet_group" "this" {
 # ECS → RDS 3306 포트 허용 전용 보안그룹
 resource "aws_security_group" "rds" {
   name        = "${var.name_prefix}-rds-sg"
-  description = "RDS MySQL - ECS 컨테이너에서만 접근 허용"
+  description = "Allow MySQL access from ECS containers only"
   vpc_id      = var.vpc_id
 
   ingress {
