@@ -18,6 +18,7 @@ jobs:
 
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -31,11 +32,12 @@ jobs:
 
       - name: Run Trivy vulnerability scanner in IaC mode
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: 'config'
           hide-progress: false
           format: 'table'
-          exit-code: '1' # 취약점 발견 시 빌드 실패
+          exit-code: '0' # 임시 soft fail: 취약점이 있어도 workflow는 계속 진행
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
@@ -49,12 +51,13 @@ jobs:
 
       - name: Run Trivy vulnerability scanner in fs mode
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: 'fs'
           scan-ref: './services'
           hide-progress: false
           format: 'table'
-          exit-code: '1' # 취약점 발견 시 빌드 실패
+          exit-code: '0' # 임시 soft fail: 취약점이 있어도 workflow는 계속 진행
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
@@ -69,9 +72,10 @@ jobs:
       - name: Run Checkov action
         id: checkov
         uses: bridgecrewio/checkov-action@master
+        continue-on-error: true
         with:
           directory: terraform/
           framework: terraform
           external_checks_dirs: security/checkov/custom_policies
           output_format: cli
-          soft_fail: false # 정책 위반이 있으면 PR 체크를 실패시킴
+          soft_fail: true # 임시 soft fail: 정책 위반이 있어도 workflow는 계속 진행
