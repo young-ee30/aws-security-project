@@ -122,7 +122,6 @@ jobs:
       - name: Terraform Format
         id: fmt
         run: terraform fmt -check -recursive ../../
-        continue-on-error: true
 
       - name: Terraform Init
         id: init
@@ -140,7 +139,7 @@ jobs:
           framework: terraform
           external_checks_dirs: security/checkov/custom_policies
           output_format: cli
-          soft_fail: true
+          soft_fail: false
 
       - name: Terraform Plan
         id: plan

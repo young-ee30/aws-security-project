@@ -74,4 +74,4 @@ jobs:
           framework: terraform
           external_checks_dirs: security/checkov/custom_policies
           output_format: cli
-          soft_fail: true # 경고성 이슈로 빌드가 실패하지 않도록 설정 (필요시 false)
+          soft_fail: false # 정책 위반이 있으면 PR 체크를 실패시킴
