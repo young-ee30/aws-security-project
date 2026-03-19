@@ -35,10 +35,10 @@ interface NavItem {
   icon: React.ComponentType<{ className?: string }>
 }
 
-/** 보안 · 운영 (상단 그룹 — 보안점검 / Git Actions 로그 / 보안 정책) */
+/** 보안 · 운영 (상단 그룹 — 보안점검 / GitHub Actions 로그 / 보안 정책) */
 const securityOpsItems: NavItem[] = [
   { label: '보안 점검', path: '/security', icon: Shield },
-  { label: 'Git Actions 로그', path: '/git-actions', icon: FileText },
+  { label: 'GitHub Actions 로그', path: '/git-actions', icon: FileText },
   { label: '보안 정책', path: '/policy', icon: ScrollText },
 ]
 
