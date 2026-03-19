@@ -52,6 +52,15 @@ resource "aws_security_group" "ecs_service" {
     }
   }
 
+  # ECS 태스크 간 통신 허용 — Prometheus가 동일 SG 내 API 서비스를 스크레이프
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+    description = "Intra-ECS traffic (Prometheus scraping)"
+  }
+
   egress {
     from_port   = 0
     to_port     = 0

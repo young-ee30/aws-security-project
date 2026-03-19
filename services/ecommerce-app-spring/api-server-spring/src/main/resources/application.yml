@@ -12,3 +12,19 @@ spring:
 app:
   jwt:
     secret: ecommerce-jwt-secret-key-2024
+
+# Prometheus 메트릭 — GET /api/metrics (다른 서비스와 경로 통일)
+management:
+  endpoints:
+    web:
+      base-path: /api
+      path-mapping:
+        prometheus: metrics
+      exposure:
+        include: health, prometheus
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      application: api-spring

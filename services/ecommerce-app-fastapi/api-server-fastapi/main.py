@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # 프로젝트 루트를 Python 경로에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -102,6 +103,9 @@ app.include_router(cart_router)
 app.include_router(orders_router)
 app.include_router(upload_router)
 app.include_router(health_router)
+
+# Prometheus 메트릭 — GET /api/metrics
+Instrumentator().instrument(app).expose(app, endpoint="/api/metrics", include_in_schema=False)
 
 
 # ========================================

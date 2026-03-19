@@ -257,3 +257,15 @@ module "guardduty" {
   enabled     = true
   tags        = var.tags
 }
+
+module "prometheus" {
+  source = "../../modules/prometheus"
+
+  name_prefix          = var.name_prefix
+  aws_region           = var.aws_region
+  cluster_name         = module.ecs.cluster_name
+  private_subnet_ids   = module.network.private_subnet_ids
+  ecs_sg_id            = module.security.ecs_sg_id
+  artifact_bucket_name = module.storage.artifact_bucket_name
+  tags                 = var.tags
+}
