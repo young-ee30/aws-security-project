@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.config.settings import settings
 from app.config.database import init_database, close_database
+from seed import seed_if_empty
 
 # 라우터 임포트
 from app.routes.auth import router as auth_router
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     # 시작 시
     try:
         await init_database()
+        await seed_if_empty()
         print("========================================")
         print("  이커머스 API 서버 시작 (FastAPI)")
         print(f"  포트: {settings.PORT}")

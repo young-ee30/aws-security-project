@@ -130,6 +130,4 @@ jobs:
             fi
             echo "- Downstream Terraform workflow can still discover this bucket automatically."
             echo "- Next step: run \`terraform-dev-plan-apply.yml\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          
+          } >> "$GITHUB_STEP_SUMMARY"          

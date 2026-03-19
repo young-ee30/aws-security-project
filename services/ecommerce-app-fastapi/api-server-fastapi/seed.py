@@ -194,6 +194,48 @@ PRODUCTS = [
 ]
 
 
+async def seed_if_empty():
+    """Populate default user/products only when the tables are empty."""
+    try:
+        users = await query("SELECT COUNT(*) as count FROM users")
+        products = await query("SELECT COUNT(*) as count FROM products")
+
+        user_count = users[0]["count"] if users else 0
+        product_count = products[0]["count"] if products else 0
+
+        if user_count > 0 and product_count > 0:
+            print("[Seed] Existing data found, skipping automatic seed.")
+            return
+
+        if user_count == 0:
+            salt = bcrypt.gensalt(rounds=10)
+            password_hash = bcrypt.hashpw(
+                TEST_USER["password"].encode("utf-8"), salt
+            ).decode("utf-8")
+            await query(
+                "INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)",
+                [TEST_USER["email"], password_hash, TEST_USER["name"]],
+            )
+            print(f"[Seed] Created default user: {TEST_USER['email']}")
+
+        if product_count == 0:
+            for product in PRODUCTS:
+                await query(
+                    """INSERT INTO products (name, description, price, image_url, category, stock)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        product["name"],
+                        product["description"],
+                        product["price"],
+                        product["image_url"],
+                        product["category"],
+                        product["stock"],
+                    ],
+                )
+            print(f"[Seed] Inserted {len(PRODUCTS)} default products.")
+    except Exception as e:
+        print(f"[Seed] Automatic seed skipped: {e}")
+
 async def seed():
     """시드 데이터 삽입"""
     print("========================================")
