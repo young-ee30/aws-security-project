@@ -64,13 +64,15 @@ resource "aws_wafv2_web_acl" "this" {
     }
   }
 
-  # 규칙 3: 핵심 룰셋 — SQL 인젝션, XSS 차단
+  # 규칙 3: 핵심 룰셋 — SQL 인젝션, XSS 탐지 (count 모드)
+  # count{}: POST body 검사 룰이 한국어 리뷰 등 정상 API 요청을 false positive 차단하므로
+  # 모니터링(count)으로 운영. IP/URI/헤더 기반 탐지는 IPReputationList/KnownBadInputs로 커버.
   rule {
     name     = "CommonRuleSet"
     priority = 30
 
     override_action {
-      none {}
+      count {}
     }
 
     statement {
