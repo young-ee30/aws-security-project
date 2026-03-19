@@ -356,7 +356,7 @@ jobs:
             local tf_address="module.alb.aws_lb_target_group.service[\"${service_name}\"]"
             local tg_name="${NAME_PREFIX}-${service_name}-tg"
 
-            if terraform state list 2>/dev/null | grep -qF "$tf_address"; then
+            if terraform state show "${tf_address}" >/dev/null 2>&1; then
               echo "Target group already tracked in Terraform state: ${tg_name}"
               return 0
             fi
