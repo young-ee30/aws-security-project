@@ -154,7 +154,7 @@ module "rds" {
   vpc_id             = module.network.vpc_id
   private_subnet_ids = module.network.private_subnet_ids
   ecs_sg_id          = module.security.ecs_sg_id
-  bastion_sg_id      = module.bastion[0].security_group_id
+  bastion_sg_id      = try(module.bastion[0].security_group_id, null)
   db_username        = var.db_username
   db_password        = var.db_password
   tags               = var.tags
