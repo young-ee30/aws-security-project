@@ -36,8 +36,14 @@ variable "db_password" {
   sensitive   = true
 }
 
+variable "enable_bastion" {
+  description = "Bastion EC2 배포 여부. SSM으로 접속하므로 키 페어 없이도 true로 설정 가능"
+  type        = bool
+  default     = false
+}
+
 variable "bastion_key_name" {
-  description = "Existing EC2 key pair name for Bastion SSH"
+  description = "Existing EC2 key pair name for Bastion SSH (optional, SSM access works without this)"
   type        = string
   default     = null
 }
