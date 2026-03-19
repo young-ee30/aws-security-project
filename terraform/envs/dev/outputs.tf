@@ -1,4 +1,6 @@
 output "alb_dns_name" { value = module.alb.alb_dns_name }
+output "cloudfront_domain_name" { value = module.cloudfront.cloudfront_domain_name }
+output "waf_web_acl_arn" { value = module.cloudfront.waf_web_acl_arn }
 output "cluster_name" { value = module.ecs.cluster_name }
 output "ecr_repository_urls" { value = module.ecr.repository_urls }
 output "artifact_bucket_name" { value = module.storage.artifact_bucket_name }
@@ -8,3 +10,4 @@ output "reviews_dynamodb_table_name" { value = module.dynamodb.reviews_table_nam
 output "bastion_public_ip" { value = try(module.bastion[0].public_ip, null) }
 output "bastion_public_dns" { value = try(module.bastion[0].public_dns, null) }
 output "bastion_security_group_id" { value = try(module.bastion[0].security_group_id, null) }
+output "guardduty_detector_id" { value = module.guardduty.detector_id }

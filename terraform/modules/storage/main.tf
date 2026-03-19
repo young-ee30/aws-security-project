@@ -42,12 +42,39 @@ resource "aws_s3_bucket_public_access_block" "reviews" {
   restrict_public_buckets = false
 }
 
+data "aws_iam_policy_document" "reviews_public_read" {
+  statement {
+    sid    = "PublicReadUploads"
+    effect = "Allow"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = ["s3:GetObject"]
+
+    resources = [
+      "${aws_s3_bucket.reviews.arn}/uploads/*",
+    ]
+  }
+}
+
 resource "aws_s3_bucket_acl" "reviews" {
   bucket = aws_s3_bucket.reviews.id
   acl    = "public-read"
 
   depends_on = [
     aws_s3_bucket_ownership_controls.reviews,
+    aws_s3_bucket_public_access_block.reviews,
+  ]
+}
+
+resource "aws_s3_bucket_policy" "reviews_public_read" {
+  bucket = aws_s3_bucket.reviews.id
+  policy = data.aws_iam_policy_document.reviews_public_read.json
+
+  depends_on = [
     aws_s3_bucket_public_access_block.reviews,
   ]
 }

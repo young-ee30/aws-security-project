@@ -345,5 +345,45 @@ jobs:
             done
           done
 
+      - name: Import orphan ALB target groups before apply
+        shell: bash
+        run: |
+          NAME_PREFIX=$(sed -n 's/^name_prefix[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' terraform.tfvars | head -n 1)
+
+          if [ -z "$NAME_PREFIX" ]; then
+            echo "Could not read name_prefix from terraform.tfvars"
+            exit 1
+          fi
+
+          import_tg_if_needed() {
+            local service_name="$1"
+            local tf_address="module.alb.aws_lb_target_group.service[\"${service_name}\"]"
+            local tg_name="${NAME_PREFIX}-${service_name}-tg"
+
+            if terraform state show "${tf_address}" >/dev/null 2>&1; then
+              echo "Target group already tracked in Terraform state: ${tg_name}"
+              return 0
+            fi
+
+            TG_ARN=$(aws elbv2 describe-target-groups \
+              --names "${tg_name}" \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text 2>/dev/null || true)
+
+            if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+              echo "No pre-existing target group found for '${tg_name}'."
+              return 0
+            fi
+
+            echo "Found existing target group '${tg_name}'. Importing into Terraform state."
+            terraform import "${tf_address}" "${TG_ARN}"
+          }
+
+          mapfile -t SERVICES < <(grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' terraform.tfvars)
+
+          for SERVICE in "${SERVICES[@]}"; do
+            import_tg_if_needed "$SERVICE"
+          done
+
       - name: Terraform Apply
         run: terraform apply -lock-timeout=10m -auto-approve -no-color

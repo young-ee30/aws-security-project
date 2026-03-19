@@ -5,7 +5,7 @@ locals {
   reviews_bucket_arn  = "arn:aws:s3:::${local.reviews_bucket_name}"
   reviews_table_name  = "${var.name_prefix}-reviews"
   reviews_table_arn   = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/${local.reviews_table_name}"
-  enable_bastion      = var.bastion_key_name != null && length(var.bastion_ingress_cidrs) > 0
+  enable_bastion      = var.enable_bastion
   private_subnet_keys = toset([
     for idx, _ in var.private_subnet_cidrs : substr(var.azs[idx], length(var.azs[idx]) - 1, 1)
   ])
@@ -125,13 +125,15 @@ locals {
 }
 
 module "network" {
-  source               = "../../modules/network"
-  name_prefix          = var.name_prefix
-  vpc_cidr             = var.vpc_cidr
-  azs                  = var.azs
-  public_subnet_cidrs  = var.public_subnet_cidrs
-  private_subnet_cidrs = var.private_subnet_cidrs
-  tags                 = var.tags
+  source                = "../../modules/network"
+  name_prefix           = var.name_prefix
+  vpc_cidr              = var.vpc_cidr
+  azs                   = var.azs
+  public_subnet_cidrs   = var.public_subnet_cidrs
+  private_subnet_cidrs  = var.private_subnet_cidrs
+  tags                  = var.tags
+  bastion_ingress_cidrs = var.bastion_ingress_cidrs
+  app_ports             = distinct([for _, svc in var.services : svc.container_port])
 }
 
 module "bastion" {
@@ -223,10 +225,35 @@ module "ecs" {
   tags                        = var.tags
 }
 
+module "cloudfront" {
+  source = "../../modules/cloudfront"
+
+  name_prefix  = var.name_prefix
+  alb_dns_name = module.alb.alb_dns_name
+  tags         = var.tags
+
+  providers = {
+    aws.us_east_1 = aws.us_east_1
+  }
+}
+
+module "cloudtrail" {
+  source      = "../../modules/cloudtrail"
+  name_prefix = var.name_prefix
+  tags        = var.tags
+}
+
 module "monitoring" {
   source        = "../../modules/monitoring"
   name_prefix   = var.name_prefix
   cluster_name  = module.ecs.cluster_name
   service_names = [for k in keys(var.services) : "${var.name_prefix}-${k}"]
   tags          = var.tags
+}
+
+module "guardduty" {
+  source      = "../../modules/guardduty"
+  name_prefix = var.name_prefix
+  enabled     = true
+  tags        = var.tags
 }

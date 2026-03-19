@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { GitBranch, Clock, RefreshCw, Play, ChevronDown, ChevronRight, Copy, Sparkles } from 'lucide-react'
+import { GitBranch, Clock, RefreshCw, Play, ChevronDown, ChevronRight, Copy, Sparkles, Upload } from 'lucide-react'
 import { PageHeader } from '@/components/layout/Header'
 import { cn } from '@/lib/utils'
 import { pipelineData, securityScanLog } from '@/data/mockData'
@@ -11,6 +11,16 @@ export default function GitActionsPage() {
         title="GitHub Actions 로그"
         subtitle="CI/CD 파이프라인 실행 현황 및 정책 관리"
         lastUpdated="오후 2:12:27"
+        actions={
+          <button
+            type="button"
+            onClick={() => console.log('push')}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg"
+          >
+            <Upload className="w-3.5 h-3.5" />
+            Push
+          </button>
+        }
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

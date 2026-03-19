@@ -3,7 +3,8 @@ output "instance_id" {
 }
 
 output "public_ip" {
-  value = aws_instance.this.public_ip
+  description = "Elastic IP (재시작해도 변하지 않는 고정 IP)"
+  value       = aws_eip.bastion.public_ip
 }
 
 output "public_dns" {

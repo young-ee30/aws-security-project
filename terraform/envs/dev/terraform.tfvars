@@ -16,7 +16,6 @@ ecr_repositories = [
 active_backend = "api-spring"
 
 services = {
-
   api-node = {
     cpu            = 256
     memory         = 512
@@ -78,7 +77,6 @@ services = {
     path_patterns  = ["/*"]
     health_check   = "/"
   }
-
 }
 
 tags = {
@@ -92,7 +90,8 @@ db_username = "admin"
 # For local runs, export TF_VAR_db_password before terraform apply.
 # In GitHub Actions, set the TF_VAR_DB_PASSWORD secret.
 
-# Bastion is always created. Set these values to allow SSH access.
+# Bastion can be enabled without SSH by using SSM Session Manager.
+enable_bastion = true
 # bastion_key_name = "your-existing-keypair"
 # bastion_ingress_cidrs = ["203.0.113.10/32"]
 # bastion_instance_type = "t3.micro"

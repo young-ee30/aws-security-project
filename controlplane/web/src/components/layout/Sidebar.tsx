@@ -1,3 +1,4 @@
+import React from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   Activity,
@@ -7,8 +8,8 @@ import {
   Cloud,
   Database,
   FileText,
-  GitBranch,
   PanelLeftClose,
+  ScrollText,
   Server,
   Shield,
 } from 'lucide-react'
@@ -34,18 +35,38 @@ interface NavItem {
   icon: React.ComponentType<{ className?: string }>
 }
 
-const menuItems: NavItem[] = [
+/** 보안 · 운영 (상단 그룹 — 보안점검 / Git Actions 로그 / 보안 정책) */
+const securityOpsItems: NavItem[] = [
   { label: '보안 점검', path: '/security', icon: Shield },
+  { label: 'Git Actions 로그', path: '/git-actions', icon: FileText },
+  { label: '보안 정책', path: '/policy', icon: ScrollText },
+]
+
+/** 인프라 · 관측 (하단 그룹, 위와 간격 분리) */
+const infraItems: NavItem[] = [
   { label: '인프라 세부', path: '/infra', icon: Database },
   { label: '앱/HTTP 세부', path: '/app-http', icon: Activity },
   { label: 'AWS 리소스 세부', path: '/aws-resource', icon: Cloud },
 ]
 
-const cicdItems: NavItem[] = [
-  { label: 'CI / CD', path: '/cicd', icon: GitBranch },
-  { label: 'Git Actions 로그', path: '/git-actions', icon: FileText },
-  { label: '보안 정책', path: '/policy', icon: Shield },
-]
+function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
+  return (
+    <NavLink
+      to={item.path}
+      className={({ isActive }) =>
+        cn(
+          'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
+          isActive
+            ? 'bg-indigo-50 text-indigo-700 font-medium'
+            : 'text-gray-600 hover:bg-gray-50',
+        )
+      }
+    >
+      <item.icon className="w-4 h-4 shrink-0" />
+      {!collapsed && <span>{item.label}</span>}
+    </NavLink>
+  )
+}
 
 const StatusIcon = ({ status }: { status: ServerItem['status'] }) => {
   switch (status) {
@@ -133,44 +154,31 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
       )}
 
-      <nav className="flex-1 px-3 py-2 overflow-y-auto">
+      <nav className="flex-1 px-3 py-2 overflow-y-auto flex flex-col">
         <div className="space-y-1">
-          {menuItems.map((item) => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              className={({ isActive }) =>
-                cn(
-                  'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
-                  isActive
-                    ? 'bg-indigo-50 text-indigo-700 font-medium'
-                    : 'text-gray-600 hover:bg-gray-50',
-                )
-              }
-            >
-              <item.icon className="w-4 h-4" />
-              {!collapsed && <span>{item.label}</span>}
-            </NavLink>
+          {!collapsed && (
+            <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              보안 · 운영
+            </p>
+          )}
+          {securityOpsItems.map((item) => (
+            <NavMenuLink key={item.path} item={item} collapsed={collapsed} />
           ))}
         </div>
 
-        <div className="mt-4 pt-4 border-t border-gray-100">
-          {cicdItems.map((item) => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              className={({ isActive }) =>
-                cn(
-                  'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
-                  isActive
-                    ? 'bg-indigo-50 text-indigo-700 font-medium'
-                    : 'text-gray-600 hover:bg-gray-50',
-                )
-              }
-            >
-              <item.icon className="w-4 h-4" />
-              {!collapsed && <span>{item.label}</span>}
-            </NavLink>
+        <div
+          className={cn('shrink-0 border-t border-gray-100', collapsed ? 'my-4' : 'my-6 mt-8')}
+          aria-hidden
+        />
+
+        <div className="space-y-1">
+          {!collapsed && (
+            <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              인프라 · 관측
+            </p>
+          )}
+          {infraItems.map((item) => (
+            <NavMenuLink key={item.path} item={item} collapsed={collapsed} />
           ))}
         </div>
       </nav>
