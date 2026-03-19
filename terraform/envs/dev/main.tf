@@ -174,6 +174,18 @@ module "ecs" {
   tags                        = var.tags
 }
 
+module "cloudfront" {
+  source = "../../modules/cloudfront"
+
+  name_prefix  = var.name_prefix
+  alb_dns_name = module.alb.alb_dns_name
+  tags         = var.tags
+
+  providers = {
+    aws.us_east_1 = aws.us_east_1
+  }
+}
+
 module "monitoring" {
   source        = "../../modules/monitoring"
   name_prefix   = var.name_prefix

@@ -9,23 +9,22 @@ data "aws_iam_policy_document" "ecs_task_assume_role" {
   }
 }
 
+# CloudFront 관리형 Prefix List — ALB가 CloudFront 엣지 노드 트래픽만 수락
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
-  description = "ALB security group"
+  description = "ALB accepts traffic only from CloudFront edge nodes"
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = var.alb_ingress_cidrs
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = var.alb_ingress_cidrs
+    description     = "HTTP from CloudFront only"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
   }
 
   egress {
