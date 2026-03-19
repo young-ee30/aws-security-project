@@ -64,9 +64,10 @@ interface PageHeaderProps {
   subtitle: string
   lastUpdated?: string
   onRefresh?: () => void
+  actions?: React.ReactNode
 }
 
-export function PageHeader({ title, subtitle, lastUpdated, onRefresh }: PageHeaderProps) {
+export function PageHeader({ title, subtitle, lastUpdated, onRefresh, actions }: PageHeaderProps) {
   void onRefresh
 
   return (
@@ -75,10 +76,15 @@ export function PageHeader({ title, subtitle, lastUpdated, onRefresh }: PageHead
         <h1 className="text-xl font-semibold text-gray-900">{title}</h1>
         <p className="text-sm text-gray-500 mt-1">{subtitle}</p>
       </div>
-      {lastUpdated && (
-        <div className="flex items-center gap-2 text-sm text-gray-500">
-          <RefreshCw className="w-4 h-4" />
-          <span>{lastUpdated} 업데이트</span>
+      {(lastUpdated || actions) && (
+        <div className="flex flex-col items-end">
+          {lastUpdated && (
+            <div className="flex items-center gap-2 text-sm text-gray-500">
+              <RefreshCw className="w-4 h-4" />
+              <span>{lastUpdated} 업데이트</span>
+            </div>
+          )}
+          {actions && <div className={lastUpdated ? 'mt-2' : undefined}>{actions}</div>}
         </div>
       )}
     </div>

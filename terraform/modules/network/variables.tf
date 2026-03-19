@@ -28,3 +28,15 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "bastion_ingress_cidrs" {
+  description = "Bastion SSH 허용 CIDR (Public NACL 인바운드 22번). Bastion 모듈과 동일 값 권장."
+  type        = list(string)
+  default     = []
+}
+
+variable "app_ports" {
+  description = "Private NACL에서 VPC 내부(ALB→ECS)로 허용할 컨테이너 TCP 포트 목록"
+  type        = list(number)
+  default     = [3000]
+}
