@@ -72,17 +72,6 @@ resource "aws_network_acl_rule" "public_in_ephemeral" {
   to_port        = 65535
 }
 
-resource "aws_network_acl_rule" "public_in_deny" {
-  network_acl_id = aws_network_acl.public.id
-  rule_number    = 32767
-  egress         = false
-  protocol       = "-1"
-  rule_action    = "deny"
-  cidr_block     = "0.0.0.0/0"
-  from_port      = 0
-  to_port        = 0
-}
-
 # ─── Public NACL: 아웃바운드 (넓게) ──────────────────────────────────────────
 resource "aws_network_acl_rule" "public_out_allow" {
   network_acl_id = aws_network_acl.public.id
@@ -90,17 +79,6 @@ resource "aws_network_acl_rule" "public_out_allow" {
   egress         = true
   protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "0.0.0.0/0"
-  from_port      = 0
-  to_port        = 0
-}
-
-resource "aws_network_acl_rule" "public_out_deny" {
-  network_acl_id = aws_network_acl.public.id
-  rule_number    = 32767
-  egress         = true
-  protocol       = "-1"
-  rule_action    = "deny"
   cidr_block     = "0.0.0.0/0"
   from_port      = 0
   to_port        = 0
@@ -153,17 +131,6 @@ resource "aws_network_acl_rule" "private_in_ephemeral" {
   to_port        = 65535
 }
 
-resource "aws_network_acl_rule" "private_in_deny" {
-  network_acl_id = aws_network_acl.private.id
-  rule_number    = 32767
-  egress         = false
-  protocol       = "-1"
-  rule_action    = "deny"
-  cidr_block     = "0.0.0.0/0"
-  from_port      = 0
-  to_port        = 0
-}
-
 # ─── Private NACL: 아웃바운드 (넓게) ─────────────────────────────────────────
 resource "aws_network_acl_rule" "private_out_allow" {
   network_acl_id = aws_network_acl.private.id
@@ -171,17 +138,6 @@ resource "aws_network_acl_rule" "private_out_allow" {
   egress         = true
   protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "0.0.0.0/0"
-  from_port      = 0
-  to_port        = 0
-}
-
-resource "aws_network_acl_rule" "private_out_deny" {
-  network_acl_id = aws_network_acl.private.id
-  rule_number    = 32767
-  egress         = true
-  protocol       = "-1"
-  rule_action    = "deny"
   cidr_block     = "0.0.0.0/0"
   from_port      = 0
   to_port        = 0
