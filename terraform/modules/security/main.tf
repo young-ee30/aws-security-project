@@ -16,7 +16,7 @@ data "aws_ec2_managed_prefix_list" "cloudfront" {
 
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
-  description = "ALB accepts traffic only from CloudFront edge nodes"
+  description = "ALB security group"
   vpc_id      = var.vpc_id
 
   ingress {
