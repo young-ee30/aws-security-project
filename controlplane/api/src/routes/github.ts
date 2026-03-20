@@ -1,12 +1,19 @@
 import { Router } from 'express'
 import {
+  dispatchFullPipeline,
   dispatchWorkflow,
   getWorkflowRunJobs,
   getWorkflowRunLogs,
   listWorkflowRuns,
   rerunFailedJobs,
+  rerunWorkflowRun,
+  getPullRequest,
+  mergePullRequest,
+  closePullRequest,
 } from '../github/actions.js'
 import { getInstallationForRepository, getRepositoryMetadata } from '../github/app.js'
+import { generateRunSummary } from '../fix/summarize.js'
+
 
 export const githubRouter = Router()
 
@@ -81,6 +88,21 @@ githubRouter.get('/api/github/runs/:runId/logs', async (req, res, next) => {
   }
 })
 
+githubRouter.get('/api/github/runs/:runId/summary', async (req, res, next) => {
+  try {
+    const runId = Number(req.params.runId)
+    if (Number.isNaN(runId)) {
+      res.status(400).json({ error: 'runId must be a number' })
+      return
+    }
+
+    const summary = await generateRunSummary(runId)
+    res.json(summary)
+  } catch (error) {
+    next(error)
+  }
+})
+
 githubRouter.post('/api/github/runs/:runId/rerun-failed', async (req, res, next) => {
   try {
     const runId = Number(req.params.runId)
@@ -96,6 +118,31 @@ githubRouter.post('/api/github/runs/:runId/rerun-failed', async (req, res, next)
   }
 })
 
+githubRouter.post('/api/github/runs/:runId/rerun', async (req, res, next) => {
+  try {
+    const runId = Number(req.params.runId)
+    if (Number.isNaN(runId)) {
+      res.status(400).json({ error: 'runId must be a number' })
+      return
+    }
+
+    const result = await rerunWorkflowRun(runId)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+githubRouter.post('/api/github/pipeline/run-all', async (req, res, next) => {
+  try {
+    const ref = typeof req.body?.ref === 'string' ? req.body.ref : undefined
+    const result = await dispatchFullPipeline(ref)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
 githubRouter.post('/api/github/workflows/:workflowId/dispatch', async (req, res, next) => {
   try {
     const workflowId = req.params.workflowId
@@ -103,6 +150,51 @@ githubRouter.post('/api/github/workflows/:workflowId/dispatch', async (req, res,
     const inputs = typeof req.body?.inputs === 'object' && req.body?.inputs ? req.body.inputs : undefined
 
     const result = await dispatchWorkflow(workflowId, ref, inputs)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+githubRouter.get('/api/github/pulls/:prNumber', async (req, res, next) => {
+  try {
+    const prNumber = Number(req.params.prNumber)
+    if (Number.isNaN(prNumber)) {
+      res.status(400).json({ error: 'prNumber must be a number' })
+      return
+    }
+
+    const pr = await getPullRequest(prNumber)
+    res.json(pr)
+  } catch (error) {
+    next(error)
+  }
+})
+
+githubRouter.post('/api/github/pulls/:prNumber/merge', async (req, res, next) => {
+  try {
+    const prNumber = Number(req.params.prNumber)
+    if (Number.isNaN(prNumber)) {
+      res.status(400).json({ error: 'prNumber must be a number' })
+      return
+    }
+
+    const result = await mergePullRequest(prNumber)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+githubRouter.patch('/api/github/pulls/:prNumber/close', async (req, res, next) => {
+  try {
+    const prNumber = Number(req.params.prNumber)
+    if (Number.isNaN(prNumber)) {
+      res.status(400).json({ error: 'prNumber must be a number' })
+      return
+    }
+
+    const result = await closePullRequest(prNumber)
     res.json(result)
   } catch (error) {
     next(error)

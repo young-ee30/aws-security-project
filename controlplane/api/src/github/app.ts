@@ -57,7 +57,9 @@ export async function getRepositoryMetadata() {
   let response
 
   try {
-    response = await githubApp.octokit.request('GET /repos/{owner}/{repo}', {
+    const octokit = await getRepoOctokit()
+
+    response = await octokit.request('GET /repos/{owner}/{repo}', {
       owner: env.githubOwner,
       repo: env.githubRepo,
     })

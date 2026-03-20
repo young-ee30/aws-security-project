@@ -82,7 +82,7 @@ Repository permissions
 - Contents: Read & write
 - Pull requests: Read & write
 - Metadata: Read-only
-- Workflows: Read & write
+- workflows: Read & write
 - Checks: Read-only
 - Commit statuses: Read-only
 ```
@@ -92,9 +92,9 @@ Repository permissions
 - `Actions`: workflow run 조회, 재실행, `workflow_dispatch`
 - `Contents`: 브랜치 생성, 파일 수정, commit, push
 - `Pull requests`: AI 수정 후 PR 생성
-- `Workflows`: `.github/workflows/**` 수정이 필요할 때 사용
+- `workflows`: `.github/workflows/**` 수정이 필요할 때 사용
 
-`Workflows` 권한은 실제로 workflow 파일을 AI가 고칠 가능성이 있으면 유지하고, 아니라면 나중에 빼도 됩니다.
+`workflows` 권한은 실제로 workflow 파일을 AI가 고칠 가능성이 있으면 유지하고, 아니라면 나중에 빼도 됩니다.
 
 ## 5. Webhook 이벤트
 

@@ -99,7 +99,7 @@ terraform apply (로컬 또는 GitHub Actions)
 
 **backend.tf (envs/dev/)** 는 state를 S3에 저장하겠다는 선언입니다. 버킷 이름은 보안상 코드에 직접 쓰지 않고, 실행 시점에 `backend.hcl` 파일로 주입합니다.
 
-**GitHub Actions에서 backend.hcl 생성 방법 (`terraform-dev-plan-apply.yml` 워크플로우)**:
+**GitHub Actions에서 backend.hcl 생성 방법 (`terraform-dev-plan-apply.yml` workflow)**:
 ```yaml
 - name: Create backend config
   run: |
@@ -113,7 +113,7 @@ terraform apply (로컬 또는 GitHub Actions)
   run: terraform init -backend-config=backend.hcl
 ```
 
-`TF_STATE_BUCKET` repository variable에 버킷 이름이 저장되어 있고, 워크플로우 실행 시마다 `backend.hcl` 파일을 동적으로 생성해서 사용합니다.
+`TF_STATE_BUCKET` repository variable에 버킷 이름이 저장되어 있고, workflow 실행 시마다 `backend.hcl` 파일을 동적으로 생성해서 사용합니다.
 
 ---
 
@@ -251,7 +251,7 @@ terraform apply
 
 ### GitHub Actions에서 자동 실행
 
-`terraform/**` 경로 변경 후 push하면 `terraform.yml` 워크플로우가 자동 실행됩니다.
+`terraform/**` 경로 변경 후 push하면 `terraform.yml` workflow가 자동 실행됩니다.
 GitHub Secret `TF_VAR_DB_PASSWORD`에 비밀번호를 등록해야 합니다.
 
 ---
@@ -265,7 +265,7 @@ GitHub Secret `TF_VAR_DB_PASSWORD`에 비밀번호를 등록해야 합니다.
 | `AWS_ROLE_ARN` | `arn:aws:iam::282146511585:role/GitHubActions-ECR-Role` | bootstrap-terraform-state.yml, terraform-dev-plan-apply.yml, deploy-node-api-ecs.yml |
 | `TF_VAR_DB_PASSWORD` | RDS 마스터 비밀번호 | terraform-dev-plan-apply.yml |
 
-`TF_VAR_DB_PASSWORD`는 워크플로우에서 `TF_VAR_db_password` 환경변수로 매핑되고, Terraform이 이를 자동으로 `var.db_password`에 연결합니다.
+`TF_VAR_DB_PASSWORD`는 workflow에서 `TF_VAR_db_password` 환경변수로 매핑되고, Terraform이 이를 자동으로 `var.db_password`에 연결합니다.
 
 ### Repository variables
 

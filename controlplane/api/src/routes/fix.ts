@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { createPullRequestFromFiles } from '../github/changes.js'
-import { env } from '../config/env.js'
+import { generateFixSuggestion } from '../fix/suggest.js'
 
 interface ConfirmRequestBody {
   baseBranch?: string
@@ -16,15 +16,14 @@ interface ConfirmRequestBody {
 
 export const fixRouter = Router()
 
-fixRouter.post('/api/github/fix-sessions/:runId/suggest', async (req, res) => {
-  const runId = req.params.runId
-
-  res.status(501).json({
-    ok: false,
-    runId,
-    message: 'Suggest endpoint is not implemented yet.',
-    configuredModel: env.llmModel,
-  })
+fixRouter.post('/api/github/fix-sessions/:runId/suggest', async (req, res, next) => {
+  try {
+    const runId = req.params.runId
+    const suggestion = await generateFixSuggestion(runId)
+    res.json(suggestion)
+  } catch (error) {
+    next(error)
+  }
 })
 
 fixRouter.post('/api/github/fix-sessions/:runId/confirm', async (req, res, next) => {

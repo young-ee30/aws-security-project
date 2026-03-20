@@ -1,24 +1,57 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
   Clock3,
+  Code2,
   Copy,
   ExternalLink,
+  FileCode,
   GitBranch,
+  GitMerge,
+  GitPullRequest,
   Play,
   RefreshCw,
+  RotateCcw,
   Sparkles,
+  X,
 } from 'lucide-react'
 import { PageHeader } from '@/components/layout/Header'
+import PipelineGraph from '@/components/pipeline/PipelineGraph'
+import StepTimeline from '@/components/pipeline/StepTimeline'
 import { cn } from '@/lib/utils'
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') || 'http://localhost:4000'
 const POLLING_INTERVAL_MS = 15000
+const NEW_RUN_POLL_ATTEMPTS = 10
+const NEW_RUN_POLL_INTERVAL_MS = 1500
+const FULL_PIPELINE_WORKFLOW_NAME = 'Bootstrap Terraform State'
+const PIPELINE_WORKFLOW_NAMES = [
+  'Bootstrap Terraform State',
+  'Terraform Dev Plan and Apply',
+  'Deploy Selected Services to ECS',
+] as const
+
+function getWorkflowDescription(workflowName: string): string {
+  if (workflowName === 'Bootstrap Terraform State') {
+    return 'state 파일 저장용 s3 버킷 확인'
+  }
+
+  if (workflowName === 'Terraform Dev Plan and Apply') {
+    return 'terraform 보안 점검 및 인프라 배포 계획 설계'
+  }
+
+  if (workflowName === 'Deploy Selected Services to ECS') {
+    return 'ECS에 도커 이미지 배포'
+  }
+
+  return 'workflow 요약'
+}
 
 interface WorkflowRun {
   id: number
+  workflowId: number
   name: string
   displayTitle: string
   status: string
@@ -88,7 +121,71 @@ interface SuggestResponse {
   ok: boolean
   runId: string
   message: string
+  mode?: 'rule-based' | 'llm' | 'hybrid'
   configuredModel?: string
+  summary?: string
+  rootCause?: string
+  riskLevel?: 'low' | 'medium' | 'high'
+  nextActions?: string[]
+  candidateFiles?: Array<{
+    path: string
+    reason: string
+  }>
+  patchIdea?: string
+  matchedRules?: string[]
+  relatedJobs?: Array<{
+    jobId: number
+    name: string
+    failedSteps: string[]
+  }>
+  llmAnalysis?: string
+  suggestedFiles?: Array<{
+    path: string
+    content: string
+  }>
+}
+
+interface PrReview {
+  number: number
+  title: string
+  state: string
+  merged: boolean
+  htmlUrl: string
+  headBranch: string
+  baseBranch: string
+  files: Array<{
+    filename: string
+    status: string
+    additions: number
+    deletions: number
+    patch: string | null
+  }>
+}
+
+interface StepSummary {
+  name: string
+  number: number
+  status: string
+  conclusion: string | null
+  summary: string
+  durationSeconds: number | null
+}
+
+interface JobSummary {
+  jobId: number
+  name: string
+  status: string
+  conclusion: string | null
+  summary: string
+  durationSeconds: number | null
+  steps: StepSummary[]
+}
+
+interface RunSummaryResponse {
+  runId: number
+  jobs: JobSummary[]
+  overallSummary: string
+  currentPhase: string | null
 }
 
 interface GithubStatusResponse {
@@ -119,10 +216,45 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   })
 
   const text = await response.text()
-  const data = text ? (JSON.parse(text) as T & ApiErrorPayload) : null
+  const contentType = response.headers.get('content-type') || ''
+  let data: (T & ApiErrorPayload) | null = null
+
+  if (text) {
+    const looksLikeJson = contentType.includes('application/json') || /^[\s]*[\[{]/.test(text)
+
+    if (looksLikeJson) {
+      try {
+        data = JSON.parse(text) as T & ApiErrorPayload
+      } catch {
+        throw new Error(`API returned invalid JSON for ${path}`)
+      }
+    }
+  }
 
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || `Request failed with HTTP ${response.status}`)
+    if (data?.error || data?.message) {
+      throw new Error(data.error || data.message || `Request failed with HTTP ${response.status}`)
+    }
+
+    if (/^\s*</.test(text)) {
+      throw new Error(
+        `API returned HTML instead of JSON for ${path} (HTTP ${response.status}). controlplane-api may need restart.`,
+      )
+    }
+
+    if (text.trim()) {
+      throw new Error(text.trim())
+    }
+
+    throw new Error(`Request failed with HTTP ${response.status}`)
+  }
+
+  if (text && data === null) {
+    if (/^\s*</.test(text)) {
+      throw new Error(`API returned HTML instead of JSON for ${path}. Check API server routing.`)
+    }
+
+    throw new Error(`API returned a non-JSON response for ${path}`)
   }
 
   return data as T
@@ -154,6 +286,65 @@ function formatDuration(startedAt?: string | null, completedAt?: string | null):
   }
 
   return `${seconds}s`
+}
+
+function pickPreferredRun(runs: WorkflowRun[]): WorkflowRun | null {
+  const selectableRuns = getSelectableRuns(runs)
+  return selectableRuns.find((run) => run.status !== 'completed' || run.conclusion === 'failure') || selectableRuns[0] || null
+}
+
+function isPipelineWorkflowRun(run: WorkflowRun): boolean {
+  return PIPELINE_WORKFLOW_NAMES.includes(run.name as (typeof PIPELINE_WORKFLOW_NAMES)[number])
+}
+
+function getSelectableRuns(runs: WorkflowRun[]): WorkflowRun[] {
+  const pipelineRuns = runs.filter(isPipelineWorkflowRun)
+  return pipelineRuns.length > 0 ? pipelineRuns : runs
+}
+
+function getVisibleWorkflowRuns(runs: WorkflowRun[]): WorkflowRun[] {
+  const selectableRuns = getSelectableRuns(runs)
+
+  return PIPELINE_WORKFLOW_NAMES.map((workflowName) => selectableRuns.find((run) => run.name === workflowName)).filter(
+    (run): run is WorkflowRun => !!run,
+  )
+}
+
+function getLatestRunForWorkflowId(runs: WorkflowRun[], workflowId: number | null): WorkflowRun | null {
+  if (!workflowId) {
+    return null
+  }
+
+  return getSelectableRuns(runs).find((run) => run.workflowId === workflowId) || null
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function isFreshFullPipelineRun(
+  run: WorkflowRun,
+  branch: string,
+  requestedAtMs: number,
+  previousNewestRunId: number | null,
+) {
+  const createdAtMs = new Date(run.createdAt).getTime()
+
+  if (run.id === previousNewestRunId) {
+    return false
+  }
+
+  if (run.name !== FULL_PIPELINE_WORKFLOW_NAME || run.event !== 'workflow_dispatch' || run.branch !== branch) {
+    return false
+  }
+
+  if (Number.isNaN(createdAtMs)) {
+    return false
+  }
+
+  return createdAtMs >= requestedAtMs - 5000
 }
 
 function formatRelativeTime(isoString?: string | null): string {
@@ -277,6 +468,137 @@ function splitLogLines(content: string): string[] {
   return content.split(/\r?\n/)
 }
 
+type ParsedLogTone =
+  | 'default'
+  | 'error'
+  | 'warning'
+  | 'notice'
+  | 'command'
+  | 'group'
+  | 'debug'
+  | 'muted'
+  | 'info'
+
+interface ParsedLogLine {
+  lineNumber: number
+  timestamp: string | null
+  message: string
+  tone: ParsedLogTone
+  indentLevel: number
+}
+
+function parseLogLines(content: string): ParsedLogLine[] {
+  const lines = splitLogLines(content)
+  let currentIndentLevel = 0
+
+  return lines.map((rawLine, index) => {
+    const lineNumber = index + 1
+    const timestampMatch = rawLine.match(
+      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s?(.*)$/,
+    )
+
+    const timestamp = timestampMatch?.[1] || null
+    const body = timestampMatch?.[2] ?? rawLine
+    const markerMatch = body.match(
+      /^(##\[(group|endgroup|error|warning|notice|command|debug|section)\]|::(error|warning|notice|group|endgroup)::)(.*)$/,
+    )
+
+    let indentLevel = currentIndentLevel
+    let tone: ParsedLogTone = 'default'
+    let message = body
+
+    if (markerMatch) {
+      const bracketMarker = markerMatch[2]
+      const workflowCommandMarker = markerMatch[4]
+      const marker = bracketMarker || workflowCommandMarker
+      const tail = markerMatch[5]?.trim() || ''
+
+      if (marker === 'endgroup') {
+        currentIndentLevel = Math.max(0, currentIndentLevel - 1)
+        indentLevel = currentIndentLevel
+        tone = 'muted'
+        message = tail || 'End group'
+      } else if (marker === 'group') {
+        indentLevel = currentIndentLevel
+        tone = 'group'
+        message = tail || 'Group'
+        currentIndentLevel += 1
+      } else if (marker === 'error') {
+        tone = 'error'
+        message = tail || body
+      } else if (marker === 'warning') {
+        tone = 'warning'
+        message = tail || body
+      } else if (marker === 'notice' || marker === 'section') {
+        tone = 'notice'
+        message = tail || body
+      } else if (marker === 'command') {
+        tone = 'command'
+        message = tail || body
+      } else if (marker === 'debug') {
+        tone = 'debug'
+        message = tail || body
+      }
+    } else if (/logs are not available yet/i.test(body) || /downloadable log archive/i.test(body)) {
+      tone = 'info'
+      message = body
+    } else if (/error|failed|fatal/i.test(body)) {
+      tone = 'error'
+      message = body
+    } else if (/warn|warning/i.test(body)) {
+      tone = 'warning'
+      message = body
+    } else if (body.trim().length === 0) {
+      tone = 'muted'
+      message = ''
+    }
+
+    return {
+      lineNumber,
+      timestamp,
+      message,
+      tone,
+      indentLevel,
+    }
+  })
+}
+
+function getLogToneClass(tone: ParsedLogTone): string {
+  if (tone === 'error') {
+    return 'text-red-700'
+  }
+
+  if (tone === 'warning') {
+    return 'text-amber-700'
+  }
+
+  if (tone === 'notice') {
+    return 'text-sky-700'
+  }
+
+  if (tone === 'command') {
+    return 'text-emerald-700'
+  }
+
+  if (tone === 'group') {
+    return 'text-gray-900 font-semibold'
+  }
+
+  if (tone === 'debug') {
+    return 'text-fuchsia-700'
+  }
+
+  if (tone === 'info') {
+    return 'text-cyan-700'
+  }
+
+  if (tone === 'muted') {
+    return 'text-gray-400'
+  }
+
+  return 'text-gray-700'
+}
+
 export default function GitActionsPage() {
   const [status, setStatus] = useState<GithubStatusResponse | null>(null)
   const [runs, setRuns] = useState<WorkflowRun[]>([])
@@ -290,13 +612,84 @@ export default function GitActionsPage() {
   const [statusError, setStatusError] = useState<string | null>(null)
   const [runsError, setRunsError] = useState<string | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [executeLoading, setExecuteLoading] = useState(false)
   const [rerunLoading, setRerunLoading] = useState(false)
+  const [rerunAction, setRerunAction] = useState<'all' | 'failed' | null>(null)
   const [suggestLoading, setSuggestLoading] = useState(false)
   const [suggestion, setSuggestion] = useState<SuggestResponse | null>(null)
   const [actionMessage, setActionMessage] = useState<string | null>(null)
-  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null)
+  const [runSummary, setRunSummary] = useState<RunSummaryResponse | null>(null)
+  const [prReview, setPrReview] = useState<PrReview | null>(null)
+  const [applyLoading, setApplyLoading] = useState(false)
+  const [prActionLoading, setPrActionLoading] = useState(false)
+  const selectedRunIdRef = useRef<number | null>(null)
+  const selectedWorkflowIdRef = useRef<number | null>(null)
+  const manualSelectionVersionRef = useRef(0)
+  const latestDetailRequestIdRef = useRef(0)
+  const latestLogsRequestIdRef = useRef(0)
+  const latestSummaryRequestIdRef = useRef(0)
 
   const selectedRun = runs.find((run) => run.id === selectedRunId) || null
+  const isGithubDisconnected = !loadingStatus && (!status || !!statusError)
+
+  useEffect(() => {
+    selectedRunIdRef.current = selectedRunId
+  }, [selectedRunId])
+
+  useEffect(() => {
+    selectedWorkflowIdRef.current = selectedRun?.workflowId ?? null
+  }, [selectedRun])
+
+  async function fetchRuns(limit = 20) {
+    const response = await apiFetch<WorkflowRunsResponse>(`/api/github/runs?limit=${limit}`)
+    return response.runs
+  }
+
+  function handleSelectRun(runId: number) {
+    manualSelectionVersionRef.current += 1
+    setSelectedRunId(runId)
+  }
+
+  async function loadRunSummary(runId: number) {
+    const requestId = latestSummaryRequestIdRef.current + 1
+    latestSummaryRequestIdRef.current = requestId
+
+    try {
+      const response = await apiFetch<RunSummaryResponse>(`/api/github/runs/${runId}/summary`)
+      if (latestSummaryRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return
+      }
+      setRunSummary(response)
+    } catch {
+      if (latestSummaryRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return
+      }
+      setRunSummary(null)
+    }
+  }
+
+  async function loadRunLogs(runId: number) {
+    const requestId = latestLogsRequestIdRef.current + 1
+    latestLogsRequestIdRef.current = requestId
+
+    try {
+      const response = await apiFetch<WorkflowLogsResponse>(`/api/github/runs/${runId}/logs`)
+      if (latestLogsRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return []
+      }
+
+      setLogs(response.logs)
+      setExpandedJobIds((current) => (current.length > 0 ? current : response.selectedJobIds))
+      return response.logs
+    } catch {
+      if (latestLogsRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return []
+      }
+
+      setLogs([])
+      return []
+    }
+  }
 
   async function loadStatus(silent = false) {
     if (!silent) {
@@ -318,7 +711,13 @@ export default function GitActionsPage() {
     }
   }
 
-  async function loadRuns(silent = false) {
+  async function loadRuns(
+    silent = false,
+    options?: {
+      preserveSelection?: boolean
+      preferredRunId?: number | null
+    },
+  ) {
     if (!silent) {
       setLoadingRuns(true)
     }
@@ -326,22 +725,23 @@ export default function GitActionsPage() {
     setRunsError(null)
 
     try {
-      const response = await apiFetch<WorkflowRunsResponse>('/api/github/runs?limit=20')
-      setRuns(response.runs)
-      setLastSyncedAt(new Date().toISOString())
-      setSelectedRunId((current) => {
-        if (current && response.runs.some((run) => run.id === current)) {
-          return current
-        }
+      const nextRuns = await fetchRuns()
+      const preferredRunId = options?.preferredRunId ?? null
+      const preserveSelection = options?.preserveSelection ?? true
+      const selectableRuns = getSelectableRuns(nextRuns)
+      const preferredRun = preferredRunId ? nextRuns.find((run) => run.id === preferredRunId) || null : null
+      const preservedRun =
+        preserveSelection && selectedWorkflowIdRef.current
+          ? selectableRuns.find((run) => run.workflowId === selectedWorkflowIdRef.current) || null
+          : null
+      const nextSelectedRun = preferredRun || preservedRun || pickPreferredRun(nextRuns)
 
-        const preferredRun =
-          response.runs.find((run) => run.status !== 'completed' || run.conclusion === 'failure') ||
-          response.runs[0]
-
-        return preferredRun?.id ?? null
-      })
+      setRuns(nextRuns)
+      setSelectedRunId(nextSelectedRun?.id ?? null)
+      return nextRuns
     } catch (error) {
       setRunsError(error instanceof Error ? error.message : '실행 목록을 불러오지 못했습니다.')
+      return []
     } finally {
       if (!silent) {
         setLoadingRuns(false)
@@ -349,25 +749,60 @@ export default function GitActionsPage() {
     }
   }
 
+  async function waitForFreshFullPipelineRun(
+    branch: string,
+    requestedAtMs: number,
+    previousNewestRunId: number | null,
+  ) {
+    for (let attempt = 0; attempt < NEW_RUN_POLL_ATTEMPTS; attempt += 1) {
+      try {
+        const nextRuns = await fetchRuns()
+        const freshRun = nextRuns.find((run) =>
+          isFreshFullPipelineRun(run, branch, requestedAtMs, previousNewestRunId),
+        )
+
+        setRuns(nextRuns)
+
+        if (freshRun) {
+          return freshRun
+        }
+      } catch {
+        // Ignore transient polling failures after dispatch and keep waiting for the new run.
+      }
+
+      if (attempt < NEW_RUN_POLL_ATTEMPTS - 1) {
+        await sleep(NEW_RUN_POLL_INTERVAL_MS)
+      }
+    }
+
+    return null
+  }
+
   async function loadRunDetail(runId: number, silent = false) {
+    const requestId = latestDetailRequestIdRef.current + 1
+    latestDetailRequestIdRef.current = requestId
+
     if (!silent) {
       setLoadingDetail(true)
       setDetailError(null)
     }
 
     try {
-      const [jobsResponse, logsResponse] = await Promise.all([
-        apiFetch<WorkflowJobsResponse>(`/api/github/runs/${runId}/jobs`),
-        apiFetch<WorkflowLogsResponse>(`/api/github/runs/${runId}/logs`),
-      ])
+      const jobsResponse = await apiFetch<WorkflowJobsResponse>(`/api/github/runs/${runId}/jobs`)
+
+      if (latestDetailRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return
+      }
 
       setJobs(jobsResponse.jobs)
-      setLogs(logsResponse.logs)
-      setExpandedJobIds((current) => (current.length > 0 && silent ? current : logsResponse.selectedJobIds))
     } catch (error) {
+      if (latestDetailRequestIdRef.current !== requestId || selectedRunIdRef.current !== runId) {
+        return
+      }
+
       setDetailError(error instanceof Error ? error.message : '실행 상세를 불러오지 못했습니다.')
     } finally {
-      if (!silent) {
+      if (!silent && latestDetailRequestIdRef.current === requestId && selectedRunIdRef.current === runId) {
         setLoadingDetail(false)
       }
     }
@@ -376,37 +811,116 @@ export default function GitActionsPage() {
   async function handleRefresh() {
     setActionMessage(null)
     await loadStatus()
-    await loadRuns()
-    if (selectedRunId) {
-      await loadRunDetail(selectedRunId)
+    const nextRuns = await loadRuns()
+    const nextSelectedRun = getLatestRunForWorkflowId(nextRuns, selectedWorkflowIdRef.current) || pickPreferredRun(nextRuns)
+    if (nextSelectedRun) {
+      await Promise.all([
+        loadRunDetail(nextSelectedRun.id),
+        loadRunSummary(nextSelectedRun.id),
+        loadRunLogs(nextSelectedRun.id),
+      ])
     }
   }
 
-  async function handleRerunFailed() {
+  async function handleExecuteworkflow() {
+    if (!status?.repository.defaultBranch) {
+      return
+    }
+
+    const targetBranch = selectedRun?.branch || status.repository.defaultBranch
+    const previousNewestRunId = runs[0]?.id ?? null
+    const requestedAtMs = Date.now()
+    const selectionVersionAtRequest = manualSelectionVersionRef.current
+
+    setExecuteLoading(true)
+    setActionMessage(null)
+
+    try {
+      await apiFetch<{ ok: boolean; workflowId: string; ref: string; message: string }>(
+        '/api/github/pipeline/run-all',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ref: targetBranch,
+          }),
+        },
+      )
+
+      setActionMessage(
+        '전체 실행을 요청했습니다. Bootstrap Terraform State부터 GitHub Actions 체인이 새로 시작됩니다.',
+      )
+      const freshRun = await waitForFreshFullPipelineRun(targetBranch, requestedAtMs, previousNewestRunId)
+
+      if (freshRun) {
+        if (manualSelectionVersionRef.current === selectionVersionAtRequest) {
+          setSelectedRunId(freshRun.id)
+          setActionMessage(`전체 실행을 요청했고 새로 시작된 run #${freshRun.runNumber} 로 전환했습니다.`)
+        } else {
+          setActionMessage(`전체 실행을 요청했고 새 run #${freshRun.runNumber} 도 생성됐습니다.`)
+        }
+      } else {
+        await loadRuns(true, { preserveSelection: false })
+      }
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : '전체 실행 요청에 실패했습니다.')
+    } finally {
+      setExecuteLoading(false)
+    }
+  }
+
+  async function handleRerun(action: 'all' | 'failed') {
     if (!selectedRunId) {
       return
     }
 
     setRerunLoading(true)
+    setRerunAction(action)
     setActionMessage(null)
 
     try {
-      const response = await apiFetch<{ message: string }>(`/api/github/runs/${selectedRunId}/rerun-failed`, {
+      const endpoint = action === 'all' ? 'rerun' : 'rerun-failed'
+      await apiFetch<{ message: string }>(`/api/github/runs/${selectedRunId}/${endpoint}`, {
         method: 'POST',
       })
 
-      setActionMessage(response.message)
+      setActionMessage(
+        action === 'all'
+          ? '현재 run의 모든 job 재실행을 요청했습니다.'
+          : '현재 run의 실패 job 재실행을 요청했습니다.',
+      )
       await loadRuns(true)
       await loadRunDetail(selectedRunId, true)
+      void loadRunLogs(selectedRunId)
     } catch (error) {
-      setActionMessage(error instanceof Error ? error.message : '재실행 요청에 실패했습니다.')
+      setActionMessage(
+        error instanceof Error
+          ? error.message
+          : action === 'all'
+            ? '현재 작업 재실행 요청에 실패했습니다.'
+            : '현재 run의 실패 job 재실행 요청에 실패했습니다.',
+      )
     } finally {
       setRerunLoading(false)
+      setRerunAction(null)
     }
   }
 
+  async function handleRerunAll() {
+    await handleRerun('all')
+  }
+
+  async function handleRerunFailed() {
+    await handleRerun('failed')
+  }
+
   async function handleCopyLogs() {
-    const combinedLog = logs
+    if (!selectedRunId) {
+      return
+    }
+
+    const logsToCopy = logs.length > 0 ? logs : await loadRunLogs(selectedRunId)
+
+    const combinedLog = logsToCopy
       .map((log) => [`# ${log.name}`, log.content.trim()].join('\n'))
       .filter(Boolean)
       .join('\n\n')
@@ -418,7 +932,7 @@ export default function GitActionsPage() {
 
     try {
       await navigator.clipboard.writeText(combinedLog)
-      setActionMessage('실패 로그를 클립보드에 복사했습니다.')
+      setActionMessage('선택한 로그를 클립보드에 복사했습니다.')
     } catch {
       setActionMessage('클립보드 복사에 실패했습니다.')
     }
@@ -431,23 +945,80 @@ export default function GitActionsPage() {
 
     setSuggestLoading(true)
     setActionMessage(null)
+    setPrReview(null)
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/github/fix-sessions/${selectedRunId}/suggest`, {
+      const payload = await apiFetch<SuggestResponse>(`/api/github/fix-sessions/${selectedRunId}/suggest`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify({}),
       })
-
-      const payload = (await response.json()) as SuggestResponse
       setSuggestion(payload)
       setActionMessage(payload.message)
     } catch (error) {
       setActionMessage(error instanceof Error ? error.message : 'AI 제안 요청에 실패했습니다.')
     } finally {
       setSuggestLoading(false)
+    }
+  }
+
+  async function handleApply() {
+    if (!selectedRunId || !suggestion?.suggestedFiles?.length) return
+
+    setApplyLoading(true)
+    setActionMessage(null)
+
+    try {
+      const result = await apiFetch<{
+        ok: boolean
+        branchName: string
+        pullRequest: { number: number; htmlUrl: string; title: string }
+      }>(`/api/github/fix-sessions/${selectedRunId}/confirm`, {
+        method: 'POST',
+        body: JSON.stringify({
+          files: suggestion.suggestedFiles,
+          commitMessage: `ai fix: Terraform 수정 제안 (run #${selectedRunId})`,
+          prTitle: `🤖 AI Fix: run #${selectedRunId} 에러 수정`,
+          prBody: `GitHub Actions run #${selectedRunId} 실패에 대한 AI 분석 기반 Terraform 코드 수정입니다.\n\n## 에러 분석\n${suggestion.llmAnalysis || suggestion.summary || ''}`,
+        }),
+      })
+
+      setActionMessage(`PR #${result.pullRequest.number} 생성 완료!`)
+
+      // PR 상세 로드
+      const pr = await apiFetch<PrReview>(`/api/github/pulls/${result.pullRequest.number}`)
+      setPrReview(pr)
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : 'PR 생성에 실패했습니다.')
+    } finally {
+      setApplyLoading(false)
+    }
+  }
+
+  async function handleMergePr(prNumber: number) {
+    setPrActionLoading(true)
+    try {
+      await apiFetch(`/api/github/pulls/${prNumber}/merge`, { method: 'POST', body: JSON.stringify({}) })
+      const updated = await apiFetch<PrReview>(`/api/github/pulls/${prNumber}`)
+      setPrReview(updated)
+      setActionMessage('PR 머지 완료! 새 workflow가 곧 시작됩니다.')
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : '머지에 실패했습니다.')
+    } finally {
+      setPrActionLoading(false)
+    }
+  }
+
+  async function handleClosePr(prNumber: number) {
+    setPrActionLoading(true)
+    try {
+      await apiFetch(`/api/github/pulls/${prNumber}/close`, { method: 'PATCH', body: JSON.stringify({}) })
+      const updated = await apiFetch<PrReview>(`/api/github/pulls/${prNumber}`)
+      setPrReview(updated)
+      setActionMessage('PR를 닫았습니다.')
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : 'PR 닫기에 실패했습니다.')
+    } finally {
+      setPrActionLoading(false)
     }
   }
 
@@ -467,29 +1038,48 @@ export default function GitActionsPage() {
       setJobs([])
       setLogs([])
       setSuggestion(null)
+      setPrReview(null)
       setExpandedJobIds([])
+      setRunSummary(null)
       return
     }
 
+    setJobs([])
+    setLogs([])
     setSuggestion(null)
+    setPrReview(null)
     setExpandedJobIds([])
+    setRunSummary(null)
     void loadRunDetail(selectedRunId)
+    void loadRunSummary(selectedRunId)
+    void loadRunLogs(selectedRunId)
 
     const intervalId = window.setInterval(() => {
       void loadRunDetail(selectedRunId, true)
+      void loadRunSummary(selectedRunId)
     }, POLLING_INTERVAL_MS)
 
     return () => window.clearInterval(intervalId)
   }, [selectedRunId])
 
-  const lastUpdatedLabel = lastSyncedAt ? formatRelativeTime(lastSyncedAt) : undefined
-
   return (
     <div>
       <PageHeader
         title="GitHub Actions 로그"
-        subtitle="실제 GitHub Actions 실행 현황과 실패 로그를 대시보드에서 확인합니다."
-        lastUpdated={lastUpdatedLabel}
+        subtitle=" GitHub Actions 진행 상황과 로그를 확인합니다."
+        titleAction={
+          status && !statusError ? (
+            <a
+              href={status.repository.htmlUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-600 hover:border-indigo-200 hover:text-indigo-700"
+            >
+              저장소 열기
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          ) : undefined
+        }
         actions={
           <div className="flex items-center gap-2">
             <button
@@ -502,12 +1092,38 @@ export default function GitActionsPage() {
             </button>
             <button
               type="button"
+              onClick={() => void handleExecuteworkflow()}
+              disabled={!status?.repository.defaultBranch || executeLoading || rerunLoading}
+              title="Bootstrap Terraform State부터 GitHub Actions 체인을 처음부터 실행합니다."
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:border-gray-100 disabled:bg-gray-50 disabled:text-gray-400"
+            >
+              <Play className="h-3.5 w-3.5" />
+              {executeLoading ? '전체 실행 요청중' : '전체 실행'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleRerunAll()}
+              disabled={!selectedRunId || executeLoading || rerunLoading || selectedRun?.status !== 'completed'}
+              title="현재 선택한 run의 모든 job을 다시 실행합니다."
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:border-gray-100 disabled:bg-gray-50 disabled:text-gray-400"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              {rerunAction === 'all' ? '현재 작업 재실행 요청중' : '현재 작업 재실행'}
+            </button>
+            <button
+              type="button"
               onClick={() => void handleRerunFailed()}
-              disabled={!selectedRunId || rerunLoading || selectedRun?.conclusion === 'success'}
+              disabled={
+                !selectedRunId ||
+                executeLoading ||
+                rerunLoading ||
+                selectedRun?.status !== 'completed' ||
+                selectedRun?.conclusion === 'success'
+              }
               className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300"
             >
               <Play className="h-3.5 w-3.5" />
-              {rerunLoading ? '재실행 요청중' : '실패 작업 재실행'}
+              {rerunAction === 'failed' ? '재실행 요청중' : '실패 작업 재실행'}
             </button>
           </div>
         }
@@ -520,21 +1136,25 @@ export default function GitActionsPage() {
         </div>
       )}
 
-      <ConnectionStatusCard status={status} loading={loadingStatus} error={statusError} />
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-1">
-          <PipelineList
+      {isGithubDisconnected ? (
+        <GitAppDisconnectedCard error={statusError} onRefresh={() => void handleRefresh()} />
+      ) : (
+        <div className="space-y-6">
+          <WorkflowRunList
             runs={runs}
             selectedRunId={selectedRunId}
             loading={loadingRuns}
             error={runsError}
-            onRefresh={() => void loadRuns()}
-            onSelect={setSelectedRunId}
+            onSelect={handleSelectRun}
           />
-        </div>
 
-        <div className="lg:col-span-2">
+          <PipelineGraph
+            workflowName={selectedRun?.name ?? null}
+            jobs={jobs}
+            activeJobId={expandedJobIds.length > 0 ? expandedJobIds[0] : null}
+            onJobClick={(jobId) => setExpandedJobIds([jobId])}
+          />
+
           <RunDetail
             run={selectedRun}
             jobs={jobs}
@@ -551,94 +1171,69 @@ export default function GitActionsPage() {
             onSuggest={() => void handleSuggest()}
             suggestLoading={suggestLoading}
             suggestion={suggestion}
+            runSummary={runSummary}
+            onApply={() => void handleApply()}
+            applyLoading={applyLoading}
+            prReview={prReview}
+            onMergePr={(n) => void handleMergePr(n)}
+            onClosePr={(n) => void handleClosePr(n)}
+            prActionLoading={prActionLoading}
           />
         </div>
-      </div>
+      )}
     </div>
   )
 }
 
-interface ConnectionStatusCardProps {
-  status: GithubStatusResponse | null
-  loading: boolean
-  error: string | null
-}
-
-function ConnectionStatusCard({ status, loading, error }: ConnectionStatusCardProps) {
+function GitAppDisconnectedCard({ error, onRefresh }: { error: string | null; onRefresh: () => void }) {
   return (
-    <div className="mb-6 rounded-xl border border-gray-200 bg-white p-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-400">GitHub App Status</p>
-          <h3 className="mt-1 text-sm font-semibold text-gray-900">API 연결 상태</h3>
-        </div>
-        {status && !error && (
-          <a
-            href={status.repository.htmlUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-700"
+    <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
+      <div className="flex items-start gap-3">
+        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-amber-900">GitHub App 연결이 안된 상태입니다.</p>
+          <p className="mt-1 text-sm text-amber-800">연결이 복구되면 이 자리에 3개 워크플로의 최신 상태가 표시됩니다.</p>
+          {error && <p className="mt-2 break-words text-xs text-amber-700">{error}</p>}
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100"
           >
-            저장소 열기
-            <ExternalLink className="h-3.5 w-3.5" />
-          </a>
-        )}
-      </div>
-
-      {loading && (
-        <p className="mt-4 text-sm text-gray-500">GitHub App 설치와 저장소 연결 상태를 확인하는 중입니다.</p>
-      )}
-
-      {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
-
-      {!loading && !error && status && (
-        <div className="mt-4 grid gap-3 rounded-lg border border-gray-100 bg-gray-50 p-4 text-sm text-gray-700 md:grid-cols-2 xl:grid-cols-4">
-          <StatusItem label="저장소" value={status.repository.fullName} />
-          <StatusItem label="기본 브랜치" value={status.repository.defaultBranch} />
-          <StatusItem label="Installation ID" value={String(status.app.installationId)} />
-          <StatusItem label="App ID" value={String(status.app.appId)} />
+            <RefreshCw className="h-3.5 w-3.5" />
+            다시 확인
+          </button>
         </div>
-      )}
+      </div>
     </div>
   )
 }
 
-function StatusItem({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <p className="text-xs font-medium uppercase tracking-[0.12em] text-gray-400">{label}</p>
-      <p className="mt-1 break-all text-sm font-medium text-gray-900">{value}</p>
-    </div>
-  )
-}
-
-interface PipelineListProps {
+interface WorkflowRunListProps {
   runs: WorkflowRun[]
   selectedRunId: number | null
   loading: boolean
   error: string | null
-  onRefresh: () => void
   onSelect: (runId: number) => void
 }
 
-function PipelineList({ runs, selectedRunId, loading, error, onRefresh, onSelect }: PipelineListProps) {
+function WorkflowRunList({
+  runs,
+  selectedRunId,
+  loading,
+  error,
+  onSelect,
+}: WorkflowRunListProps) {
+  const visibleRuns = getVisibleWorkflowRuns(runs)
+
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-5">
-      <div className="mb-4 flex items-center justify-between">
-        <span className="text-sm font-medium text-gray-700">{runs.length}개 실행</span>
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-          새로고침
-        </button>
+      <div className="mb-4 min-w-0">
+        <p className="text-sm font-medium text-gray-700">WORKFLOW</p>
       </div>
 
-      {loading && runs.length === 0 && (
+      {loading && visibleRuns.length === 0 && (
         <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
-          실행 목록을 불러오는 중입니다.
+          workflow의 최신 상태를 불러오는 중입니다.
         </div>
       )}
 
@@ -646,70 +1241,56 @@ function PipelineList({ runs, selectedRunId, loading, error, onRefresh, onSelect
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
       )}
 
-      {!loading && !error && runs.length === 0 && (
+      {!loading && !error && visibleRuns.length === 0 && (
         <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
-          표시할 workflow run이 없습니다.
+          표시할 workflow가 없습니다.
         </div>
       )}
 
-      <div className="space-y-3">
-        {runs.map((run) => (
-          <PipelineItem
-            key={run.id}
-            run={run}
-            selected={selectedRunId === run.id}
-            onSelect={() => onSelect(run.id)}
-          />
-        ))}
+      <div className="grid gap-3 xl:grid-cols-3">
+        {visibleRuns.map((run) => {
+          const presentation = getRunStatusPresentation(run.status, run.conclusion)
+          const selected = selectedRunId === run.id
+
+          return (
+            <button
+              key={run.id}
+              type="button"
+              onClick={() => onSelect(run.id)}
+              className={cn(
+                'w-full rounded-xl border p-4 text-left transition-colors',
+                selected
+                  ? 'border-indigo-300 bg-indigo-50/70 shadow-sm'
+                  : 'border-gray-200 hover:border-indigo-200 hover:bg-gray-50',
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start gap-2">
+                    <div className={cn('mt-1.5 h-2 w-2 shrink-0 rounded-full', presentation.dot)} />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-semibold text-gray-900">{run.name || 'Unnamed workflow'}</p>
+                      <p className="mt-1 text-sm leading-5 text-gray-600">{getWorkflowDescription(run.name || '')}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-400">
+                    <span>{formatRelativeTime(run.createdAt)}</span>
+                    <span>•</span>
+                    <div className="flex items-center gap-1">
+                      <Clock3 className="h-3 w-3" />
+                      <span>{formatDuration(run.createdAt, run.updatedAt)}</span>
+                    </div>
+                  </div>
+                </div>
+                <span className={cn('rounded-full px-2.5 py-1 text-[11px] font-medium', presentation.badge)}>
+                  {presentation.label}
+                </span>
+              </div>
+            </button>
+          )
+        })}
       </div>
     </div>
-  )
-}
-
-interface PipelineItemProps {
-  run: WorkflowRun
-  selected: boolean
-  onSelect: () => void
-}
-
-function PipelineItem({ run, selected, onSelect }: PipelineItemProps) {
-  const presentation = getRunStatusPresentation(run.status, run.conclusion)
-
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={cn(
-        'w-full rounded-lg border p-3 text-left transition-colors',
-        selected ? 'border-indigo-300 bg-indigo-50/70' : 'border-gray-200 hover:border-indigo-300 hover:bg-indigo-50/50',
-      )}
-    >
-      <div className="flex items-start gap-3">
-        <div className={cn('mt-2 h-2 w-2 rounded-full', presentation.dot)} />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center justify-between gap-2">
-            <span className="truncate text-sm font-medium text-gray-900">{run.name || 'Unnamed workflow'}</span>
-            <span className={cn('rounded px-2 py-0.5 text-xs font-medium', presentation.badge)}>{presentation.label}</span>
-          </div>
-          <p className="mt-1 truncate text-xs text-gray-500">{run.displayTitle || `${run.event} · run #${run.runNumber}`}</p>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-400">
-            <div className="flex items-center gap-1">
-              <GitBranch className="h-3 w-3" />
-              <span>{run.branch || 'detached'}</span>
-            </div>
-            <span>#</span>
-            <span>{shortSha(run.sha)}</span>
-            <div className="flex items-center gap-1">
-              <Clock3 className="h-3 w-3" />
-              <span>{formatDuration(run.createdAt, run.updatedAt)}</span>
-            </div>
-          </div>
-          <p className="mt-1 text-xs text-gray-400">
-            {formatRelativeTime(run.createdAt)} · {run.actor || 'unknown'}
-          </p>
-        </div>
-      </div>
-    </button>
   )
 }
 
@@ -725,6 +1306,13 @@ interface RunDetailProps {
   onSuggest: () => void
   suggestLoading: boolean
   suggestion: SuggestResponse | null
+  runSummary: RunSummaryResponse | null
+  onApply: () => void
+  applyLoading: boolean
+  prReview: PrReview | null
+  onMergePr: (prNumber: number) => void
+  onClosePr: (prNumber: number) => void
+  prActionLoading: boolean
 }
 
 function RunDetail({
@@ -739,13 +1327,22 @@ function RunDetail({
   onSuggest,
   suggestLoading,
   suggestion,
+  runSummary,
+  onApply,
+  applyLoading,
+  prReview,
+  onMergePr,
+  onClosePr,
+  prActionLoading,
 }: RunDetailProps) {
   const logByJobId = new Map(logs.map((log) => [log.jobId, log]))
+  const summaryByJobId = new Map((runSummary?.jobs || []).map((js) => [js.jobId, js]))
+  const [expandedLogJobIds, setExpandedLogJobIds] = useState<number[]>([])
 
   if (!run) {
     return (
       <div className="rounded-xl border border-gray-200 bg-white p-6 text-sm text-gray-500">
-        왼쪽 목록에서 workflow run을 선택하세요.
+        상단 목록에서 workflow run을 선택하세요.
       </div>
     )
   }
@@ -753,182 +1350,460 @@ function RunDetail({
   const presentation = getRunStatusPresentation(run.status, run.conclusion)
 
   return (
-    <div className="rounded-xl border border-gray-200 bg-white p-5">
-      <div className="mb-4 border-b border-gray-100 pb-4">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-          <div>
+    <div className="space-y-4">
+      {/* Current Phase Badge */}
+      {runSummary?.currentPhase && (
+        <div className="flex items-center gap-2 rounded-lg border border-indigo-100 bg-indigo-50/70 px-4 py-2.5">
+          <div className="h-2 w-2 rounded-full bg-indigo-500 animate-pulse" />
+          <span className="text-sm font-medium text-indigo-800">{runSummary.currentPhase}</span>
+          {runSummary.overallSummary && (
+            <span className="text-xs text-indigo-500">· {runSummary.overallSummary}</span>
+          )}
+        </div>
+      )}
+
+      <div className="rounded-xl border border-gray-200 bg-white p-5">
+        <div className="mb-4 border-b border-gray-100 pb-4">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-semibold text-gray-900">{run.name || 'Unnamed workflow'}</h3>
+                <span className={cn('rounded px-2 py-0.5 text-xs font-medium', presentation.badge)}>{presentation.label}</span>
+                <a
+                  href={run.htmlUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-700"
+                >
+                  GitHub 열기
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-gray-400">
+                <div className="flex items-center gap-1">
+                  <GitBranch className="h-3 w-3" />
+                  <span>{run.branch || 'detached'}</span>
+                </div>
+                <span># {shortSha(run.sha)}</span>
+                <div className="flex items-center gap-1">
+                  <Clock3 className="h-3 w-3" />
+                  <span>{formatDuration(run.createdAt, run.updatedAt)}</span>
+                </div>
+                <span>{run.actor || 'unknown'}</span>
+                <span>{formatDateTime(run.createdAt)}</span>
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-sm font-semibold text-gray-900">{run.name || 'Unnamed workflow'}</h3>
-              <span className={cn('rounded px-2 py-0.5 text-xs font-medium', presentation.badge)}>{presentation.label}</span>
-              <a
-                href={run.htmlUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-700"
-              >
-                GitHub 열기
-                <ExternalLink className="h-3.5 w-3.5" />
-              </a>
-            </div>
-            <p className="mt-1 text-xs text-gray-500">{run.displayTitle || `${run.event} · run #${run.runNumber}`}</p>
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-gray-400">
-              <div className="flex items-center gap-1">
-                <GitBranch className="h-3 w-3" />
-                <span>{run.branch || 'detached'}</span>
-              </div>
-              <span># {shortSha(run.sha)}</span>
-              <div className="flex items-center gap-1">
-                <Clock3 className="h-3 w-3" />
-                <span>{formatDuration(run.createdAt, run.updatedAt)}</span>
-              </div>
-              <span>{run.actor || 'unknown'}</span>
-              <span>{formatDateTime(run.createdAt)}</span>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onSuggest}
-              disabled={suggestLoading}
-              className="flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-70"
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              {suggestLoading ? 'AI 요청중' : 'AI 도움 받기'}
-            </button>
-            <button
-              type="button"
-              onClick={onCopyLogs}
-              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100"
-            >
-              <Copy className="h-3.5 w-3.5" />
-              로그 복사
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {suggestion && (
-        <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-          <p className="font-medium">AI 제안 응답</p>
-          <p className="mt-1">{suggestion.message}</p>
-          {suggestion.configuredModel && <p className="mt-1 text-xs">configured model: {suggestion.configuredModel}</p>}
-        </div>
-      )}
-
-      {loading && jobs.length === 0 && (
-        <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
-          실행 상세를 불러오는 중입니다.
-        </div>
-      )}
-
-      {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
-      )}
-
-      {!loading && !error && jobs.length === 0 && (
-        <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
-          이 실행에는 표시할 job 정보가 없습니다.
-        </div>
-      )}
-
-      <div className="space-y-3">
-        {jobs.map((job) => {
-          const log = logByJobId.get(job.id)
-          const tone = getStepTone(job.conclusion, job.status)
-          const expanded = expandedJobIds.includes(job.id)
-
-          return (
-            <div key={job.id} className="overflow-hidden rounded-lg border border-gray-200">
               <button
                 type="button"
-                onClick={() => onToggleJob(job.id)}
-                className="flex w-full items-center justify-between bg-gray-50 p-3 transition-colors hover:bg-gray-100"
+                onClick={onSuggest}
+                disabled={suggestLoading || run.conclusion === 'success'}
+                className="flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-70"
               >
-                <div className="flex items-center gap-2">
-                  {expanded ? (
-                    <ChevronDown className="h-4 w-4 text-gray-400" />
-                  ) : (
-                    <ChevronRight className="h-4 w-4 text-gray-400" />
-                  )}
-                  <div className={cn('h-2 w-2 rounded-full', tone.dot)} />
-                  <span className={cn('text-sm font-medium', tone.text)}>{job.name}</span>
-                  <span className="text-xs text-gray-400">{tone.label}</span>
-                </div>
-                <span className="text-xs text-gray-400">{formatDuration(job.startedAt, job.completedAt)}</span>
+                <Sparkles className="h-3.5 w-3.5" />
+                {suggestLoading ? 'AI 분석중...' : 'AI 에러 분석'}
               </button>
+              <button
+                type="button"
+                onClick={onCopyLogs}
+                className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                로그 복사
+              </button>
+            </div>
+          </div>
+        </div>
 
-              {expanded && (
-                <div className="border-t border-gray-100">
-                  <div className="flex flex-wrap items-center gap-3 bg-white px-4 py-3 text-xs text-gray-500">
-                    <span>runner: {job.runnerName || 'unknown'}</span>
-                    <span>started: {formatDateTime(job.startedAt)}</span>
-                    {job.labels.length > 0 && <span>labels: {job.labels.join(', ')}</span>}
-                    {job.htmlUrl && (
-                      <a
-                        href={job.htmlUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-700"
-                      >
-                        Job 링크
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
+        {suggestion && (
+          <div className="mb-4 space-y-3">
+            {/* AI 분석 메인 카드 */}
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-4 w-4 shrink-0 text-amber-600" />
+                  <p className="font-medium">
+                    AI 에러 분석
+                    {suggestion.mode === 'hybrid' && (
+                      <span className="ml-2 rounded bg-amber-200/60 px-1.5 py-0.5 text-[10px] font-normal uppercase">LLM + Rule</span>
                     )}
-                  </div>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 text-[11px] text-amber-500">
+                  {suggestion.mode && <span>모드: {suggestion.mode}</span>}
+                  {suggestion.configuredModel && <span>· {suggestion.configuredModel}</span>}
+                </div>
+              </div>
 
-                  {job.steps.length > 0 && (
-                    <div className="border-t border-gray-100 bg-white px-4 py-3">
-                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-gray-400">Steps</p>
-                      <div className="space-y-2">
-                        {job.steps.map((step) => {
-                          const stepTone = getStepTone(step.conclusion, step.status)
-                          return (
-                            <div
-                              key={`${job.id}-${step.number}`}
-                              className="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-2"
-                            >
-                              <div className="flex items-center gap-2">
-                                <div className={cn('h-2 w-2 rounded-full', stepTone.dot)} />
-                                <span className="text-sm text-gray-700">{step.name}</span>
-                              </div>
-                              <span className="text-xs text-gray-400">{formatDuration(step.startedAt, step.completedAt)}</span>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    </div>
+              {/* LLM 분석 결과 (새 프롬프트 형식) */}
+              {suggestion.llmAnalysis && (
+                <div className="mt-3 rounded-lg border border-amber-200 bg-white/70 p-3 text-sm leading-relaxed text-amber-950 whitespace-pre-wrap">
+                  {suggestion.llmAnalysis}
+                </div>
+              )}
+
+              {/* Rule-based 요약 (LLM 없을 때) */}
+              {!suggestion.llmAnalysis && suggestion.summary && (
+                <div className="mt-3 space-y-3 border-t border-amber-200 pt-3">
+                  <SuggestionRow label="요약" value={suggestion.summary} />
+                  {suggestion.rootCause && <SuggestionRow label="원인" value={suggestion.rootCause} />}
+                  {suggestion.riskLevel && <SuggestionRow label="위험도" value={suggestion.riskLevel} />}
+                  {suggestion.nextActions && suggestion.nextActions.length > 0 && (
+                    <SuggestionList
+                      label="다음 조치"
+                      items={suggestion.nextActions}
+                      getKey={(item) => item}
+                      renderItem={(item) => item}
+                    />
                   )}
-
-                  <div className="border-t border-gray-100 bg-gray-900 px-4 py-4 font-mono text-xs">
-                    {log ? (
-                      <div className="space-y-1">
-                        {splitLogLines(log.content).map((line, index) => {
-                          const toneClass =
-                            /error|failed|fatal/i.test(line)
-                              ? 'text-red-400'
-                              : /warn|warning/i.test(line)
-                                ? 'text-amber-300'
-                                : line.trim().length === 0
-                                  ? 'text-gray-600'
-                                  : 'text-gray-300'
-
-                          return (
-                            <div key={`${job.id}-line-${index}`} className={toneClass}>
-                              {line || ' '}
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ) : (
-                      <div className="text-gray-400">이 job은 현재 선택된 로그 대상이 아닙니다.</div>
-                    )}
-                  </div>
                 </div>
               )}
             </div>
-          )
-        })}
+
+            {/* 코드 수정 제안 + 적용 버튼 */}
+            {suggestion.suggestedFiles && suggestion.suggestedFiles.length > 0 && (
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <FileCode className="h-4 w-4 text-emerald-600" />
+                    <p className="text-sm font-medium text-emerald-800">
+                      Terraform 코드 수정 제안
+                      <span className="ml-2 text-xs font-normal text-emerald-500">
+                        {suggestion.suggestedFiles.length}개 파일
+                      </span>
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onApply}
+                    disabled={applyLoading || !!prReview}
+                    className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <GitPullRequest className="h-3.5 w-3.5" />
+                    {applyLoading ? 'PR 생성 중...' : prReview ? 'PR 생성됨' : '적용 (PR 생성)'}
+                  </button>
+                </div>
+
+                {/* 수정 파일 목록 */}
+                <div className="mt-3 space-y-2">
+                  {suggestion.suggestedFiles.map((file) => (
+                    <details key={file.path} className="rounded-lg border border-emerald-200 bg-white overflow-hidden">
+                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs font-medium text-emerald-800 hover:bg-emerald-50">
+                        <FileCode className="h-3.5 w-3.5 shrink-0" />
+                        {file.path}
+                      </summary>
+                      <pre className="overflow-x-auto bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-200">
+                        <code>{file.content}</code>
+                      </pre>
+                    </details>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* PR 리뷰 패널 */}
+            {prReview && (
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <GitPullRequest className="h-4 w-4 text-indigo-600" />
+                    <div>
+                      <p className="text-sm font-medium text-indigo-800">
+                        PR #{prReview.number}: {prReview.title}
+                      </p>
+                      <p className="text-xs text-indigo-500">
+                        {prReview.headBranch} → {prReview.baseBranch}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {/* PR 상태 배지 */}
+                    {prReview.merged ? (
+                      <span className="flex items-center gap-1 rounded-full bg-purple-100 px-2.5 py-1 text-xs font-medium text-purple-700">
+                        <GitMerge className="h-3 w-3" /> 머지됨
+                      </span>
+                    ) : prReview.state === 'closed' ? (
+                      <span className="flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600">
+                        <X className="h-3 w-3" /> 닫힘
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-700">
+                        <GitPullRequest className="h-3 w-3" /> 열림
+                      </span>
+                    )}
+
+                    {/* 액션 버튼 (열린 PR만) */}
+                    {!prReview.merged && prReview.state === 'open' && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => onMergePr(prReview.number)}
+                          disabled={prActionLoading}
+                          className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
+                        >
+                          <GitMerge className="h-3.5 w-3.5" />
+                          {prActionLoading ? '처리 중...' : '머지'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onClosePr(prReview.number)}
+                          disabled={prActionLoading}
+                          className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-60"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          닫기
+                        </button>
+                      </>
+                    )}
+
+                    <a
+                      href={prReview.htmlUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-700"
+                    >
+                      GitHub
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                </div>
+
+                {/* Diff 표시 */}
+                {prReview.files.length > 0 && (
+                  <div className="mt-3 space-y-2">
+                    {prReview.files.map((file) => (
+                      <details key={file.filename} className="rounded-lg border border-indigo-200 bg-white overflow-hidden">
+                        <summary className="flex cursor-pointer items-center justify-between px-3 py-2 text-xs hover:bg-indigo-50">
+                          <span className="font-medium text-indigo-800">{file.filename}</span>
+                          <span className="flex items-center gap-2 text-[11px]">
+                            <span className="text-emerald-600">+{file.additions}</span>
+                            <span className="text-red-500">-{file.deletions}</span>
+                            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500">{file.status}</span>
+                          </span>
+                        </summary>
+                        {file.patch && (
+                          <pre className="overflow-x-auto bg-slate-950 p-3 text-[11px] leading-relaxed">
+                            {file.patch.split('\n').map((line, i) => (
+                              <div
+                                key={i}
+                                className={cn(
+                                  line.startsWith('+') && !line.startsWith('+++') ? 'text-emerald-400' :
+                                    line.startsWith('-') && !line.startsWith('---') ? 'text-red-400' :
+                                      line.startsWith('@@') ? 'text-blue-400' : 'text-slate-400'
+                                )}
+                              >
+                                {line}
+                              </div>
+                            ))}
+                          </pre>
+                        )}
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {loading && jobs.length === 0 && (
+          <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
+            실행 상세를 불러오는 중입니다.
+          </div>
+        )}
+
+        {error && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
+        )}
+
+        {!loading && !error && jobs.length === 0 && (
+          <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-10 text-center text-sm text-gray-500">
+            이 실행에는 표시할 job 정보가 없습니다.
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {jobs.map((job) => {
+            const log = logByJobId.get(job.id)
+            const jobSummary = summaryByJobId.get(job.id)
+            const tone = getStepTone(job.conclusion, job.status)
+            const expanded = expandedJobIds.includes(job.id)
+            const logExpanded = expandedLogJobIds.includes(job.id)
+
+            return (
+              <div key={job.id} className="overflow-hidden rounded-lg border border-gray-200">
+                <button
+                  type="button"
+                  onClick={() => onToggleJob(job.id)}
+                  className="flex w-full items-center justify-between bg-gray-50 p-3 transition-colors hover:bg-gray-100"
+                >
+                  <div className="flex items-center gap-2">
+                    {expanded ? (
+                      <ChevronDown className="h-4 w-4 text-gray-400" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 text-gray-400" />
+                    )}
+                    <div className={cn('h-2 w-2 rounded-full', tone.dot)} />
+                    <span className={cn('text-sm font-medium', tone.text)}>{job.name}</span>
+                    <span className="text-xs text-gray-400">{tone.label}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {/* Job summary badge */}
+                    {jobSummary && (
+                      <span className="hidden text-xs text-gray-400 sm:inline">{jobSummary.summary}</span>
+                    )}
+                    <span className="text-xs text-gray-400">{formatDuration(job.startedAt, job.completedAt)}</span>
+                  </div>
+                </button>
+
+                {expanded && (
+                  <div className="border-t border-gray-100">
+                    <div className="flex flex-wrap items-center gap-3 bg-white px-4 py-3 text-xs text-gray-500">
+                      <span>runner: {job.runnerName || 'unknown'}</span>
+                      <span>started: {formatDateTime(job.startedAt)}</span>
+                      {job.labels.length > 0 && <span>labels: {job.labels.join(', ')}</span>}
+                      {job.htmlUrl && (
+                        <a
+                          href={job.htmlUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-700"
+                        >
+                          Job 링크
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </a>
+                      )}
+                    </div>
+
+                    {/* Step Timeline with summaries */}
+                    {jobSummary && jobSummary.steps.length > 0 ? (
+                      <div className="border-t border-gray-100 bg-white">
+                        <StepTimeline
+                          steps={jobSummary.steps.map((s) => ({
+                            name: s.name,
+                            number: s.number,
+                            status: s.status,
+                            conclusion: s.conclusion,
+                            summary: s.summary,
+                            durationSeconds: s.durationSeconds,
+                          }))}
+                        />
+                      </div>
+                    ) : job.steps.length > 0 ? (
+                      <div className="border-t border-gray-100 bg-white">
+                        <StepTimeline
+                          steps={job.steps.map((s) => ({
+                            name: s.name,
+                            number: s.number,
+                            status: s.status,
+                            conclusion: s.conclusion,
+                            startedAt: s.startedAt,
+                            completedAt: s.completedAt,
+                          }))}
+                        />
+                      </div>
+                    ) : null}
+
+                    {/* Log toggle */}
+                    <div className="border-t border-gray-100">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedLogJobIds((prev) =>
+                            prev.includes(job.id) ? prev.filter((id) => id !== job.id) : [...prev, job.id],
+                          )
+                        }
+                        className="flex w-full items-center gap-2 bg-gray-50 px-4 py-2 text-xs text-gray-500 transition-colors hover:bg-gray-100"
+                      >
+                        <Code2 className="h-3.5 w-3.5" />
+                        {logExpanded ? '원시 로그 숨기기' : '원시 로그 보기'}
+                        {logExpanded ? (
+                          <ChevronDown className="h-3 w-3" />
+                        ) : (
+                          <ChevronRight className="h-3 w-3" />
+                        )}
+                      </button>
+
+                      {logExpanded && (
+                        <div className="bg-[#f6f8fa] px-4 py-4">
+                          {log ? (
+                            <LogViewer jobId={job.id} content={log.content} />
+                          ) : (
+                            <div className="text-gray-400">이 job은 현재 선택된 로그 대상이 아닙니다.</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LogViewer({ jobId, content }: { jobId: number; content: string }) {
+  const parsedLines = parseLogLines(content)
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-gray-200 bg-white font-mono text-xs shadow-sm">
+      <div className="grid grid-cols-[72px_160px_minmax(0,1fr)] border-b border-gray-200 bg-[#f6f8fa] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500">
+        <span>Line</span>
+        <span>Time</span>
+        <span>Log</span>
+      </div>
+      <div className="max-h-[560px] overflow-auto bg-white">
+        {parsedLines.map((line) => (
+          <div
+            key={`${jobId}-line-${line.lineNumber}`}
+            className="grid grid-cols-[72px_160px_minmax(0,1fr)] border-b border-gray-100 px-3 py-1.5 last:border-b-0 even:bg-[#f6f8fa]"
+          >
+            <div className="select-none pr-3 text-right text-[11px] text-gray-400">{line.lineNumber}</div>
+            <div className="pr-3 text-[11px] text-gray-500">{line.timestamp || '-'}</div>
+            <div
+              className={`min-w-0 whitespace-pre-wrap break-words py-0.5 ${getLogToneClass(line.tone)}`}
+              style={{ paddingLeft: `${line.indentLevel * 16}px` }}
+            >
+              {line.message || ' '}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SuggestionRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-700">{label}</p>
+      <p className="mt-1">{value}</p>
+    </div>
+  )
+}
+
+function SuggestionList<T>({
+  label,
+  items,
+  getKey,
+  renderItem,
+}: {
+  label: string
+  items: T[]
+  getKey: (item: T) => string
+  renderItem: (item: T) => string
+}) {
+  return (
+    <div>
+      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-700">{label}</p>
+      <div className="mt-1 space-y-1">
+        {items.map((item) => (
+          <p key={getKey(item)}>{`- ${renderItem(item)}`}</p>
+        ))}
       </div>
     </div>
   )

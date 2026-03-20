@@ -140,51 +140,51 @@ export const pipelineData: Array<{
   time: string
   author: string
 }> = [
-  {
-    id: '1',
-    name: 'CI — Build & Test',
-    status: 'failed',
-    description: 'feat: 사용자 인증 모듈 리팩토링',
-    branch: 'main',
-    commit: 'a3f8c21',
-    duration: '3m 42s',
-    time: '5분 전',
-    author: '@kim-dev'
-  },
-  {
-    id: '2',
-    name: 'Security Scan — Trivy',
-    status: 'failed',
-    description: 'feat: 사용자 인증 모듈 리팩토링',
-    branch: 'main',
-    commit: 'a3f8c21',
-    duration: '2m 15s',
-    time: '5분 전',
-    author: '@kim-dev'
-  },
-  {
-    id: '3',
-    name: 'CD — Deploy to Staging',
-    status: 'success',
-    description: 'chore: 2.5.0 스테이징 배포',
-    branch: 'release/2.5.0',
-    commit: 'b7d1e94',
-    duration: '4m 28s',
-    time: '23분 전',
-    author: '@ci-bot'
-  },
-  {
-    id: '4',
-    name: 'CD — Deploy to Production',
-    status: 'failed',
-    description: 'release: v2.4.1',
-    branch: 'main',
-    commit: 'c9e2f05',
-    duration: '5m 11s',
-    time: '1시간 전',
-    author: '@lee-ops'
-  }
-]
+    {
+      id: '1',
+      name: 'CI — Build & Test',
+      status: 'failed',
+      description: 'feat: 사용자 인증 모듈 리팩토링',
+      branch: 'main',
+      commit: 'a3f8c21',
+      duration: '3m 42s',
+      time: '5분 전',
+      author: '@kim-dev'
+    },
+    {
+      id: '2',
+      name: 'Security Scan — Trivy',
+      status: 'failed',
+      description: 'feat: 사용자 인증 모듈 리팩토링',
+      branch: 'main',
+      commit: 'a3f8c21',
+      duration: '2m 15s',
+      time: '5분 전',
+      author: '@kim-dev'
+    },
+    {
+      id: '3',
+      name: 'CD — Deploy to Staging',
+      status: 'success',
+      description: 'chore: 2.5.0 스테이징 배포',
+      branch: 'release/2.5.0',
+      commit: 'b7d1e94',
+      duration: '4m 28s',
+      time: '23분 전',
+      author: '@ci-bot'
+    },
+    {
+      id: '4',
+      name: 'CD — Deploy to Production',
+      status: 'failed',
+      description: 'release: v2.4.1',
+      branch: 'main',
+      commit: 'c9e2f05',
+      duration: '5m 11s',
+      time: '1시간 전',
+      author: '@lee-ops'
+    }
+  ]
 
 export const securityScanLog = {
   title: 'Security Scan — Trivy',

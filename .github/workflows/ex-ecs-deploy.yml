@@ -130,33 +130,57 @@ jobs:
 
             if [ "${#TARGETS[@]}" -eq 0 ]; then
               echo "has_targets=false" >> "$GITHUB_OUTPUT"
-              echo 'matrix={"service":[]}' >> "$GITHUB_OUTPUT"
+              echo 'matrix={"include":[{"job_name":"이미 배포된 서비스 유지","service":"__noop__","skip_deploy":"true"}]}' >> "$GITHUB_OUTPUT"
+              {
+                echo "## ECS deployment"
+                echo ""
+                echo "- Result: no new ECS deployment was required."
+                echo "- Meaning: current services are already deployed and running."
+                echo "- Reason: no frontend or active backend changes were detected for this revision."
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi
 
-          JSON_TARGETS=$(printf '"%s",' "${TARGETS[@]}")
-          JSON_TARGETS="[${JSON_TARGETS%,}]"
+          JSON_TARGETS=""
+          for target in "${TARGETS[@]}"; do
+            JSON_TARGETS="${JSON_TARGETS}{\"job_name\":\"Deploy ${target}\",\"service\":\"${target}\",\"skip_deploy\":\"false\"},"
+          done
 
           echo "has_targets=true" >> "$GITHUB_OUTPUT"
-          echo "matrix={\"service\":${JSON_TARGETS}}" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":[${JSON_TARGETS%,}]}" >> "$GITHUB_OUTPUT"
 
   deploy-selected:
-    name: Deploy ${{ matrix.service }}
+    name: ${{ matrix.job_name }}
     needs: resolve-targets
-    if: needs.resolve-targets.outputs.has_targets == 'true'
+    if: needs.resolve-targets.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.resolve-targets.outputs.matrix) }}
 
     steps:
+      - name: Explain current deployment state
+        if: matrix.skip_deploy == 'true'
+        shell: bash
+        run: |
+          echo "Current ECS services are already deployed and running."
+          echo "No new deployment was required for this revision."
+          {
+            echo "## ECS deployment"
+            echo ""
+            echo "- Result: existing ECS services remain deployed and running."
+            echo "- Action: skipped a new deployment because no deployable changes were detected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout target revision
+        if: matrix.skip_deploy != 'true'
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.resolve-targets.outputs.head_sha }}
 
       - name: Resolve service configuration
+        if: matrix.skip_deploy != 'true'
         id: config
         shell: bash
         run: |
@@ -200,6 +224,7 @@ jobs:
           esac
 
       - name: Deploy selected service
+        if: matrix.skip_deploy != 'true'
         uses: ./.github/actions/deploy-ecs-service
         with:
           aws_region: ${{ env.AWS_REGION }}

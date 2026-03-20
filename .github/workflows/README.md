@@ -1,4 +1,4 @@
-# Workflow Notes
+# workflow Notes
 
 상세 설명은 [`.github/README.md`](/c:/Users/User/Desktop/aws-security-project/.github/README.md)를 참고하세요.
 

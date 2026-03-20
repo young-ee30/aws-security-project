@@ -1,4 +1,4 @@
-# Dashboard AI Fix Workflow Guide
+# Dashboard AI Fix workflow Guide
 
 이 문서는 `young` 브랜치에서 만들 기능의 기준 문서입니다.
 
@@ -413,7 +413,7 @@ GitHub에서 아래 경로로 이동합니다.
 - `Contents`: Read & write
 - `Pull requests`: Read & write
 - `Metadata`: Read-only
-- `Workflows`: Read & write
+- `workflows`: Read & write
 
 설치 시에는 `Only select repositories`로 필요한 저장소만 선택합니다.
 

@@ -155,7 +155,7 @@ controlplane/
 - `Contents: Read & write`
 - `Pull requests: Read & write`
 - `Metadata: Read-only`
-- `Workflows: Read & write`
+- `workflows: Read & write`
 
 설치:
 

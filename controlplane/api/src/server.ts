@@ -4,6 +4,7 @@ import { env } from './config/env.js'
 import { fixRouter } from './routes/fix.js'
 import { githubRouter } from './routes/github.js'
 import { healthRouter } from './routes/health.js'
+import { policyRouter } from './routes/policy.js'
 
 const app = express()
 
@@ -13,11 +14,12 @@ app.use(
     credentials: true,
   }),
 )
-app.use(express.json({ limit: '2mb' }))
+app.use(express.json({ limit: '20mb' }))
 
 app.use(healthRouter)
 app.use(githubRouter)
 app.use(fixRouter)
+app.use(policyRouter)
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const message = err instanceof Error ? err.message : 'Unexpected server error'

@@ -34,8 +34,10 @@ export const env = {
   githubAppClientId: optional('GITHUB_APP_CLIENT_ID'),
   githubAppPrivateKey: required('GITHUB_APP_PRIVATE_KEY'),
   githubWebhookSecret: optional('GITHUB_WEBHOOK_SECRET'),
-  llmApiKey: optional('LLM_API_KEY'),
-  llmModel: optional('LLM_MODEL', 'gpt-5.4-mini'),
+  llmProvider: optional('LLM_PROVIDER', 'gemini'),
+  geminiApiKey: optional('GEMINI_API_KEY') || optional('LLM_API_KEY'),
+  llmApiKey: optional('GEMINI_API_KEY') || optional('LLM_API_KEY'),
+  llmModel: optional('GEMINI_MODEL') || optional('LLM_MODEL', 'gemini-2.5-flash-lite'),
 }
 
 if (Number.isNaN(env.githubAppId)) {

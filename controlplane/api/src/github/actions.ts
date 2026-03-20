@@ -3,6 +3,12 @@ import { getInstallationToken, getRepoOctokit, getRepositoryMetadata } from './a
 
 type WorkflowDispatchInput = Record<string, string | number | boolean>
 
+const FULL_PIPELINE_ENTRY_WORKFLOW = 'bootstrap-terraform-state.yml'
+const FULL_PIPELINE_DEFAULT_INPUTS: WorkflowDispatchInput = {
+  aws_region: 'ap-northeast-2',
+  project_name: 'devsecops',
+}
+
 function formatConclusion(value: string | null | undefined): string {
   return value || 'unknown'
 }
@@ -17,6 +23,7 @@ export async function listWorkflowRuns(limit = 20) {
 
   return response.data.workflow_runs.map((run) => ({
     id: run.id,
+    workflowId: run.workflow_id,
     name: run.name,
     displayTitle: run.display_title,
     status: run.status,
@@ -111,18 +118,56 @@ export async function getWorkflowRunLogs(runId: number, requestedJobId?: number)
 
   const selectedJobs = requestedJobId
     ? jobs.filter((job) => job.id === requestedJobId)
-    : jobs.filter((job) => formatConclusion(job.conclusion) !== 'success')
+    : jobs.filter(
+      (job) =>
+        job.status === 'completed' &&
+        formatConclusion(job.conclusion) !== 'success' &&
+        formatConclusion(job.conclusion) !== 'skipped',
+    )
 
-  const effectiveJobs = selectedJobs.length > 0 ? selectedJobs : jobs.slice(0, 3)
+  const effectiveJobs =
+    selectedJobs.length > 0
+      ? selectedJobs
+      : jobs.filter((job) => job.status === 'in_progress').slice(0, 3).length > 0
+        ? jobs.filter((job) => job.status === 'in_progress').slice(0, 3)
+        : jobs.slice(0, 3)
 
   const logs = await Promise.all(
-    effectiveJobs.map(async (job) => ({
-      jobId: job.id,
-      name: job.name,
-      status: job.status,
-      conclusion: job.conclusion,
-      content: await fetchJobLogText(job.id),
-    })),
+    effectiveJobs.map(async (job) => {
+      if (job.status !== 'completed') {
+        return {
+          jobId: job.id,
+          name: job.name,
+          status: job.status,
+          conclusion: job.conclusion,
+          content: `Logs are not available yet. Current job status: ${job.status}.`,
+        }
+      }
+
+      try {
+        return {
+          jobId: job.id,
+          name: job.name,
+          status: job.status,
+          conclusion: job.conclusion,
+          content: await fetchJobLogText(job.id),
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+
+        if (message.includes('HTTP 404')) {
+          return {
+            jobId: job.id,
+            name: job.name,
+            status: job.status,
+            conclusion: job.conclusion,
+            content: 'This job does not currently have a downloadable log archive from GitHub.',
+          }
+        }
+
+        throw error
+      }
+    }),
   )
 
   return {
@@ -148,6 +193,22 @@ export async function rerunFailedJobs(runId: number) {
   }
 }
 
+export async function rerunWorkflowRun(runId: number) {
+  const octokit = await getRepoOctokit()
+
+  await octokit.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', {
+    owner: env.githubOwner,
+    repo: env.githubRepo,
+    run_id: runId,
+  })
+
+  return {
+    ok: true,
+    runId,
+    message: 'Requested rerun for entire workflow run',
+  }
+}
+
 export async function dispatchWorkflow(workflowId: string, ref?: string, inputs?: WorkflowDispatchInput) {
   const octokit = await getRepoOctokit()
   const repository = await getRepositoryMetadata()
@@ -170,4 +231,104 @@ export async function dispatchWorkflow(workflowId: string, ref?: string, inputs?
     workflowId,
     ref: targetRef,
   }
+}
+
+export async function dispatchFullPipeline(ref?: string) {
+  const result = await dispatchWorkflow(FULL_PIPELINE_ENTRY_WORKFLOW, ref, FULL_PIPELINE_DEFAULT_INPUTS)
+
+  return {
+    ok: true,
+    workflowId: result.workflowId,
+    ref: result.ref,
+    message: 'Requested full GitHub Actions pipeline from Bootstrap Terraform State',
+  }
+}
+
+export async function getFileContent(filePath: string, ref?: string): Promise<string | null> {
+  try {
+    const octokit = await getRepoOctokit()
+    const response = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+      owner: env.githubOwner,
+      repo: env.githubRepo,
+      path: filePath,
+      ref: ref || undefined,
+    })
+
+    const data = response.data as { content?: string; encoding?: string }
+    if (data.content && data.encoding === 'base64') {
+      return Buffer.from(data.content, 'base64').toString('utf8')
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
+
+export async function getPullRequest(prNumber: number) {
+  const octokit = await getRepoOctokit()
+
+  const [pr, files] = await Promise.all([
+    octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+      owner: env.githubOwner,
+      repo: env.githubRepo,
+      pull_number: prNumber,
+    }),
+    octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
+      owner: env.githubOwner,
+      repo: env.githubRepo,
+      pull_number: prNumber,
+      per_page: 100,
+    }),
+  ])
+
+  return {
+    number: pr.data.number,
+    title: pr.data.title,
+    body: pr.data.body,
+    state: pr.data.state,
+    merged: pr.data.merged,
+    htmlUrl: pr.data.html_url,
+    headBranch: pr.data.head.ref,
+    baseBranch: pr.data.base.ref,
+    createdAt: pr.data.created_at,
+    updatedAt: pr.data.updated_at,
+    user: pr.data.user?.login || null,
+    files: files.data.map((f) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      patch: f.patch || null,
+    })),
+  }
+}
+
+export async function mergePullRequest(prNumber: number) {
+  const octokit = await getRepoOctokit()
+  const result = await octokit.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', {
+    owner: env.githubOwner,
+    repo: env.githubRepo,
+    pull_number: prNumber,
+    merge_method: 'squash',
+  })
+
+  return {
+    ok: true,
+    merged: result.data.merged,
+    sha: result.data.sha,
+    message: result.data.message,
+  }
+}
+
+export async function closePullRequest(prNumber: number) {
+  const octokit = await getRepoOctokit()
+  await octokit.request('PATCH /repos/{owner}/{repo}/pulls/{pull_number}', {
+    owner: env.githubOwner,
+    repo: env.githubRepo,
+    pull_number: prNumber,
+    state: 'closed',
+  })
+
+  return { ok: true }
 }

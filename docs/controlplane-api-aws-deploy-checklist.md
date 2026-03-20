@@ -169,7 +169,7 @@ https://api.your-domain.com       -> controlplane/api
 
 선택지는 두 가지입니다.
 
-### 선택지 A. 기존 ECS 배포 워크플로우에 `controlplane-api` 추가
+### 선택지 A. 기존 ECS 배포 workflow에 `controlplane-api` 추가
 
 수정할 것:
 
@@ -189,17 +189,17 @@ https://api.your-domain.com       -> controlplane/api
 
 주의:
 
-- 현재 워크플로우는 `active_backend`와 기존 앱 디렉터리 변경 감지에 맞춰져 있음
+- 현재 workflow는 `active_backend`와 기존 앱 디렉터리 변경 감지에 맞춰져 있음
 - `controlplane/api` 변경 감지 경로를 새로 넣어야 함
 
-### 선택지 B. `controlplane/api` 전용 배포 워크플로우를 새로 만들기
+### 선택지 B. `controlplane/api` 전용 배포 workflow를 새로 만들기
 
 권장 상황:
 
 - 기존 ecommerce 앱 배포와 controlplane 백엔드 배포를 분리하고 싶을 때
 - 서비스 경로, 브랜치 전략, 승인 정책을 따로 가져가고 싶을 때
 
-새 워크플로우에서 필요한 것:
+새 workflow에서 필요한 것:
 
 - checkout
 - OIDC로 AWS role assume
