@@ -7,6 +7,7 @@ import {
   Circle,
   Cloud,
   Database,
+  FileBarChart,
   FileText,
   PanelLeftClose,
   ScrollText,
@@ -47,6 +48,7 @@ const infraItems: NavItem[] = [
   { label: '인프라 세부', path: '/infra', icon: Database },
   { label: '앱/HTTP 세부', path: '/app-http', icon: Activity },
   { label: 'AWS 리소스 세부', path: '/aws-resource', icon: Cloud },
+  { label: '전체 로그/메트릭', path: '/logs-metrics', icon: FileBarChart },
 ]
 
 function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
