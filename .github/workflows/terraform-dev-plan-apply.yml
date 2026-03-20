@@ -203,14 +203,22 @@ jobs:
             local tf_address="$1"
             local role_name="$2"
 
-            if terraform state list 2>/dev/null | grep -qx "$tf_address"; then
+            if terraform state show "$tf_address" >/dev/null 2>&1; then
               echo "IAM role is already tracked in Terraform state: $role_name"
               return 0
             fi
 
             if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
-              echo "Found existing IAM role '$role_name'. Importing into Terraform state."
-              terraform import "$tf_address" "$role_name"
+              echo "Found existing IAM role '$role_name'. Attempting import..."
+              IMPORT_OUTPUT=$(terraform import "$tf_address" "$role_name" 2>&1) || {
+                if echo "$IMPORT_OUTPUT" | grep -q "Resource already managed by Terraform"; then
+                  echo "IAM role '$role_name' is already managed by Terraform, skipping."
+                  return 0
+                fi
+                echo "$IMPORT_OUTPUT"
+                return 1
+              }
+              echo "$IMPORT_OUTPUT"
             else
               echo "No pre-existing IAM role found for '$role_name'."
             fi
@@ -375,8 +383,16 @@ jobs:
               return 0
             fi
 
-            echo "Found existing target group '${tg_name}'. Importing into Terraform state."
-            terraform import "${tf_address}" "${TG_ARN}"
+            echo "Found existing target group '${tg_name}'. Attempting import..."
+            IMPORT_OUTPUT=$(terraform import "${tf_address}" "${TG_ARN}" 2>&1) || {
+              if echo "$IMPORT_OUTPUT" | grep -q "Resource already managed by Terraform"; then
+                echo "Target group '${tg_name}' is already managed by Terraform, skipping."
+                return 0
+              fi
+              echo "$IMPORT_OUTPUT"
+              return 1
+            }
+            echo "$IMPORT_OUTPUT"
           }
 
           mapfile -t SERVICES < <(grep -oP '^\s{2}\K[a-z][a-z0-9-]+(?=\s*=\s*\{)' terraform.tfvars)

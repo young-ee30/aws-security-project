@@ -6,8 +6,38 @@ import {
   listWorkflowRuns,
   rerunFailedJobs,
 } from '../github/actions.js'
+import { getInstallationForRepository, getRepositoryMetadata } from '../github/app.js'
 
 export const githubRouter = Router()
+
+githubRouter.get('/api/github/status', async (_req, res, next) => {
+  try {
+    const [repository, installation] = await Promise.all([
+      getRepositoryMetadata(),
+      getInstallationForRepository(),
+    ])
+
+    res.json({
+      ok: true,
+      repository: {
+        owner: repository.owner.login,
+        name: repository.name,
+        fullName: repository.full_name,
+        defaultBranch: repository.default_branch,
+        private: repository.private,
+        htmlUrl: repository.html_url,
+      },
+      app: {
+        appId: installation.app_id,
+        installationId: installation.id,
+        repositorySelection: installation.repository_selection,
+        targetType: installation.target_type,
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
+})
 
 githubRouter.get('/api/github/runs', async (req, res, next) => {
   try {

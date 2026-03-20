@@ -91,6 +91,24 @@ interface SuggestResponse {
   configuredModel?: string
 }
 
+interface GithubStatusResponse {
+  ok: boolean
+  repository: {
+    owner: string
+    name: string
+    fullName: string
+    defaultBranch: string
+    private: boolean
+    htmlUrl: string
+  }
+  app: {
+    appId: number
+    installationId: number
+    repositorySelection: string
+    targetType: string
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
@@ -260,13 +278,16 @@ function splitLogLines(content: string): string[] {
 }
 
 export default function GitActionsPage() {
+  const [status, setStatus] = useState<GithubStatusResponse | null>(null)
   const [runs, setRuns] = useState<WorkflowRun[]>([])
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
   const [jobs, setJobs] = useState<WorkflowJob[]>([])
   const [logs, setLogs] = useState<WorkflowJobLog[]>([])
   const [expandedJobIds, setExpandedJobIds] = useState<number[]>([])
+  const [loadingStatus, setLoadingStatus] = useState(true)
   const [loadingRuns, setLoadingRuns] = useState(true)
   const [loadingDetail, setLoadingDetail] = useState(false)
+  const [statusError, setStatusError] = useState<string | null>(null)
   const [runsError, setRunsError] = useState<string | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)
   const [rerunLoading, setRerunLoading] = useState(false)
@@ -276,6 +297,26 @@ export default function GitActionsPage() {
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null)
 
   const selectedRun = runs.find((run) => run.id === selectedRunId) || null
+
+  async function loadStatus(silent = false) {
+    if (!silent) {
+      setLoadingStatus(true)
+    }
+
+    setStatusError(null)
+
+    try {
+      const response = await apiFetch<GithubStatusResponse>('/api/github/status')
+      setStatus(response)
+    } catch (error) {
+      setStatus(null)
+      setStatusError(error instanceof Error ? error.message : 'GitHub App 연결 상태를 확인하지 못했습니다.')
+    } finally {
+      if (!silent) {
+        setLoadingStatus(false)
+      }
+    }
+  }
 
   async function loadRuns(silent = false) {
     if (!silent) {
@@ -334,6 +375,7 @@ export default function GitActionsPage() {
 
   async function handleRefresh() {
     setActionMessage(null)
+    await loadStatus()
     await loadRuns()
     if (selectedRunId) {
       await loadRunDetail(selectedRunId)
@@ -410,6 +452,7 @@ export default function GitActionsPage() {
   }
 
   useEffect(() => {
+    void loadStatus()
     void loadRuns()
 
     const intervalId = window.setInterval(() => {
@@ -477,6 +520,8 @@ export default function GitActionsPage() {
         </div>
       )}
 
+      <ConnectionStatusCard status={status} loading={loadingStatus} error={statusError} />
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="lg:col-span-1">
           <PipelineList
@@ -509,6 +554,60 @@ export default function GitActionsPage() {
           />
         </div>
       </div>
+    </div>
+  )
+}
+
+interface ConnectionStatusCardProps {
+  status: GithubStatusResponse | null
+  loading: boolean
+  error: string | null
+}
+
+function ConnectionStatusCard({ status, loading, error }: ConnectionStatusCardProps) {
+  return (
+    <div className="mb-6 rounded-xl border border-gray-200 bg-white p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-400">GitHub App Status</p>
+          <h3 className="mt-1 text-sm font-semibold text-gray-900">API 연결 상태</h3>
+        </div>
+        {status && !error && (
+          <a
+            href={status.repository.htmlUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-700"
+          >
+            저장소 열기
+            <ExternalLink className="h-3.5 w-3.5" />
+          </a>
+        )}
+      </div>
+
+      {loading && (
+        <p className="mt-4 text-sm text-gray-500">GitHub App 설치와 저장소 연결 상태를 확인하는 중입니다.</p>
+      )}
+
+      {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
+
+      {!loading && !error && status && (
+        <div className="mt-4 grid gap-3 rounded-lg border border-gray-100 bg-gray-50 p-4 text-sm text-gray-700 md:grid-cols-2 xl:grid-cols-4">
+          <StatusItem label="저장소" value={status.repository.fullName} />
+          <StatusItem label="기본 브랜치" value={status.repository.defaultBranch} />
+          <StatusItem label="Installation ID" value={String(status.app.installationId)} />
+          <StatusItem label="App ID" value={String(status.app.appId)} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StatusItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs font-medium uppercase tracking-[0.12em] text-gray-400">{label}</p>
+      <p className="mt-1 break-all text-sm font-medium text-gray-900">{value}</p>
     </div>
   )
 }
