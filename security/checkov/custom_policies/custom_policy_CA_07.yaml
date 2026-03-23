@@ -1,0 +1,26 @@
+---
+metadata:
+  id: CKV2_CUSTOM_CA_07
+  name: custom_policy_CA_07
+  category: GENERAL_SECURITY
+  severity: MEDIUM
+scope:
+  provider: aws
+definition:
+  resource_types:
+    - aws_route_table
+    - aws_route_table_association
+    - aws_internet_gateway
+    - aws_nat_gateway
+  prevent:
+    - or:
+      - or:
+        - checked_attribute: routing_topology
+          target_value: "public_subnet_without_internet_gateway"
+        - checked_attribute: routing_topology
+          target_value: "private_subnet_with_internet_gateway"
+      - or:
+        - checked_attribute: routing_topology
+          target_value: "public_subnet_with_nat_gateway"
+        - checked_attribute: routing_topology
+          target_value: "private_subnet_without_nat_gateway"
