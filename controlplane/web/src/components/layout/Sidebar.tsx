@@ -1,15 +1,8 @@
 import React from 'react'
 import { NavLink } from 'react-router-dom'
-import {
-  FileText,
-  PanelLeftClose,
-  ScrollText,
-  Server,
-  MonitorCheck,
-  ShieldAlert,
-} from 'lucide-react'
+import { FileText, Gauge, PanelLeftClose, ScrollText, Siren } from 'lucide-react'
 import { cn } from '@/lib/utils'
-
+import DeployedServicesPanel from './DeployedServicesPanel'
 
 interface NavItem {
   label: string
@@ -25,8 +18,8 @@ const securityOpsItems: NavItem[] = [
 
 /** 인프라 · 관측 (하단 그룹, 위와 간격 분리) */
 const infraItems: NavItem[] = [
-  { label: '관제', path: '/incident/gwanje', icon: MonitorCheck },
-  { label: '침해', path: '/incident/hae', icon: ShieldAlert },
+  { label: '관제', path: '/incident/gwanje', icon: Gauge },
+  { label: '침해', path: '/incident/hae', icon: Siren },
 ]
 
 function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
@@ -38,7 +31,7 @@ function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean })
           'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
           isActive
             ? 'bg-indigo-50 text-indigo-700 font-medium'
-            : 'text-gray-600 hover:bg-gray-50',
+            : 'text-gray-700 hover:bg-gray-50',
         )
       }
     >
@@ -47,7 +40,6 @@ function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean })
     </NavLink>
   )
 }
-
 
 interface SidebarProps {
   collapsed: boolean
@@ -62,41 +54,23 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
         collapsed ? 'w-16' : 'w-56',
       )}
     >
-      <div className="h-14 flex items-center justify-between px-4 border-b border-gray-100">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center">
+      <div className="h-14 flex items-center px-4 border-b border-gray-100">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center shrink-0">
             <span className="text-white font-bold text-sm">O</span>
           </div>
           {!collapsed && (
-            <div>
+            <div className="min-w-0">
               <h1 className="font-semibold text-gray-900 text-sm">DevSecOps</h1>
-              <p className="text-xs text-gray-500">통합 관제 대시보드</p>
+              <p className="text-xs text-gray-600">통합 관제 대시보드</p>
             </div>
           )}
         </div>
-        <button
-          onClick={onToggle}
-          className="p-1 hover:bg-gray-100 rounded transition-colors"
-        >
-          <PanelLeftClose
-            className={cn(
-              'w-4 h-4 text-gray-400 transition-transform',
-              collapsed && 'rotate-180',
-            )}
-          />
-        </button>
       </div>
 
-      {!collapsed && (
-        <div className="px-3 py-3">
-          <div className="flex items-center gap-2 px-2 mb-2">
-            <Server className="w-4 h-4 text-gray-400" />
-            <span className="text-xs font-medium text-gray-500">모니터링 서버</span>
-          </div>
-        </div>
-      )}
+      {!collapsed && <DeployedServicesPanel />}
 
-      <nav className="flex-1 px-3 py-2 overflow-y-auto flex flex-col">
+      <nav className="flex-1 px-3 py-2 overflow-y-auto flex flex-col min-h-0">
         <div className="space-y-1">
           {!collapsed && (
             <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
@@ -115,7 +89,7 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
 
         <div className="space-y-1">
           {!collapsed && (
-            <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+            <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">
               인프라 · 관측
             </p>
           )}
@@ -125,14 +99,32 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
       </nav>
 
-      {!collapsed && (
-        <div className="p-3 border-t border-gray-100">
-          <div className="flex items-center gap-2 px-2">
-            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-            <span className="text-xs text-gray-500">시스템 정상 운영 중</span>
-          </div>
+      <div className="p-3 border-t border-gray-100 shrink-0">
+        <div
+          className={cn(
+            'flex items-center gap-2 min-w-0',
+            collapsed ? 'justify-center' : 'justify-between px-1',
+          )}
+        >
+          {!collapsed && (
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shrink-0" />
+              <span className="text-xs text-gray-600 leading-tight truncate">시스템 정상 운영 중</span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={onToggle}
+            className="p-1.5 hover:bg-gray-100 rounded-md transition-colors shrink-0 text-gray-500 hover:text-gray-700"
+            title={collapsed ? '사이드바 펼치기' : '사이드바 접기'}
+            aria-label={collapsed ? '사이드바 펼치기' : '사이드바 접기'}
+          >
+            <PanelLeftClose
+              className={cn('w-4 h-4 transition-transform', collapsed && 'rotate-180')}
+            />
+          </button>
         </div>
-      )}
+      </div>
     </aside>
   )
 }
