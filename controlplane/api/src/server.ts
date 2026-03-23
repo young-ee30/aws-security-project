@@ -1,6 +1,7 @@
 import cors from 'cors'
 import express from 'express'
 import { env } from './config/env.js'
+import { dashboardRouter } from './routes/dashboard.js'
 import { fixRouter } from './routes/fix.js'
 import { githubRouter } from './routes/github.js'
 import { healthRouter } from './routes/health.js'
@@ -31,6 +32,7 @@ app.use(
 app.use(express.json({ limit: '20mb' }))
 
 app.use(healthRouter)
+mountWithOptionalBasePath(dashboardRouter)
 mountWithOptionalBasePath(metricsRouter)
 mountWithOptionalBasePath(githubRouter)
 mountWithOptionalBasePath(fixRouter)

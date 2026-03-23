@@ -40,6 +40,9 @@ export const env = {
   geminiApiKey: optional('GEMINI_API_KEY') || optional('LLM_API_KEY'),
   llmApiKey: optional('GEMINI_API_KEY') || optional('LLM_API_KEY'),
   llmModel: optional('GEMINI_MODEL') || optional('LLM_MODEL', 'gemini-2.5-flash-lite'),
+  awsRegion: optional('AWS_REGION', 'ap-northeast-2'),
+  namePrefix: optional('NAME_PREFIX', 'devsecops-dev'),
+  prometheusUrl: optional('PROMETHEUS_URL'),
 }
 
 if (Number.isNaN(env.githubAppId)) {

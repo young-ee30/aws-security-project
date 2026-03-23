@@ -9,6 +9,13 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudtrail": "^3.0.0",
+    "@aws-sdk/client-cloudwatch": "^3.0.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.0.0",
+    "@aws-sdk/client-ecs": "^3.0.0",
+    "@aws-sdk/client-elastic-load-balancing-v2": "^3.0.0",
+    "@aws-sdk/client-guardduty": "^3.0.0",
+    "@aws-sdk/client-rds": "^3.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
