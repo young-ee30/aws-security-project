@@ -1,33 +1,13 @@
 import React from 'react'
 import { NavLink } from 'react-router-dom'
 import {
-  Activity,
-  AlertTriangle,
-  CheckCircle,
-  Circle,
-  Cloud,
-  Database,
   FileText,
   PanelLeftClose,
   ScrollText,
   Server,
-  Shield,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-interface ServerItem {
-  id: string
-  name: string
-  type: string
-  ip: string
-  status: 'running' | 'warning' | 'stopped'
-}
-
-const servers: ServerItem[] = [
-  { id: '1', name: 'web-server-01', type: 't3.medium', ip: '10.0.1.10', status: 'running' },
-  { id: '2', name: 'web-server-02', type: 't3.medium', ip: '10.0.2.10', status: 'warning' },
-  { id: '3', name: 'worker-01', type: 'c5.large', ip: '10.0.1.20', status: 'running' },
-]
 
 interface NavItem {
   label: string
@@ -35,19 +15,14 @@ interface NavItem {
   icon: React.ComponentType<{ className?: string }>
 }
 
-/** 보안 · 운영 (상단 그룹 — 보안점검 / GitHub Actions 로그 / 보안 정책) */
+/** 보안 · 운영 (상단 그룹 — GitHub Actions 로그 / 보안 정책) */
 const securityOpsItems: NavItem[] = [
-  { label: '보안 점검', path: '/security', icon: Shield },
   { label: 'GitHub Actions 로그', path: '/git-actions', icon: FileText },
   { label: '보안 정책', path: '/policy', icon: ScrollText },
 ]
 
 /** 인프라 · 관측 (하단 그룹, 위와 간격 분리) */
-const infraItems: NavItem[] = [
-  { label: '인프라 세부', path: '/infra', icon: Database },
-  { label: '앱/HTTP 세부', path: '/app-http', icon: Activity },
-  { label: 'AWS 리소스 세부', path: '/aws-resource', icon: Cloud },
-]
+const infraItems: NavItem[] = []
 
 function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
   return (
@@ -68,16 +43,6 @@ function NavMenuLink({ item, collapsed }: { item: NavItem; collapsed: boolean })
   )
 }
 
-const StatusIcon = ({ status }: { status: ServerItem['status'] }) => {
-  switch (status) {
-    case 'running':
-      return <CheckCircle className="w-4 h-4 text-green-500" />
-    case 'warning':
-      return <AlertTriangle className="w-4 h-4 text-amber-500" />
-    case 'stopped':
-      return <Circle className="w-4 h-4 text-gray-400" />
-  }
-}
 
 interface SidebarProps {
   collapsed: boolean
@@ -122,34 +87,6 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
           <div className="flex items-center gap-2 px-2 mb-2">
             <Server className="w-4 h-4 text-gray-400" />
             <span className="text-xs font-medium text-gray-500">모니터링 서버</span>
-          </div>
-          <div className="space-y-1">
-            {servers.map((server) => (
-              <div
-                key={server.id}
-                className={cn(
-                  'px-3 py-2 rounded-lg cursor-pointer transition-colors',
-                  server.id === '1'
-                    ? 'bg-indigo-50 border border-indigo-200'
-                    : 'hover:bg-gray-50',
-                )}
-              >
-                <div className="flex items-center justify-between">
-                  <span
-                    className={cn(
-                      'text-sm font-medium',
-                      server.id === '1' ? 'text-indigo-700' : 'text-gray-700',
-                    )}
-                  >
-                    {server.name}
-                  </span>
-                  <StatusIcon status={server.status} />
-                </div>
-                <div className="text-xs text-gray-500 mt-0.5">
-                  {server.type} · {server.ip}
-                </div>
-              </div>
-            ))}
           </div>
         </div>
       )}

@@ -1,9 +1,5 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/layout/Layout'
-import AppHttpPage from './pages/AppHttpPage'
-import InfraPage from './pages/InfraPage'
-import AwsResourcePage from './pages/AwsResourcePage'
-import SecurityPage from './pages/SecurityPage'
 import GitActionsPage from './pages/GitActionsPage'
 import CicdPage from './pages/CicdPage'
 import PolicyPage from './pages/PolicyPage'
@@ -16,11 +12,7 @@ function App() {
       <Route path="/settings/github/installed" element={<GithubInstalledPage />} />
       <Route path="/settings/github/callback" element={<GithubCallbackPage />} />
       <Route path="/" element={<Layout />}>
-        <Route index element={<Navigate to="/app-http" replace />} />
-        <Route path="app-http" element={<AppHttpPage />} />
-        <Route path="infra" element={<InfraPage />} />
-        <Route path="aws-resource" element={<AwsResourcePage />} />
-        <Route path="security" element={<SecurityPage />} />
+        <Route index element={<Navigate to="/git-actions" replace />} />
         <Route path="cicd" element={<CicdPage />} />
         <Route path="git-actions" element={<GitActionsPage />} />
         <Route path="policy" element={<PolicyPage />} />
