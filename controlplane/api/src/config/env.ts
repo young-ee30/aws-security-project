@@ -28,6 +28,7 @@ export const env = {
   port: optionalNumber('PORT', 4000),
   nodeEnv: optional('NODE_ENV', 'development'),
   frontendOrigin: optional('FRONTEND_ORIGIN', 'http://localhost:5173'),
+  apiBasePath: optional('API_BASE_PATH'),
   metricsSourceUrl: optional('METRICS_SOURCE_URL'),
   githubOwner: required('GITHUB_OWNER'),
   githubRepo: required('GITHUB_REPO'),

@@ -63,12 +63,21 @@ interface PageHeaderProps {
   title: string
   subtitle: string
   lastUpdated?: string
+  lastUpdatedLabel?: string
   onRefresh?: () => void
   actions?: React.ReactNode
   titleAction?: React.ReactNode
 }
 
-export function PageHeader({ title, subtitle, lastUpdated, onRefresh, actions, titleAction }: PageHeaderProps) {
+export function PageHeader({
+  title,
+  subtitle,
+  lastUpdated,
+  lastUpdatedLabel = '업데이트',
+  onRefresh,
+  actions,
+  titleAction,
+}: PageHeaderProps) {
   void onRefresh
 
   return (
@@ -85,7 +94,7 @@ export function PageHeader({ title, subtitle, lastUpdated, onRefresh, actions, t
           {lastUpdated && (
             <div className="flex items-center gap-2 text-sm text-gray-500">
               <RefreshCw className="w-4 h-4" />
-              <span>{lastUpdated} 업데이트</span>
+              <span>{lastUpdated} {lastUpdatedLabel}</span>
             </div>
           )}
           {actions && <div className={lastUpdated ? 'mt-2' : undefined}>{actions}</div>}

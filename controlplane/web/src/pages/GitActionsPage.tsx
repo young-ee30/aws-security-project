@@ -35,18 +35,18 @@ const PIPELINE_WORKFLOW_NAMES = [
 
 function getWorkflowDescription(workflowName: string): string {
   if (workflowName === 'Bootstrap Terraform State') {
-    return 'state 파일 저장용 s3 버킷 확인'
+    return 'Terraform state 준비'
   }
 
   if (workflowName === 'Terraform Dev Plan and Apply') {
-    return 'terraform 보안 점검 및 인프라 배포 계획 설계'
+    return '보안 점검 및 배포 계획'
   }
 
   if (workflowName === 'Deploy Selected Services to ECS') {
-    return 'ECS에 도커 이미지 배포'
+    return 'ECS 이미지 배포'
   }
 
-  return 'workflow 요약'
+  return '워크플로우 개요'
 }
 
 interface WorkflowRun {
@@ -168,6 +168,7 @@ interface SuggestResponse {
   ok: boolean
   runId: string
   message: string
+  analysisKind?: 'failure' | 'informational'
   mode?: 'rule-based' | 'llm' | 'hybrid'
   configuredModel?: string
   llmStatus?: 'not_attempted' | 'success' | 'failed'
@@ -211,6 +212,11 @@ interface PrReview {
   }>
 }
 
+type SuggestionTarget =
+  | { type: 'run' }
+  | { type: 'annotations'; jobId: number }
+  | { type: 'step'; jobId: number; stepNumber: number }
+
 interface StepSummary {
   name: string
   number: number
@@ -240,6 +246,28 @@ interface RunSummaryResponse {
 interface StepSelection {
   jobId: number
   stepNumber: number
+}
+
+type StepFailureTone = 'security' | 'warning'
+
+interface CheckovFinding {
+  checkId: string
+  title: string
+  resource: string | null
+  path: string | null
+  startLine: number | null
+  guide: string | null
+  isCustomPolicy: boolean
+}
+
+interface CheckovStepInsight {
+  tone: StepFailureTone
+  summary: string
+  compactSummary: string
+  helperText: string
+  findings: CheckovFinding[]
+  customFindings: CheckovFinding[]
+  builtinFindings: CheckovFinding[]
 }
 
 interface GithubStatusResponse {
@@ -715,9 +743,9 @@ function parseLogLines(content: string): ParsedLogLine[] {
 
     if (markerMatch) {
       const bracketMarker = markerMatch[2]
-      const workflowCommandMarker = markerMatch[4]
+      const workflowCommandMarker = markerMatch[3]
       const marker = bracketMarker || workflowCommandMarker
-      const tail = markerMatch[5]?.trim() || ''
+      const tail = markerMatch[4]?.trim() || ''
 
       if (marker === 'endgroup') {
         currentIndentLevel = Math.max(0, currentIndentLevel - 1)
@@ -783,9 +811,50 @@ function getRawLogTimestampMs(rawLine: string): number | null {
   return matched ? getIsoTimestampMs(matched[1]) : null
 }
 
+function getRawLogBody(rawLine: string): string {
+  return rawLine.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s?/, '')
+}
+
 function buildStepLogContent(step: WorkflowStep, steps: WorkflowStep[], content?: string): string {
   if (!content) {
     return ''
+  }
+
+  const rawLines = splitLogLines(content)
+  const commandBoundaryIndexes = rawLines.reduce<number[]>((indexes, rawLine, index) => {
+    const body = getRawLogBody(rawLine)
+    if (/^##\[group\](Run |Pull down action image )/i.test(body)) {
+      indexes.push(index)
+    }
+    return indexes
+  }, [])
+
+  if (commandBoundaryIndexes.length > 0) {
+    const mainSteps = steps.filter(
+      (candidate) =>
+        candidate.name !== 'Set up job' &&
+        !/^Post /i.test(candidate.name) &&
+        candidate.name !== 'Complete job',
+    )
+    const mainStepIndex = mainSteps.findIndex((candidate) => candidate.number === step.number)
+
+    if (step.name === 'Set up job') {
+      const endIndex = commandBoundaryIndexes[0] ?? rawLines.length
+      return rawLines.slice(0, endIndex).join('\n').trim()
+    }
+
+    if (mainStepIndex >= 0) {
+      const startIndex = mainStepIndex === 0 ? 0 : (commandBoundaryIndexes[mainStepIndex] ?? 0)
+      const endIndex = commandBoundaryIndexes[mainStepIndex + 1] ?? rawLines.length
+      return rawLines.slice(startIndex, endIndex).join('\n').trim()
+    }
+
+    if (/^Post /i.test(step.name) || step.name === 'Complete job') {
+      const postStartIndex = rawLines.findIndex((rawLine) => /Post job cleanup\./i.test(getRawLogBody(rawLine)))
+      if (postStartIndex >= 0) {
+        return rawLines.slice(postStartIndex).join('\n').trim()
+      }
+    }
   }
 
   const sortedSteps = [...steps].sort((left, right) => left.number - right.number)
@@ -816,15 +885,225 @@ function buildStepLogContent(step: WorkflowStep, steps: WorkflowStep[], content?
   return selectedLines.join('\n').trim()
 }
 
-function getCurrentStepTarget(jobs: WorkflowJob[]): StepSelection | null {
-  for (const job of jobs) {
-    const activeStep = job.steps.find((step) => step.status === 'in_progress')
-    if (activeStep) {
-      return { jobId: job.id, stepNumber: activeStep.number }
+function normalizeCheckovLogLine(rawLine: string): string {
+  return rawLine
+    .replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s?/, '')
+    .replace(/^##\[(?:error|warning|notice)\]\s*/, '')
+    .trim()
+}
+
+function normalizeCheckovPath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\/+/, '').trim()
+}
+
+function parseCheckovLocation(rawValue: string): { path: string; startLine: number | null } | null {
+  const matched = rawValue.match(/^(.*?):(\d+)(?:-\d+)?$/)
+  if (!matched) {
+    const path = normalizeCheckovPath(rawValue)
+    return path ? { path, startLine: null } : null
+  }
+
+  const path = normalizeCheckovPath(matched[1])
+  const startLine = Number(matched[2])
+
+  if (!path) {
+    return null
+  }
+
+  return {
+    path,
+    startLine: Number.isNaN(startLine) ? null : startLine,
+  }
+}
+
+function parseCheckovFindings(content: string): CheckovFinding[] {
+  if (!content) {
+    return []
+  }
+
+  const lines = splitLogLines(content).map(normalizeCheckovLogLine)
+  const findings: CheckovFinding[] = []
+  const seen = new Set<string>()
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const checkMatch =
+      lines[index].match(/^Check:\s+([A-Z0-9_]+):\s+"(.+)"$/) ||
+      lines[index].match(/^Check:\s+([A-Z0-9_]+):\s+(.+)$/)
+
+    if (!checkMatch) {
+      continue
+    }
+
+    const checkId = checkMatch[1]
+    const title = checkMatch[2].trim().replace(/^"+|"+$/g, '')
+    let resource: string | null = null
+    let location: { path: string; startLine: number | null } | null = null
+    let guide: string | null = null
+
+    for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+      const nextLine = lines[nextIndex]
+
+      if (nextLine.startsWith('Check: ')) {
+        break
+      }
+
+      const resourceMatch = nextLine.match(/^FAILED for resource:\s+(.+)$/)
+      if (resourceMatch) {
+        resource = resourceMatch[1].trim()
+        continue
+      }
+
+      const fileMatch = nextLine.match(/^File:\s+(.+)$/)
+      if (fileMatch && !location) {
+        location = parseCheckovLocation(fileMatch[1])
+        continue
+      }
+
+      const callingFileMatch = nextLine.match(/^Calling File:\s+(.+)$/)
+      if (callingFileMatch && !location) {
+        location = parseCheckovLocation(callingFileMatch[1])
+        continue
+      }
+
+      const guideMatch = nextLine.match(/^Guide:\s+(.+)$/)
+      if (guideMatch) {
+        guide = guideMatch[1].trim()
+      }
+    }
+
+    const isCustomPolicy =
+      /CKV(?:2)?_CUSTOM_/i.test(checkId) ||
+      !!guide?.includes('custom_policies') ||
+      !!location?.path.includes('security/checkov/custom_policies')
+    const key = [checkId, title, resource || '', location?.path || '', location?.startLine ?? ''].join('::')
+
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    findings.push({
+      checkId,
+      title,
+      resource,
+      path: location?.path || null,
+      startLine: location?.startLine ?? null,
+      guide,
+      isCustomPolicy,
+    })
+  }
+
+  return findings
+}
+
+function buildCheckovStepInsight(step: WorkflowStep, stepLog: string): CheckovStepInsight | null {
+  if (step.conclusion !== 'failure' || !/checkov/i.test(step.name)) {
+    return null
+  }
+
+  const findings = parseCheckovFindings(stepLog)
+  const customFindings = findings.filter((finding) => finding.isCustomPolicy)
+  const builtinFindings = findings.filter((finding) => !finding.isCustomPolicy)
+
+  if (customFindings.length > 0) {
+    return {
+      tone: 'security',
+      summary: '삽입한 Checkov 사용자 정책을 위반했습니다.',
+      compactSummary: `커스텀 정책 ${customFindings.length}건 위반`,
+      helperText: '아래 AI 분석 버튼으로 수정 방법을 확인하고, 제안 파일이 생성되면 바로 PR로 적용할 수 있습니다.',
+      findings,
+      customFindings,
+      builtinFindings,
     }
   }
 
-  return null
+  return {
+    tone: 'warning',
+    summary: 'Checkov 자체 정책 준수 위반입니다.',
+    compactSummary: `기본 Checkov 정책 ${builtinFindings.length}건 경고`,
+    helperText: '기본 Checkov 정책 위반은 경고로 보고, 아래 AI 분석 버튼으로 원인과 수정 방법을 확인할 수 있습니다.',
+    findings,
+    customFindings,
+    builtinFindings,
+  }
+}
+
+function getWorkflowStepFailureTone(step: WorkflowStep, checkovInsight: CheckovStepInsight | null): StepFailureTone | undefined {
+  if (step.conclusion !== 'failure') {
+    return undefined
+  }
+
+  if (/gitleaks|trivy/i.test(step.name)) {
+    return 'security'
+  }
+
+  if (/checkov/i.test(step.name)) {
+    return checkovInsight?.tone || 'warning'
+  }
+
+  return 'warning'
+}
+
+function summarizeCheckovFindings(findings: CheckovFinding[]): AnnotationSummary[] {
+  const grouped = new Map<string, AnnotationSummary>()
+
+  for (const finding of findings) {
+    const key = `${finding.checkId}::${finding.title}`
+    const existing = grouped.get(key)
+
+    if (existing) {
+      existing.count += 1
+      continue
+    }
+
+    grouped.set(key, {
+      key,
+      title: finding.checkId,
+      message: finding.title,
+      annotationLevel: finding.isCustomPolicy ? 'failure' : 'warning',
+      count: 1,
+      samplePath: finding.path,
+    })
+  }
+
+  return [...grouped.values()]
+}
+
+function formatCheckovFindingDetails(finding: CheckovFinding): string | null {
+  const location = finding.path
+    ? `${finding.path}${finding.startLine ? `:${finding.startLine}` : ''}`
+    : null
+
+  return [location, finding.resource].filter((value): value is string => !!value).join(' / ') || null
+}
+
+function getLastStepTarget(jobs: WorkflowJob[]): StepSelection | null {
+  let lastStep: { jobId: number; stepNumber: number; activityMs: number } | null = null
+
+  for (const job of jobs) {
+    for (const step of job.steps) {
+      const activityMs = getIsoTimestampMs(step.completedAt) ?? getIsoTimestampMs(step.startedAt)
+      if (activityMs == null) {
+        continue
+      }
+
+      if (
+        !lastStep ||
+        activityMs > lastStep.activityMs ||
+        (activityMs === lastStep.activityMs && step.number > lastStep.stepNumber)
+      ) {
+        lastStep = {
+          jobId: job.id,
+          stepNumber: step.number,
+          activityMs,
+        }
+      }
+    }
+  }
+
+  return lastStep
+    ? { jobId: lastStep.jobId, stepNumber: lastStep.stepNumber }
+    : null
 }
 
 function getWorkflowStepDomId(jobId: number, stepNumber: number): string {
@@ -888,6 +1167,7 @@ export default function GitActionsPage() {
   const [rerunAction, setRerunAction] = useState<'all' | 'failed' | null>(null)
   const [suggestLoading, setSuggestLoading] = useState(false)
   const [suggestion, setSuggestion] = useState<SuggestResponse | null>(null)
+  const [suggestionTarget, setSuggestionTarget] = useState<SuggestionTarget | null>(null)
   const [suggestionContextLabel, setSuggestionContextLabel] = useState<string | null>(null)
   const [actionMessage, setActionMessage] = useState<string | null>(null)
   const [runSummary, setRunSummary] = useState<RunSummaryResponse | null>(null)
@@ -904,7 +1184,7 @@ export default function GitActionsPage() {
 
   const selectedRun = runs.find((run) => run.id === selectedRunId) || null
   const isGithubDisconnected = !loadingStatus && (!status || !!statusError)
-  const currentStepTarget = getCurrentStepTarget(jobs)
+  const lastStepTarget = getLastStepTarget(jobs)
 
   useEffect(() => {
     selectedRunIdRef.current = selectedRunId
@@ -939,7 +1219,16 @@ export default function GitActionsPage() {
     setSelectedRunId(runId)
   }
 
-  async function handleSelectStep(job: WorkflowJob, step: WorkflowStep) {
+  async function handleSelectStep(job: WorkflowJob, step: WorkflowStep, options?: { forceOpen?: boolean }) {
+    const isSameSelectedStep =
+      selectedStepTarget?.jobId === job.id &&
+      selectedStepTarget.stepNumber === step.number
+
+    if (isSameSelectedStep && !options?.forceOpen) {
+      setSelectedStepTarget(null)
+      return
+    }
+
     setExpandedJobIds((current) => (current.includes(job.id) ? current : [...current, job.id]))
     setSelectedStepTarget({ jobId: job.id, stepNumber: step.number })
 
@@ -953,18 +1242,18 @@ export default function GitActionsPage() {
     }
   }
 
-  async function handleFocusCurrentStep() {
-    if (!currentStepTarget) {
+  async function handleFocusLastStep() {
+    if (!lastStepTarget) {
       return
     }
 
-    const targetJob = jobs.find((job) => job.id === currentStepTarget.jobId)
-    const targetStep = targetJob?.steps.find((step) => step.number === currentStepTarget.stepNumber)
+    const targetJob = jobs.find((job) => job.id === lastStepTarget.jobId)
+    const targetStep = targetJob?.steps.find((step) => step.number === lastStepTarget.stepNumber)
     if (!targetJob || !targetStep) {
       return
     }
 
-    await handleSelectStep(targetJob, targetStep)
+    await handleSelectStep(targetJob, targetStep, { forceOpen: true })
   }
 
   async function loadRunSummary(runId: number) {
@@ -1306,6 +1595,7 @@ export default function GitActionsPage() {
     setSuggestLoading(true)
     setActionMessage(null)
     setPrReview(null)
+    setSuggestionTarget({ type: 'run' })
     setSuggestionContextLabel(null)
 
     try {
@@ -1334,6 +1624,7 @@ export default function GitActionsPage() {
     setSuggestLoading(true)
     setActionMessage(null)
     setPrReview(null)
+    setSuggestionTarget({ type: 'annotations', jobId: job.id })
     setSuggestionContextLabel(`${job.name} 대응 가이드`)
 
     try {
@@ -1371,6 +1662,7 @@ export default function GitActionsPage() {
     setSuggestLoading(true)
     setActionMessage(null)
     setPrReview(null)
+    setSuggestionTarget({ type: 'step', jobId: job.id, stepNumber: step.number })
     setSuggestionContextLabel(`${job.name} > ${step.name}`)
 
     try {
@@ -1382,13 +1674,16 @@ export default function GitActionsPage() {
           stepName: step.name,
           stepNumber: step.number,
           stepStatus: step.status,
+          stepConclusion: step.conclusion,
           stepLog,
-          annotations: annotationSummaries.map((annotation) => ({
-            title: annotation.title,
-            message: annotation.message,
-            path: annotation.samplePath,
-            count: annotation.count,
-          })),
+          annotations: step.conclusion === 'failure'
+            ? annotationSummaries.map((annotation) => ({
+              title: annotation.title,
+              message: annotation.message,
+              path: annotation.samplePath,
+              count: annotation.count,
+            }))
+            : [],
         }),
       })
 
@@ -1485,6 +1780,7 @@ export default function GitActionsPage() {
       setAnnotationsMeta(null)
       setSelectedStepTarget(null)
       setSuggestion(null)
+      setSuggestionTarget(null)
       setSuggestionContextLabel(null)
       setPrReview(null)
       setExpandedJobIds([])
@@ -1498,6 +1794,7 @@ export default function GitActionsPage() {
     setAnnotationsMeta(null)
     setSelectedStepTarget(null)
     setSuggestion(null)
+    setSuggestionTarget(null)
     setSuggestionContextLabel(null)
     setPrReview(null)
     setExpandedJobIds([])
@@ -1538,13 +1835,13 @@ export default function GitActionsPage() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => void handleFocusCurrentStep()}
-              disabled={!currentStepTarget || executeLoading || rerunLoading}
-              title="현재 진행 중인 step 위치로 이동합니다."
+              onClick={() => void handleFocusLastStep()}
+              disabled={!lastStepTarget || executeLoading || rerunLoading}
+              title="가장 마지막으로 실행된 step 위치로 이동합니다."
               className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:border-gray-100 disabled:bg-gray-50 disabled:text-gray-400"
             >
               <Clock3 className="h-3.5 w-3.5" />
-              현재 작업 위치
+              마지막 작업 위치
             </button>
             <button
               type="button"
@@ -1635,6 +1932,7 @@ export default function GitActionsPage() {
             }
             suggestLoading={suggestLoading}
             suggestion={suggestion}
+            suggestionTarget={suggestionTarget}
             suggestionContextLabel={suggestionContextLabel}
             runSummary={runSummary}
             onApply={() => void handleApply()}
@@ -1784,6 +2082,7 @@ interface RunDetailProps {
   onSuggestStep: (job: WorkflowJob, step: WorkflowStep, stepLog: string, annotationSummaries: AnnotationSummary[]) => void
   suggestLoading: boolean
   suggestion: SuggestResponse | null
+  suggestionTarget: SuggestionTarget | null
   suggestionContextLabel: string | null
   runSummary: RunSummaryResponse | null
   onApply: () => void
@@ -1812,6 +2111,7 @@ function RunDetail({
   onSuggestStep,
   suggestLoading,
   suggestion,
+  suggestionTarget,
   suggestionContextLabel,
   runSummary,
   onApply,
@@ -1913,69 +2213,15 @@ function RunDetail({
           </div>
         </div>
 
-        {suggestion && (
+        {suggestion && (suggestionTarget?.type !== 'step' || !!prReview || !!suggestion.suggestedFiles?.length) && (
           <div className="mb-4 space-y-3">
             {/* AI 분석 메인 카드 */}
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <Sparkles className="h-4 w-4 shrink-0 text-amber-600" />
-                  <p className="font-medium">
-                    {suggestionContextLabel || 'AI 에러 분석'}
-                    {suggestion.llmStatus === 'success' && (
-                      <span className="ml-2 rounded bg-amber-200/60 px-1.5 py-0.5 text-[10px] font-normal uppercase">
-                        LLM + Rule
-                      </span>
-                    )}
-                    {suggestion.llmStatus === 'failed' && (
-                      <span className="ml-2 rounded bg-red-200/70 px-1.5 py-0.5 text-[10px] font-normal uppercase text-red-800">
-                        Rule fallback
-                      </span>
-                    )}
-                    {suggestion.llmStatus === 'not_attempted' && (
-                      <span className="ml-2 rounded bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-normal uppercase text-slate-700">
-                        Rule only
-                      </span>
-                    )}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 text-[11px] text-amber-500">
-                  {suggestion.mode && <span>모드: {suggestion.mode}</span>}
-                  {suggestion.configuredModel && <span>· {suggestion.configuredModel}</span>}
-                </div>
-              </div>
-
-              {/* LLM 분석 결과 (새 프롬프트 형식) */}
-              {suggestion.llmError && (
-                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                  <p className="font-medium">Gemini 호출 실패로 rule-based 분석만 표시 중</p>
-                  <p className="mt-1">{suggestion.llmError}</p>
-                </div>
-              )}
-
-              {suggestion.llmAnalysis && (
-                <div className="mt-3 rounded-lg border border-amber-200 bg-white/70 p-3 text-sm leading-relaxed text-amber-950 whitespace-pre-wrap">
-                  {suggestion.llmAnalysis}
-                </div>
-              )}
-
-              {/* Rule-based 요약 (LLM 없을 때) */}
-              {!suggestion.llmAnalysis && suggestion.summary && (
-                <div className="mt-3 space-y-3 border-t border-amber-200 pt-3">
-                  <SuggestionRow label="요약" value={suggestion.summary} />
-                  {suggestion.rootCause && <SuggestionRow label="원인" value={suggestion.rootCause} />}
-                  {suggestion.riskLevel && <SuggestionRow label="위험도" value={suggestion.riskLevel} />}
-                  {suggestion.nextActions && suggestion.nextActions.length > 0 && (
-                    <SuggestionList
-                      label="다음 조치"
-                      items={suggestion.nextActions}
-                      getKey={(item) => item}
-                      renderItem={(item) => item}
-                    />
-                  )}
-                </div>
-              )}
-            </div>
+            {suggestionTarget?.type !== 'step' && (
+              <SuggestionInsightCard
+                suggestion={suggestion}
+                label={suggestionContextLabel || 'AI 에러 분석'}
+              />
+            )}
 
             {/* 코드 수정 제안 + 적용 버튼 */}
             {suggestion.suggestedFiles && suggestion.suggestedFiles.length > 0 && (
@@ -2151,14 +2397,21 @@ function RunDetail({
             const logExpanded = expandedLogJobIds.includes(job.id)
             const timelineSteps = job.steps.map((step) => {
               const summaryStep = jobSummary?.steps.find((candidate) => candidate.number === step.number)
+              const checkovStepLog =
+                step.conclusion === 'failure' && /checkov/i.test(step.name)
+                  ? buildStepLogContent(step, job.steps, log?.content)
+                  : ''
+              const checkovInsight = buildCheckovStepInsight(step, checkovStepLog)
+
               return {
                 name: step.name,
                 number: step.number,
                 status: step.status,
                 conclusion: step.conclusion,
+                failureTone: getWorkflowStepFailureTone(step, checkovInsight) ?? null,
                 startedAt: step.startedAt,
                 completedAt: step.completedAt,
-                summary: summaryStep?.summary,
+                summary: checkovInsight?.compactSummary || summaryStep?.summary,
                 durationSeconds: summaryStep?.durationSeconds ?? null,
               }
             })
@@ -2167,6 +2420,19 @@ function RunDetail({
                 ? job.steps.find((step) => step.number === selectedStepTarget.stepNumber) || null
                 : null
             const selectedStepLog = selectedStep ? buildStepLogContent(selectedStep, job.steps, log?.content) : ''
+            const selectedStepCheckovInsight = selectedStep ? buildCheckovStepInsight(selectedStep, selectedStepLog) : null
+            const selectedStepAnnotationSummaries =
+              selectedStepCheckovInsight && selectedStepCheckovInsight.findings.length > 0
+                ? summarizeCheckovFindings(selectedStepCheckovInsight.findings)
+                : jobAnnotationSummaries
+            const selectedStepSuggestion =
+              selectedStep &&
+              suggestion &&
+              suggestionTarget?.type === 'step' &&
+              suggestionTarget.jobId === job.id &&
+              suggestionTarget.stepNumber === selectedStep.number
+                ? suggestion
+                : null
 
             return (
               <div key={job.id} className="overflow-hidden rounded-lg border border-gray-200">
@@ -2226,45 +2492,95 @@ function RunDetail({
                             }
                           }}
                           stepDomIdPrefix={getWorkflowStepDomId(job.id, 0).replace(/-0$/, '')}
+                          renderExpandedContent={(step) => {
+                            if (!selectedStep || selectedStep.number !== step.number) {
+                              return null
+                            }
+
+                            const expandedStep = selectedStep
+
+                            return (
+                              <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70">
+                                {selectedStepCheckovInsight && (
+                                  <div className="border-b border-slate-200 px-4 py-4">
+                                    <CheckovStepInsightCard insight={selectedStepCheckovInsight} />
+                                  </div>
+                                )}
+                                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+                                  <div>
+                                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+                                      Step Logs
+                                    </p>
+                                    <p className="mt-1 text-sm font-medium text-slate-900">
+                                      {job.name} &gt; {expandedStep.name}
+                                    </p>
+                                    <p className="mt-1 text-xs text-slate-500">
+                                      {selectedStepLog
+                                        ? `${parseLogLines(selectedStepLog).length} log lines`
+                                        : '이 step에 매칭되는 로그를 찾지 못했습니다.'}
+                                    </p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onSuggestStep(job, expandedStep, selectedStepLog, selectedStepAnnotationSummaries)
+                                    }
+                                    disabled={suggestLoading || !selectedStepLog}
+                                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    <Sparkles className="h-3.5 w-3.5" />
+                                    {suggestLoading ? 'AI 분석중...' : '이 단계 AI 분석'}
+                                  </button>
+                                </div>
+                                {selectedStepSuggestion && (
+                                  <div className="border-b border-slate-200 px-4 py-4">
+                                    <SuggestionInsightCard
+                                      suggestion={selectedStepSuggestion}
+                                      label={suggestionContextLabel || `${job.name} > ${expandedStep.name}`}
+                                    />
+                                  </div>
+                                )}
+                                {selectedStepSuggestion?.suggestedFiles && selectedStepSuggestion.suggestedFiles.length > 0 && (
+                                  <div className="border-b border-slate-200 px-4 py-4">
+                                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                                      <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div className="flex items-center gap-2">
+                                          <FileCode className="h-4 w-4 text-emerald-600" />
+                                          <div>
+                                            <p className="text-sm font-medium text-emerald-800">
+                                              AI가 수정 파일 {selectedStepSuggestion.suggestedFiles.length}개를 제안했습니다.
+                                            </p>
+                                            <p className="mt-1 text-xs text-emerald-700">
+                                              이 단계에서 바로 PR을 생성해 적용할 수 있습니다.
+                                            </p>
+                                          </div>
+                                        </div>
+                                        <button
+                                          type="button"
+                                          onClick={onApply}
+                                          disabled={applyLoading || !!prReview}
+                                          className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          <GitPullRequest className="h-3.5 w-3.5" />
+                                          {applyLoading ? 'PR 생성 중...' : prReview ? 'PR 생성됨' : '적용 (PR 생성)'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                                {selectedStepLog ? (
+                                  <LogViewer jobId={job.id} content={selectedStepLog} />
+                                ) : (
+                                  <div className="px-4 py-6 text-sm text-slate-500">
+                                    현재 step과 연결된 로그 구간을 찾지 못했습니다.
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          }}
                         />
                       </div>
                     ) : null}
-
-                    {selectedStep && (
-                      <div className="border-t border-gray-100 bg-slate-50/70 px-4 py-4">
-                        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                          <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
-                              Step Details
-                            </p>
-                            <p className="mt-1 text-sm font-medium text-slate-900">
-                              {job.name} &gt; {selectedStep.name}
-                            </p>
-                            <p className="mt-1 text-xs text-slate-500">
-                              {selectedStepLog
-                                ? `${parseLogLines(selectedStepLog).length} log lines`
-                                : '이 step에 매칭된 로그를 찾지 못했습니다.'}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => onSuggestStep(job, selectedStep, selectedStepLog, jobAnnotationSummaries)}
-                            disabled={suggestLoading || !selectedStepLog}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
-                          >
-                            <Sparkles className="h-3.5 w-3.5" />
-                            {suggestLoading ? 'AI 분석중...' : '이 단계 AI 분석'}
-                          </button>
-                        </div>
-                        {selectedStepLog ? (
-                          <LogViewer jobId={job.id} content={selectedStepLog} />
-                        ) : (
-                          <div className="rounded-lg border border-dashed border-slate-200 bg-white px-4 py-6 text-sm text-slate-500">
-                            현재 step과 연결된 로그 구간을 찾지 못했습니다.
-                          </div>
-                        )}
-                      </div>
-                    )}
 
                     {jobAnnotationItems.length > 0 && (
                       <div className="border-t border-gray-100 bg-amber-50/40 px-4 py-3">
@@ -2370,32 +2686,312 @@ function RunDetail({
 }
 
 function LogViewer({ jobId, content }: { jobId: number; content: string }) {
-  const parsedLines = parseLogLines(content)
+  const parsedLines = parseLogLines(content).filter(
+    (line) => !(line.tone === 'muted' && line.message === 'End group'),
+  )
 
   return (
     <div className="overflow-hidden rounded-xl border border-gray-200 bg-white font-mono text-xs shadow-sm">
-      <div className="grid grid-cols-[72px_160px_minmax(0,1fr)] border-b border-gray-200 bg-[#f6f8fa] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500">
+      <div className="grid grid-cols-[56px_minmax(0,1fr)] border-b border-gray-200 bg-[#f6f8fa] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500">
         <span>Line</span>
-        <span>Time</span>
         <span>Log</span>
       </div>
       <div className="max-h-[560px] overflow-auto bg-white">
         {parsedLines.map((line) => (
           <div
             key={`${jobId}-line-${line.lineNumber}`}
-            className="grid grid-cols-[72px_160px_minmax(0,1fr)] border-b border-gray-100 px-3 py-1.5 last:border-b-0 even:bg-[#f6f8fa]"
+            className="grid grid-cols-[56px_minmax(0,1fr)] border-b border-gray-100 px-3 py-1.5 last:border-b-0 even:bg-[#f6f8fa]"
           >
-            <div className="select-none pr-3 text-right text-[11px] text-gray-400">{line.lineNumber}</div>
-            <div className="pr-3 text-[11px] text-gray-500">{line.timestamp || '-'}</div>
+            <div className="select-none pr-2 text-right text-[11px] text-gray-400">{line.lineNumber}</div>
             <div
               className={`min-w-0 whitespace-pre-wrap break-words py-0.5 ${getLogToneClass(line.tone)}`}
               style={{ paddingLeft: `${line.indentLevel * 16}px` }}
             >
-              {line.message || ' '}
+              {line.tone === 'group' ? (
+                <span className="inline-flex items-center gap-1.5 font-semibold text-gray-900">
+                  <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
+                  <span>{line.message || 'Group'}</span>
+                </span>
+              ) : (
+                line.message || ' '
+              )}
             </div>
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+interface InsightSection {
+  title: string | null
+  bullets: string[]
+  paragraphs: string[]
+}
+
+function normalizeInsightText(text: string): string {
+  return text
+    .replace(/\r/g, '')
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+}
+
+function parseInsightSections(text: string): InsightSection[] {
+  const lines = normalizeInsightText(text).split('\n')
+  const sections: InsightSection[] = []
+  let current: InsightSection = { title: null, bullets: [], paragraphs: [] }
+  let paragraphBuffer: string[] = []
+
+  const flushParagraph = () => {
+    const paragraph = paragraphBuffer.join(' ').trim()
+    if (paragraph) {
+      current.paragraphs.push(paragraph)
+    }
+    paragraphBuffer = []
+  }
+
+  const flushSection = () => {
+    flushParagraph()
+    if (current.title || current.bullets.length > 0 || current.paragraphs.length > 0) {
+      sections.push(current)
+    }
+    current = { title: null, bullets: [], paragraphs: [] }
+  }
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+
+    if (!line) {
+      flushParagraph()
+      continue
+    }
+
+    if (/^#{1,6}\s+/.test(line) || /^\[[^\]]+\]$/.test(line)) {
+      flushSection()
+      current.title = line.replace(/^#{1,6}\s+/, '').replace(/^\[(.+)\]$/, '$1').trim()
+      continue
+    }
+
+    if (/^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line)) {
+      flushParagraph()
+      current.bullets.push(line.replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, '').trim())
+      continue
+    }
+
+    paragraphBuffer.push(line)
+  }
+
+  flushSection()
+  return sections
+}
+
+function InsightBody({ text }: { text: string }) {
+  const sections = parseInsightSections(text)
+
+  if (sections.length === 0) {
+    return (
+      <div className="mt-3 rounded-lg border border-amber-200 bg-white/70 p-3 text-sm leading-6 text-amber-950 whitespace-pre-wrap">
+        {text}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-3 space-y-3">
+      {sections.map((section, index) => (
+        <div key={`${section.title || 'section'}-${index}`} className="rounded-lg border border-amber-200 bg-white/70 p-3">
+          {section.title && (
+            <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-700">
+              {section.title}
+            </p>
+          )}
+          {section.paragraphs.length > 0 && (
+            <div className={cn('space-y-2 text-sm leading-6 text-amber-950', section.title && 'mt-2')}>
+              {section.paragraphs.map((paragraph, paragraphIndex) => (
+                <p key={`${index}-paragraph-${paragraphIndex}`}>{paragraph}</p>
+              ))}
+            </div>
+          )}
+          {section.bullets.length > 0 && (
+            <div className={cn('space-y-2 text-sm leading-6 text-amber-950', section.title && 'mt-2')}>
+              {section.bullets.map((bullet, bulletIndex) => (
+                <div key={`${index}-bullet-${bulletIndex}`} className="flex gap-2">
+                  <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
+                  <p>{bullet}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function CheckovStepInsightCard({ insight }: { insight: CheckovStepInsight }) {
+  const visibleCustomFindings = insight.customFindings.slice(0, 6)
+  const visibleBuiltinFindings = insight.builtinFindings.slice(0, 3)
+  const toneStyles =
+    insight.tone === 'security'
+      ? {
+        container: 'border-red-200 bg-red-50 text-red-900',
+        badge: 'bg-red-100 text-red-700',
+        title: 'text-red-800',
+        body: 'text-red-700',
+        divider: 'border-red-200',
+        item: 'border-red-200 bg-white/70',
+      }
+      : {
+        container: 'border-amber-200 bg-amber-50 text-amber-900',
+        badge: 'bg-amber-100 text-amber-700',
+        title: 'text-amber-800',
+        body: 'text-amber-700',
+        divider: 'border-amber-200',
+        item: 'border-amber-200 bg-white/70',
+      }
+
+  return (
+    <div className={cn('rounded-xl border px-4 py-3', toneStyles.container)}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-2">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className={cn('text-sm font-semibold', toneStyles.title)}>{insight.summary}</p>
+            <p className={cn('mt-1 text-xs leading-5', toneStyles.body)}>{insight.helperText}</p>
+            <p className={cn('mt-2 text-xs font-medium', toneStyles.body)}>{insight.compactSummary}</p>
+          </div>
+        </div>
+        <span className={cn('rounded-full px-2 py-1 text-[11px] font-medium', toneStyles.badge)}>
+          {insight.tone === 'security' ? 'custom policy' : 'checkov warning'}
+        </span>
+      </div>
+
+      {insight.tone === 'security' && visibleCustomFindings.length > 0 && (
+        <div className={cn('mt-3 space-y-2 border-t pt-3', toneStyles.divider)}>
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-red-700">Violated Policies</p>
+          {visibleCustomFindings.map((finding) => {
+            const details = formatCheckovFindingDetails(finding)
+
+            return (
+              <div
+                key={`${finding.checkId}-${finding.path || finding.resource || finding.title}`}
+                className={cn('rounded-lg border px-3 py-2', toneStyles.item)}
+              >
+                <p className="text-sm font-medium text-red-900">
+                  {finding.title} <span className="text-xs font-normal text-red-600">({finding.checkId})</span>
+                </p>
+                {details && <p className="mt-1 text-xs text-red-700">{details}</p>}
+                {finding.guide && (
+                  <p className="mt-1 break-all text-[11px] text-red-600">{finding.guide}</p>
+                )}
+              </div>
+            )
+          })}
+          {insight.customFindings.length > visibleCustomFindings.length && (
+            <p className="text-xs text-red-700">
+              외 {insight.customFindings.length - visibleCustomFindings.length}개 정책 위반이 더 있습니다.
+            </p>
+          )}
+        </div>
+      )}
+
+      {insight.tone === 'warning' && insight.builtinFindings.length > 0 && (
+        <div className={cn('mt-3 space-y-2 border-t pt-3', toneStyles.divider)}>
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-700">Detected Checks</p>
+          {visibleBuiltinFindings.map((finding) => {
+            const details = formatCheckovFindingDetails(finding)
+
+            return (
+              <div
+                key={`${finding.checkId}-${finding.path || finding.resource || finding.title}`}
+                className={cn('rounded-lg border px-3 py-2', toneStyles.item)}
+              >
+                <p className="text-sm font-medium text-amber-900">
+                  {finding.title} <span className="text-xs font-normal text-amber-700">({finding.checkId})</span>
+                </p>
+                {details && <p className="mt-1 text-xs text-amber-700">{details}</p>}
+              </div>
+            )
+          })}
+          {insight.builtinFindings.length > visibleBuiltinFindings.length && (
+            <p className="text-xs text-amber-700">
+              외 {insight.builtinFindings.length - visibleBuiltinFindings.length}개 기본 정책 경고가 더 있습니다.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SuggestionInsightCard({
+  suggestion,
+  label,
+}: {
+  suggestion: SuggestResponse
+  label: string
+}) {
+  const detailLabel = suggestion.analysisKind === 'informational' ? '설명' : '원인'
+  const nextLabel = suggestion.analysisKind === 'informational' ? '확인 포인트' : '다음 조치'
+
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 shrink-0 text-amber-600" />
+          <p className="font-medium">
+            {label}
+            {suggestion.llmStatus === 'success' && (
+              <span className="ml-2 rounded bg-amber-200/60 px-1.5 py-0.5 text-[10px] font-normal uppercase">
+                LLM + Rule
+              </span>
+            )}
+            {suggestion.llmStatus === 'failed' && (
+              <span className="ml-2 rounded bg-red-200/70 px-1.5 py-0.5 text-[10px] font-normal uppercase text-red-800">
+                Rule fallback
+              </span>
+            )}
+            {suggestion.llmStatus === 'not_attempted' && (
+              <span className="ml-2 rounded bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-normal uppercase text-slate-700">
+                Rule only
+              </span>
+            )}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-amber-500">
+          {suggestion.mode && <span>모드: {suggestion.mode}</span>}
+          {suggestion.configuredModel && <span>{suggestion.configuredModel}</span>}
+        </div>
+      </div>
+
+      {suggestion.llmError && (
+        <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          <p className="font-medium">Gemini 호출 실패로 rule-based 결과만 표시 중입니다.</p>
+          <p className="mt-1">{suggestion.llmError}</p>
+        </div>
+      )}
+
+      {suggestion.llmAnalysis && (
+        <InsightBody text={suggestion.llmAnalysis} />
+      )}
+
+      {!suggestion.llmAnalysis && suggestion.summary && (
+        <div className="mt-3 space-y-3 border-t border-amber-200 pt-3">
+          <SuggestionRow label="요약" value={suggestion.summary} />
+          {suggestion.rootCause && <SuggestionRow label={detailLabel} value={suggestion.rootCause} />}
+          {suggestion.analysisKind !== 'informational' && suggestion.riskLevel && (
+            <SuggestionRow label="위험도" value={suggestion.riskLevel} />
+          )}
+          {suggestion.nextActions && suggestion.nextActions.length > 0 && (
+            <SuggestionList
+              label={nextLabel}
+              items={suggestion.nextActions}
+              getKey={(item) => item}
+              renderItem={(item) => item}
+            />
+          )}
+        </div>
+      )}
     </div>
   )
 }

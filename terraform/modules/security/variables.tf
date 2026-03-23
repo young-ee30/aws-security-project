@@ -17,6 +17,12 @@ variable "reviews_dynamodb_table_arn" {
   description = "Reviews DynamoDB 테이블 ARN (ECS Task Role 정책용)"
   type        = string
 }
+variable "ecs_task_execution_secret_arns" {
+  description = "Secrets Manager or SSM Parameter ARNs that ECS task execution role may read for container secret injection"
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

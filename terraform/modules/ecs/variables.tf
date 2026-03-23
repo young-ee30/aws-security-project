@@ -14,6 +14,7 @@ variable "services" {
     desired_count  = number
     image          = string
     environment    = map(string)
+    secrets        = optional(map(string), {})
     command        = optional(list(string), null)
   }))
 }

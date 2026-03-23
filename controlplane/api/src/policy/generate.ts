@@ -38,6 +38,8 @@ const PREFERRED_AWS_TERRAFORM_RESOURCE_TYPES = [
 type CheckovCategory = (typeof CHECKOV_CATEGORIES)[number]
 type CheckovSeverity = (typeof CHECKOV_SEVERITIES)[number]
 type CheckovProvider = (typeof CHECKOV_PROVIDERS)[number]
+type TerraformApplicability = 'yes' | 'partial' | 'no'
+type CoverageMode = 'full' | 'partial'
 type PolicyGenerationMode = 'llm' | 'fallback'
 type PolicyProvider = LlmProvider | 'fallback'
 type JsonValue = string | number | boolean | null | JsonObject | JsonValue[]
@@ -47,6 +49,7 @@ interface JsonObject {
 }
 
 interface LlmPolicyDraft {
+  status?: unknown
   sourcePolicyId?: unknown
   sourcePolicyTitle?: unknown
   conversionStatus?: unknown
@@ -60,6 +63,11 @@ interface LlmPolicyDraft {
   provider?: unknown
   guideline?: unknown
   fileName?: unknown
+  coverageMode?: unknown
+  coveredConditions?: unknown
+  notCoveredConditions?: unknown
+  assumptions?: unknown
+  limitations?: unknown
   definition?: unknown
 }
 
@@ -77,10 +85,37 @@ interface ExtractedPolicySignals {
   matchedTopics: string[]
 }
 
+interface NormalizedControl {
+  control_id: string
+  title: string
+  source_severity: CheckovSeverity
+  provider: CheckovProvider
+  target_format: 'checkov_yaml'
+  terraform_applicability: TerraformApplicability
+  coverage_mode: CoverageMode
+  control_objective: string
+  pass_conditions: string[]
+  fail_conditions: string[]
+  implementation_examples: string[]
+  resource_candidates: string[]
+  check_dimensions: string[]
+  enforceable_conditions: string[]
+  non_enforceable_conditions: string[]
+  allowed_evidence_fields: string[]
+  forbidden_inferred_evidence: string[]
+  required_resource_families: string[][]
+  generation_constraints: {
+    disallow_hardcoded_resource_names: boolean
+    must_report_uncovered_conditions: boolean
+    must_not_guess_missing_provider_details: boolean
+  }
+}
+
 interface LocalPolicyClassificationResult {
   convertible: boolean
   reason: string
   signals: ExtractedPolicySignals
+  normalizedControl: NormalizedControl | null
   fallbackDraft: ResolvedPolicyDraft | null
 }
 
@@ -105,11 +140,34 @@ interface ResolvedPolicyDraft {
   guideline?: string
   fileName: string
   definition: JsonObject
+  yamlContent?: string
+}
+
+interface GeneratedPolicyPackagePolicy {
+  id: string
+  file_name: string
+  title: string
+  rationale: string
+  resource_types: string[]
+  content: string
+}
+
+interface GeneratedPolicyPackage {
+  status: 'ok' | 'cannot_generate'
+  policy_format: string
+  coverage_mode: CoverageMode
+  policies: GeneratedPolicyPackagePolicy[]
+  covered_conditions: string[]
+  not_covered_conditions: string[]
+  assumptions: string[]
+  limitations: string[]
+  generation_notes: string[]
 }
 
 interface GeneratedPolicyArtifact {
   sourcePolicyId: string
   sourcePolicyTitle: string
+  sourceExcerpt?: string
   policyName: string
   description: string
   summary: string
@@ -297,6 +355,81 @@ const FALLBACK_POLICY_TEMPLATES: FallbackPolicyTemplate[] = [
   },
 ]
 
+const DIMENSION_TO_ALLOWED_EVIDENCE: Record<string, string[]> = {
+  network_segmentation: [
+    'subnet association',
+    'route table association',
+    'network boundary separation',
+  ],
+  routing_topology: [
+    'route table association',
+    'routing path',
+    'gateway attachment',
+  ],
+  public_exposure: [
+    'public exposure attributes',
+    'public accessibility attributes',
+    'network exposure settings',
+  ],
+  access_control: [
+    'security group rules',
+    'network ACL rules',
+    'IAM-related attachment evidence',
+  ],
+  encryption: [
+    'encryption attributes',
+    'kms configuration',
+  ],
+  logging: [
+    'logging attributes',
+    'log delivery configuration',
+  ],
+}
+
+const DIMENSION_TO_FORBIDDEN_EVIDENCE: Record<string, string[]> = {
+  network_segmentation: ['tags', 'naming conventions'],
+  routing_topology: ['tags', 'naming conventions'],
+  public_exposure: ['tags', 'resource naming conventions'],
+  access_control: ['tags', 'resource naming conventions'],
+  encryption: ['tags'],
+  logging: ['tags'],
+}
+
+const DIMENSION_TO_REQUIRED_RESOURCE_FAMILIES: Record<string, string[][]> = {
+  network_segmentation: [
+    ['aws_subnet', 'aws_route_table'],
+  ],
+  routing_topology: [
+    ['aws_route_table_association', 'aws_internet_gateway', 'aws_nat_gateway'],
+  ],
+  public_exposure: [
+    ['aws_db_instance'],
+  ],
+}
+
+const REQUIRED_POLICY_PACKAGE_KEYS = [
+  'status',
+  'policy_format',
+  'coverage_mode',
+  'policies',
+  'covered_conditions',
+  'not_covered_conditions',
+  'assumptions',
+  'limitations',
+  'generation_notes',
+] as const
+
+const FORBIDDEN_INVENTED_ATTR_PATTERNS = [
+  /tags\.NetworkType/i,
+  /tags\.subnet_type/i,
+  /tags\.public_private/i,
+  /tags\.network_type/i,
+]
+
+const TAUTOLOGY_PATTERNS = [
+  /or:\s*[\r\n]+(?:\s*-\s*[\r\n]+)?\s*not:\s*[\r\n]+\s*attribute:\s*([A-Za-z0-9_.-]+)\s*[\r\n]+\s*(?:operator:\s*equals|equals:)\s*public[\s\S]*not:\s*[\r\n]+\s*attribute:\s*\1\s*[\r\n]+\s*(?:operator:\s*equals|equals:)\s*private/is,
+]
+
 export interface GeneratePolicyRequest {
   fileName: string
   contentBase64: string
@@ -359,6 +492,22 @@ function normalizeSourcePolicyId(value: string) {
     .replace(/-+/g, '-')
 }
 
+function getCustomPolicySuffix(sourcePolicyId: string) {
+  return normalizeSourcePolicyId(sourcePolicyId).replace(/-/g, '_')
+}
+
+function getGeneratedPolicyName(sourcePolicyId: string) {
+  return `custom_policy_${getCustomPolicySuffix(sourcePolicyId)}`
+}
+
+function getGeneratedPolicyId(sourcePolicyId: string) {
+  return `CKV2_CUSTOM_${getCustomPolicySuffix(sourcePolicyId)}`
+}
+
+function getGeneratedPolicyFileName(sourcePolicyId: string) {
+  return `${getGeneratedPolicyName(sourcePolicyId)}.yaml`
+}
+
 function cleanPolicyTitle(value: string) {
   return value
     .trim()
@@ -392,13 +541,56 @@ function normalizeWhitespace(text: string) {
     .trim()
 }
 
-function pickSummarySentence(text: string) {
-  const sentences = text
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((part) => part.trim())
-    .filter((part) => part.length >= 40 && part.length <= 220)
+function cleanSummaryCandidate(text: string) {
+  return normalizeWhitespace(text)
+    .replace(/\n+/g, ' ')
+    .replace(/^(점검 목적|점검목적|목적|inspection purpose|purpose)\s*[:：-]?\s*/i, '')
+    .trim()
+}
 
-  return sentences[0] || ''
+function looksAbruptSummary(text: string) {
+  const normalized = cleanSummaryCandidate(text)
+  if (!normalized || /[.!?…]$/.test(normalized)) {
+    return false
+  }
+
+  return /(권한을|을|를|이|가|은|는|의|및|또는|에서|으로|하고|하며|통해)$/u.test(normalized)
+}
+
+function pickSummarySentence(text: string) {
+  const normalized = normalizeWhitespace(text)
+  const paragraphs = normalized
+    .split(/\n{2,}/)
+    .map(cleanSummaryCandidate)
+    .filter(Boolean)
+  const sentences = paragraphs.flatMap((paragraph) =>
+    paragraph
+      .split(/(?<=[.!?])\s+/)
+      .map(cleanSummaryCandidate)
+      .filter(Boolean),
+  )
+  const preferred = sentences.find(
+    (part) => part.length >= 40 && part.length <= 220 && !looksAbruptSummary(part),
+  )
+
+  if (preferred) {
+    return preferred
+  }
+
+  const paragraphFallback = paragraphs.find(
+    (part) => part.length >= 40 && part.length <= 220 && !looksAbruptSummary(part),
+  )
+
+  if (paragraphFallback) {
+    return paragraphFallback
+  }
+
+  const longFallback = paragraphs.find((part) => part.length >= 40) || sentences.find((part) => part.length >= 40) || ''
+  if (!longFallback) {
+    return ''
+  }
+
+  return longFallback.length > 220 ? `${longFallback.slice(0, 217).trimEnd()}...` : longFallback
 }
 
 function extractSourcePolicies(fileName: string, text: string): SourcePolicyItem[] {
@@ -673,18 +865,221 @@ function extractPolicySignals(sourcePolicy: SourcePolicyItem): ExtractedPolicySi
   }
 }
 
-function buildStructuredSourcePolicyPrompt(sourcePolicy: SourcePolicyItem) {
-  const sections = extractPolicySections(sourcePolicy)
-  const signals = extractPolicySignals(sourcePolicy)
+const NON_ENFORCEABLE_CONDITION_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /administrator[- ]only|admin only/i, label: 'administrator-only access requirements' },
+  { pattern: /appropriate authorization|proper authorization|access approval/i, label: 'appropriate authorization assignment' },
+  { pattern: /policy (establishment|definition)|governance|procedure/i, label: 'policy or procedure requirements' },
+  { pattern: /periodic|regular review|review frequency|audit cycle/i, label: 'periodic review requirements' },
+  { pattern: /human approval|manual approval|operator review/i, label: 'human approval requirements' },
+  { pattern: /runtime|running state|operational status/i, label: 'runtime or operational state checks' },
+]
 
-  const payload = {
-    sourcePolicyId: sourcePolicy.sourcePolicyId,
-    sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
-    sections,
-    signals,
+function splitConditionSentences(text?: string) {
+  if (!text) {
+    return []
   }
 
-  return `Convert this extracted Terraform policy input.\n${JSON.stringify(payload)}`
+  return [...new Set(
+    text
+      .split(/(?<=[.!?])\s+|\n+|•|·|-/)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 8),
+  )].slice(0, 4)
+}
+
+function deriveCheckDimensions(text: string, matchedTopics: string[]) {
+  const dimensions = new Set<string>()
+  const lower = text.toLowerCase()
+
+  for (const topic of matchedTopics) {
+    if (topic === 'public-ip' || topic === 's3-public-access') dimensions.add('public_exposure')
+    if (topic === 'route-table') dimensions.add('routing_topology')
+    if (topic === 'security-group' || topic === 'iam') dimensions.add('access_control')
+    if (topic === 'encryption') dimensions.add('encryption')
+    if (topic === 'logging') dimensions.add('logging')
+    if (topic === 'backup-retention') dimensions.add('backup_retention')
+  }
+
+  if (/public subnet|private subnet|network segmentation|segmentation/i.test(lower)) dimensions.add('network_segmentation')
+  if (/public ip|publicly accessible|public access/i.test(lower)) dimensions.add('public_exposure')
+  if (/logging|cloudtrail|audit/i.test(lower)) dimensions.add('logging')
+  if (/encrypt|encryption|kms/i.test(lower)) dimensions.add('encryption')
+
+  return [...dimensions]
+}
+
+function deriveEnforceableConditions(dimensions: string[]) {
+  const conditions: string[] = []
+
+  if (dimensions.includes('public_exposure')) {
+    conditions.push('internal resources must not expose public IPs or public access')
+  }
+  if (dimensions.includes('network_segmentation')) {
+    conditions.push('public and private network resources must be separated')
+  }
+  if (dimensions.includes('routing_topology')) {
+    conditions.push('routing must enforce intended public and private network topology')
+  }
+  if (dimensions.includes('access_control')) {
+    conditions.push('network or identity access controls must restrict unintended access')
+  }
+  if (dimensions.includes('encryption')) {
+    conditions.push('relevant resources must have encryption enabled')
+  }
+  if (dimensions.includes('logging')) {
+    conditions.push('relevant resources must have logging enabled')
+  }
+  if (dimensions.includes('backup_retention')) {
+    conditions.push('relevant resources must have backup or retention settings configured')
+  }
+
+  return conditions
+}
+
+function deriveAllowedEvidenceFields(checkDimensions: string[]) {
+  return [...new Set(checkDimensions.flatMap((dimension) => DIMENSION_TO_ALLOWED_EVIDENCE[dimension] || []))]
+}
+
+function deriveForbiddenInferredEvidence(checkDimensions: string[]) {
+  return [...new Set(checkDimensions.flatMap((dimension) => DIMENSION_TO_FORBIDDEN_EVIDENCE[dimension] || []))]
+}
+
+function deriveRequiredResourceFamilies(checkDimensions: string[], resourceCandidates: string[]) {
+  const families = checkDimensions.flatMap((dimension) => DIMENSION_TO_REQUIRED_RESOURCE_FAMILIES[dimension] || [])
+  const deduped: string[][] = []
+  const seen = new Set<string>()
+  const candidateSet = new Set(resourceCandidates)
+
+  for (const family of families) {
+    if (resourceCandidates.length > 0 && family.every((resourceType) => !candidateSet.has(resourceType))) {
+      continue
+    }
+
+    const normalizedFamily = [...new Set(family)].sort()
+    const key = normalizedFamily.join('::')
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    deduped.push(normalizedFamily)
+  }
+
+  return deduped
+}
+
+function collectNonEnforceableConditions(text: string) {
+  return NON_ENFORCEABLE_CONDITION_PATTERNS.filter(({ pattern }) => pattern.test(text)).map(({ label }) => label)
+}
+
+function classifyTerraformApplicability(
+  resourceCandidates: string[],
+  enforceableConditions: string[],
+  nonEnforceableConditions: string[],
+): { terraformApplicability: TerraformApplicability; coverageMode: CoverageMode } {
+  if (resourceCandidates.length === 0 && enforceableConditions.length === 0) {
+    return { terraformApplicability: 'no', coverageMode: 'partial' }
+  }
+
+  if (nonEnforceableConditions.length > 0 || enforceableConditions.length === 0) {
+    return { terraformApplicability: 'partial', coverageMode: 'partial' }
+  }
+
+  return { terraformApplicability: 'yes', coverageMode: 'full' }
+}
+
+function compactJsonValue(value: JsonValue): JsonValue | undefined {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((item) => compactJsonValue(item))
+      .filter((item): item is JsonValue => item !== undefined)
+    return normalized.length > 0 ? normalized : undefined
+  }
+
+  if (isPlainObject(value)) {
+    const normalized = compactJsonObject(value)
+    return Object.keys(normalized).length > 0 ? normalized : undefined
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+
+  return value === null ? undefined : value
+}
+
+function compactJsonObject(value: JsonObject) {
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, child]) => {
+      const normalized = compactJsonValue(child)
+      return normalized === undefined ? [] : [[key, normalized]]
+    }),
+  ) as JsonObject
+}
+
+function buildNormalizedControl(
+  sourcePolicy: SourcePolicyItem,
+  baselineDraft: ResolvedPolicyDraft,
+  signals: ExtractedPolicySignals,
+): NormalizedControl {
+  const sections = extractPolicySections(sourcePolicy)
+  const summarySentence = pickSummarySentence(sourcePolicy.content)
+  const combinedText = [
+    sourcePolicy.sourcePolicyTitle,
+    sections.purpose,
+    sections.inspectionCriteria,
+    sections.risk,
+    sections.remediation,
+    sections.excerpt,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const resourceCandidates =
+    signals.candidateResourceTypes.length > 0
+      ? signals.candidateResourceTypes
+      : [...new Set(findResourceTypes(baselineDraft.definition))]
+  const checkDimensions = deriveCheckDimensions(combinedText, signals.matchedTopics)
+  const enforceableConditions = deriveEnforceableConditions(checkDimensions)
+  const nonEnforceableConditions = collectNonEnforceableConditions(combinedText)
+  const allowedEvidenceFields = deriveAllowedEvidenceFields(checkDimensions)
+  const forbiddenInferredEvidence = deriveForbiddenInferredEvidence(checkDimensions)
+  const requiredResourceFamilies = deriveRequiredResourceFamilies(checkDimensions, resourceCandidates)
+  const { terraformApplicability, coverageMode } = classifyTerraformApplicability(
+    resourceCandidates,
+    enforceableConditions,
+    nonEnforceableConditions,
+  )
+
+  return {
+    control_id: sourcePolicy.sourcePolicyId,
+    title: sourcePolicy.sourcePolicyTitle,
+    source_severity: baselineDraft.severity,
+    provider: baselineDraft.provider,
+    target_format: 'checkov_yaml',
+    terraform_applicability: terraformApplicability,
+    coverage_mode: coverageMode,
+    control_objective: sections.purpose || sections.inspectionCriteria || summarySentence || sourcePolicy.sourcePolicyTitle,
+    pass_conditions: splitConditionSentences(sections.inspectionCriteria),
+    fail_conditions: splitConditionSentences(sections.risk),
+    implementation_examples: splitConditionSentences(sections.remediation),
+    resource_candidates: resourceCandidates,
+    check_dimensions: checkDimensions,
+    enforceable_conditions: enforceableConditions,
+    non_enforceable_conditions: nonEnforceableConditions,
+    allowed_evidence_fields: allowedEvidenceFields,
+    forbidden_inferred_evidence: forbiddenInferredEvidence,
+    required_resource_families: requiredResourceFamilies,
+    generation_constraints: {
+      disallow_hardcoded_resource_names: true,
+      must_report_uncovered_conditions: true,
+      must_not_guess_missing_provider_details: true,
+    },
+  }
+}
+
+function buildStructuredSourcePolicyPrompt(normalizedControl: NormalizedControl) {
+  return JSON.stringify(compactJsonObject(normalizedControl as unknown as JsonObject))
 }
 
 function classifySourcePolicyLocally(
@@ -692,13 +1087,15 @@ function classifySourcePolicyLocally(
   sourcePolicy: SourcePolicyItem,
 ): LocalPolicyClassificationResult {
   const signals = extractPolicySignals(sourcePolicy)
-  const fallbackDraft = buildFallbackDraftForSourcePolicy(fileName, sourcePolicy)
+  const fallbackDraft = buildFallbackDraftForSourcePolicy(fileName, sourcePolicy) ?? buildBaseDraftForSourcePolicy(fileName, sourcePolicy)
+  const normalizedControl = buildNormalizedControl(sourcePolicy, fallbackDraft, signals)
 
-  if (!signals.likelyConvertible) {
+  if (!signals.likelyConvertible || normalizedControl.terraform_applicability === 'no') {
     return {
       convertible: false,
       reason: 'Local classifier marked this source policy as operational, procedural, or not statically checkable from Terraform.',
       signals,
+      normalizedControl,
       fallbackDraft: null,
     }
   }
@@ -708,86 +1105,59 @@ function classifySourcePolicyLocally(
       convertible: false,
       reason: 'Local classifier could not confirm an AWS Terraform target for this source policy.',
       signals,
-      fallbackDraft: null,
-    }
-  }
-
-  if (fallbackDraft) {
-    return {
-      convertible: true,
-      reason: 'Local classifier matched this source policy to a Terraform-checkable AWS control.',
-      signals,
-      fallbackDraft,
-    }
-  }
-
-  if (signals.candidateResourceTypes.length === 0) {
-    return {
-      convertible: false,
-      reason: 'Local classifier could not infer a Terraform AWS resource type for this source policy.',
-      signals,
+      normalizedControl,
       fallbackDraft: null,
     }
   }
 
   return {
     convertible: true,
-    reason: `Local classifier inferred Terraform AWS resource hints: ${signals.candidateResourceTypes.join(', ')}.`,
+    reason:
+      normalizedControl.coverage_mode === 'partial'
+        ? 'Local classifier found Terraform-enforceable conditions, but only partial coverage is possible from static Terraform data.'
+        : `Local classifier inferred Terraform AWS resource hints: ${normalizedControl.resource_candidates.join(', ')}.`,
     signals,
-    fallbackDraft: buildBaseDraftForSourcePolicy(fileName, sourcePolicy),
+    normalizedControl,
+    fallbackDraft,
   }
 }
 
-function buildPolicyDefinitionPrompt(
-  fileName: string,
-  sourcePolicy: SourcePolicyItem,
-  baselineDraft: ResolvedPolicyDraft,
-  signals: ExtractedPolicySignals,
-) {
-  const preferredResourceTypes =
-    signals.candidateResourceTypes.length > 0 ? signals.candidateResourceTypes : [...new Set(findResourceTypes(baselineDraft.definition))]
-
+function buildPolicyUserPrompt(normalizedControl: NormalizedControl) {
   return [
-    `PDF file: ${fileName}`,
+    'Generate Terraform static-analysis policy artifacts from the following normalized control input.',
     '',
-    buildStructuredSourcePolicyPrompt(sourcePolicy),
+    '[CONTROL]',
+    JSON.stringify(compactJsonObject(normalizedControl as unknown as JsonObject)),
     '',
-    'Local conversion decision:',
-    'conversion_status: convertible',
-    `policy_name: ${baselineDraft.policyName}`,
-    `category: ${baselineDraft.category}`,
-    `severity: ${baselineDraft.severity}`,
-    `provider: ${baselineDraft.provider}`,
-    `preferred_resource_types: ${JSON.stringify(preferredResourceTypes)}`,
-    `fallback_definition_hint: ${JSON.stringify(baselineDraft.definition)}`,
-    '',
-    'Return only guideline and definition.',
-    'Use the local hints only if they fit the source policy text.',
+    'Requirements:',
+    '- target format must follow target_format',
+    '- provider must follow provider',
+    '- use only resource_candidates',
+    '- use only allowed_evidence_fields',
+    '- never use forbidden_inferred_evidence',
+    '- do not hardcode Terraform resource names',
+    '- report uncovered conditions when coverage_mode is partial',
+    '- if sufficient grounded evidence does not exist, return cannot_generate',
+    '- output JSON only',
   ].join('\n')
 }
 
-function buildMinimalDefinitionPrompt(
-  fileName: string,
-  sourcePolicy: SourcePolicyItem,
-  baselineDraft: ResolvedPolicyDraft,
-  signals: ExtractedPolicySignals,
+function buildRepairUserPrompt(
+  normalizedControl: NormalizedControl,
+  pkg: JsonObject,
+  errors: string[],
 ) {
-  const preferredResourceTypes =
-    signals.candidateResourceTypes.length > 0 ? signals.candidateResourceTypes : [...new Set(findResourceTypes(baselineDraft.definition))]
-
   return [
-    `PDF file: ${fileName}`,
+    'Repair the policy package using the validator errors below.',
     '',
-    buildStructuredSourcePolicyPrompt(sourcePolicy),
+    '[NORMALIZED_CONTROL]',
+    JSON.stringify(compactJsonObject(normalizedControl as unknown as JsonObject)),
     '',
-    `policy_name: ${baselineDraft.policyName}`,
-    `category: ${baselineDraft.category}`,
-    `severity: ${baselineDraft.severity}`,
-    `preferred_resource_types: ${JSON.stringify(preferredResourceTypes)}`,
+    '[PREVIOUS_OUTPUT]',
+    JSON.stringify(pkg),
     '',
-    'Return only the shortest valid definition.',
-    'Use a single attribute rule or a single not-wrapped attribute rule.',
-    'Do not use checks arrays or composite operators.',
+    '[VALIDATOR_ERRORS]',
+    JSON.stringify(errors),
   ].join('\n')
 }
 function isConvertibleDraft(draft: LlmPolicyDraft) {
@@ -807,13 +1177,25 @@ function extractPreferredAwsResourceTypes(text: string) {
   const matches: string[] = []
 
   if (/route table|routing table|aws_route|aws_route_table|internet gateway|igw|nat gateway|private subnet|public subnet|라우팅|라우트 테이블|인터넷 게이트웨이/.test(lower)) {
-    matches.push('aws_route', 'aws_route_table', 'aws_route_table_association', 'aws_subnet')
+    matches.push(
+      'aws_route',
+      'aws_route_table',
+      'aws_route_table_association',
+      'aws_subnet',
+      'aws_internet_gateway',
+      'aws_nat_gateway',
+    )
   }
-  if (/security group|ssh|22\/tcp|0\.0\.0\.0\/0|ingress|egress/.test(lower)) matches.push('aws_security_group')
+  if (/security group|ssh|22\/tcp|0\.0\.0\.0\/0|ingress|egress|network acl|nacl/.test(lower)) {
+    matches.push('aws_security_group', 'aws_network_acl')
+  }
   if (/s3|bucket|public access block|versioning|server-side encryption/.test(lower)) {
     matches.push('aws_s3_bucket', 'aws_s3_bucket_public_access_block')
   }
   if (/rds|database|db instance|mysql|postgres/.test(lower)) matches.push('aws_db_instance', 'aws_rds_cluster')
+  if (/ec2|instance|virtual machine|public ip|associate public ip/.test(lower)) {
+    matches.push('aws_instance', 'aws_network_interface')
+  }
   if (/iam|role|least privilege|trust policy/.test(lower)) matches.push('aws_iam_role')
   if (/kms|key management|customer managed key|cmk/.test(lower)) matches.push('aws_kms_key')
   if (/cloudtrail|audit trail|logging/.test(lower)) matches.push('aws_cloudtrail', 'aws_cloudwatch_log_group')
@@ -821,7 +1203,7 @@ function extractPreferredAwsResourceTypes(text: string) {
   if (/launch template|imds|metadata service|ec2/.test(lower)) matches.push('aws_launch_template')
   if (/elasticache|redis|replication group/.test(lower)) matches.push('aws_elasticache_replication_group')
 
-  return [...new Set(matches)].slice(0, 4)
+  return [...new Set(matches)].slice(0, 10)
 }
 
 function scoreFallbackTemplate(template: FallbackPolicyTemplate, text: string) {
@@ -912,28 +1294,27 @@ function buildFallbackDraftForSourcePolicy(fileName: string, sourcePolicy: Sourc
   const sourceTitle = humanizeFileName(fileName)
   const summarySentence = pickSummarySentence(text)
   const template = selectBestFallbackTemplate(text)
+  const normalizedSourcePolicyId = normalizeSourcePolicyId(sourcePolicy.sourcePolicyId)
 
   if (!template) {
     return null
   }
 
-  const policyName = `${sourcePolicy.sourcePolicyId} ${sourcePolicy.sourcePolicyTitle}`
+  const policyName = getGeneratedPolicyName(normalizedSourcePolicyId)
 
   return {
-    sourcePolicyId: sourcePolicy.sourcePolicyId,
+    sourcePolicyId: normalizedSourcePolicyId,
     sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
     policyName,
     description:
       summarySentence ||
-      `${template.description} Source: ${sourceTitle} ${sourcePolicy.sourcePolicyId}.`,
+      `${template.description} Source: ${sourceTitle} ${normalizedSourcePolicyId}.`,
     summary: template.summary,
-    policyId: `CKV2_CUSTOM_${slugify(sourcePolicy.sourcePolicyId).replace(/-/g, '_').toUpperCase()}_${slugify(template.key)
-      .replace(/-/g, '_')
-      .toUpperCase()}_${Date.now().toString().slice(-6)}`,
+    policyId: getGeneratedPolicyId(normalizedSourcePolicyId),
     category: template.category,
     severity: template.severity,
     provider,
-    fileName: toPolicyFileName(`${sourcePolicy.sourcePolicyId}-${sourcePolicy.sourcePolicyTitle}`, template.key),
+    fileName: getGeneratedPolicyFileName(normalizedSourcePolicyId),
     definition: template.definition,
   }
 }
@@ -961,23 +1342,22 @@ function buildFallbackDrafts(fileName: string, sourcePolicies: SourcePolicyItem[
 
 function buildBaseDraftForSourcePolicy(fileName: string, sourcePolicy: SourcePolicyItem): ResolvedPolicyDraft {
   const provider = detectProvider(sourcePolicy.content)
-  const policyName = `${sourcePolicy.sourcePolicyId} ${sourcePolicy.sourcePolicyTitle}`.trim()
+  const normalizedSourcePolicyId = normalizeSourcePolicyId(sourcePolicy.sourcePolicyId)
+  const policyName = getGeneratedPolicyName(normalizedSourcePolicyId)
 
   return {
-    sourcePolicyId: sourcePolicy.sourcePolicyId,
+    sourcePolicyId: normalizedSourcePolicyId,
     sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
     policyName,
     description:
       pickSummarySentence(sourcePolicy.content) ||
-      `Derived from ${humanizeFileName(fileName)} ${sourcePolicy.sourcePolicyId}. Review before applying.`,
-    summary: `Derived a Terraform AWS control from ${sourcePolicy.sourcePolicyId}.`,
-    policyId: `CKV2_CUSTOM_${slugify(sourcePolicy.sourcePolicyId).replace(/-/g, '_').toUpperCase()}_${Date.now()
-      .toString()
-      .slice(-6)}`,
+      `Derived from ${humanizeFileName(fileName)} ${normalizedSourcePolicyId}. Review before applying.`,
+    summary: `Derived a Terraform AWS control from ${normalizedSourcePolicyId}.`,
+    policyId: getGeneratedPolicyId(normalizedSourcePolicyId),
     category: 'GENERAL_SECURITY',
     severity: 'MEDIUM',
     provider,
-    fileName: toPolicyFileName(`${sourcePolicy.sourcePolicyId}-${sourcePolicy.sourcePolicyTitle}`, sourcePolicy.sourcePolicyId),
+    fileName: getGeneratedPolicyFileName(normalizedSourcePolicyId),
     definition: inferFallbackDefinition(sourcePolicy.content, provider),
   }
 }
@@ -1069,6 +1449,350 @@ function hasAwsTerraformResourceTypes(definition: JsonObject) {
   return resourceTypes.some((resourceType) => /^aws_[a-z0-9_]+$/.test(resourceType))
 }
 
+const HARDCODED_TERRAFORM_LOCAL_NAME_RE = /aws_[a-z0-9_]+\.(public|private|example|main|default)\b/i
+
+function normalizeStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return [...new Set(value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean))]
+}
+
+function normalizeGeneratedPolicyPackagePolicy(value: unknown): GeneratedPolicyPackagePolicy | null {
+  if (!isPlainObject(value)) {
+    return null
+  }
+
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.file_name !== 'string' ||
+    typeof value.title !== 'string' ||
+    typeof value.rationale !== 'string' ||
+    !Array.isArray(value.resource_types) ||
+    typeof value.content !== 'string'
+  ) {
+    return null
+  }
+
+  return {
+    id: value.id.trim(),
+    file_name: value.file_name.trim(),
+    title: value.title.trim(),
+    rationale: value.rationale.trim(),
+    resource_types: normalizeStringArray(value.resource_types),
+    content: value.content.trim(),
+  }
+}
+
+function normalizeGeneratedPolicyPackage(value: unknown): GeneratedPolicyPackage | null {
+  if (!isPlainObject(value)) {
+    return null
+  }
+
+  const status = typeof value.status === 'string' ? value.status.trim().toLowerCase() : ''
+  const coverageMode = typeof value.coverage_mode === 'string' ? value.coverage_mode.trim().toLowerCase() : ''
+
+  if ((status !== 'ok' && status !== 'cannot_generate') || (coverageMode !== 'full' && coverageMode !== 'partial')) {
+    return null
+  }
+
+  return {
+    status: status as GeneratedPolicyPackage['status'],
+    policy_format: typeof value.policy_format === 'string' ? value.policy_format.trim() : '',
+    coverage_mode: coverageMode as CoverageMode,
+    policies: Array.isArray(value.policies)
+      ? value.policies.map((policy) => normalizeGeneratedPolicyPackagePolicy(policy)).filter(Boolean) as GeneratedPolicyPackagePolicy[]
+      : [],
+    covered_conditions: normalizeStringArray(value.covered_conditions),
+    not_covered_conditions: normalizeStringArray(value.not_covered_conditions),
+    assumptions: normalizeStringArray(value.assumptions),
+    limitations: normalizeStringArray(value.limitations),
+    generation_notes: normalizeStringArray(value.generation_notes),
+  }
+}
+
+function extractYamlMetadataSeverity(yamlContent: string): string {
+  const lines = yamlContent.split(/\r?\n/)
+  let inMetadata = false
+  let metadataIndent = 0
+
+  for (const line of lines) {
+    const indent = line.match(/^\s*/)?.[0].length || 0
+    if (!inMetadata) {
+      const metadataMatch = line.match(/^(\s*)metadata:\s*$/)
+      if (metadataMatch) {
+        inMetadata = true
+        metadataIndent = metadataMatch[1].length
+      }
+      continue
+    }
+
+    if (line.trim() && indent <= metadataIndent) {
+      break
+    }
+
+    const severityMatch = line.match(/^\s*severity:\s*"?([A-Za-z]+)"?\s*$/)
+    if (severityMatch) {
+      return severityMatch[1].trim().toUpperCase()
+    }
+  }
+
+  const fallbackMatch = yamlContent.match(/^\s*severity:\s*"?([A-Za-z]+)"?\s*$/m)
+  return fallbackMatch ? fallbackMatch[1].trim().toUpperCase() : ''
+}
+
+function extractYamlResourceTypes(yamlContent: string): string[] {
+  const lines = yamlContent.split(/\r?\n/)
+  const resourceTypes: string[] = []
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const inlineMatch = lines[index].match(/^\s*resource_types:\s*\[(.+)\]\s*$/)
+    if (inlineMatch) {
+      const values = inlineMatch[1]
+        .split(',')
+        .map((value) => value.replace(/["']/g, '').trim())
+        .filter(Boolean)
+      resourceTypes.push(...values)
+      continue
+    }
+
+    const blockMatch = lines[index].match(/^(\s*)resource_types:\s*$/)
+    if (!blockMatch) {
+      continue
+    }
+
+    const baseIndent = blockMatch[1].length
+    for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+      const nextLine = lines[nextIndex]
+      const trimmed = nextLine.trim()
+      const indent = nextLine.match(/^\s*/)?.[0].length || 0
+
+      if (!trimmed) {
+        continue
+      }
+
+      if (indent <= baseIndent) {
+        break
+      }
+
+      const itemMatch = nextLine.match(/^\s*-\s*["']?([A-Za-z0-9_./-]+)["']?\s*$/)
+      if (itemMatch) {
+        resourceTypes.push(itemMatch[1].trim())
+      }
+    }
+  }
+
+  return [...new Set(resourceTypes)]
+}
+
+function containsForbiddenInventedAttrs(yamlContent: string, normalizedControl: NormalizedControl) {
+  const forbiddenEvidence = new Set(normalizedControl.forbidden_inferred_evidence)
+  if (![...forbiddenEvidence].some((value) => /tags/i.test(value))) {
+    return false
+  }
+
+  return FORBIDDEN_INVENTED_ATTR_PATTERNS.some((pattern) => pattern.test(yamlContent))
+}
+
+function containsTautologyHint(yamlContent: string) {
+  return TAUTOLOGY_PATTERNS.some((pattern) => pattern.test(yamlContent))
+}
+
+function checkRequiredResourceFamilies(policyResourceTypes: string[], normalizedControl: NormalizedControl) {
+  const used = new Set(policyResourceTypes)
+  const missingFamilies: string[][] = []
+
+  for (const family of normalizedControl.required_resource_families) {
+    const familySet = new Set(family)
+    const overlaps = [...familySet].some((resourceType) => used.has(resourceType))
+    if (!overlaps) {
+      missingFamilies.push([...familySet].sort())
+    }
+  }
+
+  return missingFamilies
+}
+
+function validatePolicyPackage(pkg: JsonObject, normalizedControl: NormalizedControl): string[] {
+  const errors: string[] = []
+  const missingKeys = REQUIRED_POLICY_PACKAGE_KEYS.filter((key) => !(key in pkg))
+
+  if (missingKeys.length > 0) {
+    errors.push(`missing keys: ${missingKeys.join(', ')}`)
+  }
+
+  const status = typeof pkg.status === 'string' ? pkg.status.trim().toLowerCase() : ''
+  if (status !== 'ok' && status !== 'cannot_generate') {
+    errors.push(`invalid status: ${String(pkg.status)}`)
+  }
+
+  const coverageMode = typeof pkg.coverage_mode === 'string' ? pkg.coverage_mode.trim().toLowerCase() : ''
+  if (coverageMode !== 'full' && coverageMode !== 'partial') {
+    errors.push(`invalid coverage_mode: ${String(pkg.coverage_mode)}`)
+  }
+
+  if (typeof pkg.policy_format !== 'string' || pkg.policy_format.trim() !== normalizedControl.target_format) {
+    errors.push(`policy_format mismatch: expected=${normalizedControl.target_format}, actual=${String(pkg.policy_format)}`)
+  }
+
+  if (coverageMode === 'partial' && normalizeStringArray(pkg.not_covered_conditions).length === 0) {
+    errors.push('partial coverage but not_covered_conditions is empty')
+  }
+
+  if (!Array.isArray(pkg.policies)) {
+    errors.push('policies must be an array')
+    return errors
+  }
+
+  if (status === 'ok' && pkg.policies.length === 0) {
+    errors.push('status=ok but policies is empty')
+  }
+
+  pkg.policies.forEach((policyValue, index) => {
+    if (!isPlainObject(policyValue)) {
+      errors.push(`policy[${index}] must be an object`)
+      return
+    }
+
+    const requiredPolicyKeys = ['id', 'file_name', 'title', 'rationale', 'resource_types', 'content']
+    const missingPolicyKeys = requiredPolicyKeys.filter((key) => !(key in policyValue))
+    if (missingPolicyKeys.length > 0) {
+      errors.push(`policy[${index}] missing key(s): ${missingPolicyKeys.join(', ')}`)
+      return
+    }
+
+    const normalizedPolicy = normalizeGeneratedPolicyPackagePolicy(policyValue)
+    if (!normalizedPolicy) {
+      errors.push(`policy[${index}] has invalid field types`)
+      return
+    }
+
+    if (normalizedPolicy.resource_types.length === 0) {
+      errors.push(`policy[${index}] resource_types is empty`)
+    }
+
+    const yamlSeverity = extractYamlMetadataSeverity(normalizedPolicy.content)
+    if (!yamlSeverity) {
+      errors.push(`policy[${index}] metadata.severity is missing from YAML`)
+    }
+    if (yamlSeverity && yamlSeverity !== normalizedControl.source_severity) {
+      errors.push(`policy[${index}] severity mismatch: expected=${normalizedControl.source_severity}, actual=${yamlSeverity}`)
+    }
+
+    if (HARDCODED_TERRAFORM_LOCAL_NAME_RE.test(normalizedPolicy.content)) {
+      errors.push(`policy[${index}] contains hardcoded Terraform local resource name`)
+    }
+
+    if (containsForbiddenInventedAttrs(normalizedPolicy.content, normalizedControl)) {
+      errors.push(`policy[${index}] contains invented tag-based evidence forbidden by input`)
+    }
+
+    if (containsTautologyHint(normalizedPolicy.content)) {
+      errors.push(`policy[${index}] contains tautology-like logic`)
+    }
+
+    const usedResourceTypes = new Set(normalizedPolicy.resource_types)
+    const allowedResourceTypes = new Set(normalizedControl.resource_candidates)
+    const disallowedResourceTypes = [...usedResourceTypes].filter((resourceType) => !allowedResourceTypes.has(resourceType))
+    if (disallowedResourceTypes.length > 0) {
+      errors.push(`policy[${index}] uses resource types outside candidates: ${disallowedResourceTypes.join(', ')}`)
+    }
+
+    const yamlResourceTypes = new Set(extractYamlResourceTypes(normalizedPolicy.content))
+    if (yamlResourceTypes.size === 0) {
+      errors.push(`policy[${index}] definition.resource_types is missing from YAML`)
+    }
+    if (yamlResourceTypes.size > 0) {
+      const mismatch =
+        yamlResourceTypes.size !== usedResourceTypes.size ||
+        [...yamlResourceTypes].some((resourceType) => !usedResourceTypes.has(resourceType))
+      if (mismatch) {
+        errors.push(`policy[${index}] resource_types mismatch between top-level field and YAML definition`)
+      }
+    }
+
+    const missingFamilies = checkRequiredResourceFamilies(normalizedPolicy.resource_types, normalizedControl)
+    if (missingFamilies.length > 0) {
+      errors.push(
+        `policy[${index}] missing required resource families for dimensions ${normalizedControl.check_dimensions.join(', ')}: ${JSON.stringify(missingFamilies)}`,
+      )
+    }
+  })
+
+  return errors
+}
+
+function validateGeneratedDefinitionDraft(draft: JsonObject, normalizedControl: NormalizedControl) {
+  const status = typeof draft.status === 'string' ? draft.status.trim().toLowerCase() : 'ok'
+
+  if (status !== 'ok' && status !== 'cannot_generate') {
+    return {
+      valid: false,
+      cannotGenerate: false,
+      message: `Gemini returned an invalid status for ${normalizedControl.control_id}.`,
+    }
+  }
+
+  if (status === 'cannot_generate') {
+    return {
+      valid: false,
+      cannotGenerate: true,
+      message: `Gemini marked ${normalizedControl.control_id} as cannot_generate from the normalized control input.`,
+    }
+  }
+
+  if ('coverage_mode' in draft && typeof draft.coverage_mode === 'string') {
+    const coverageMode = draft.coverage_mode.trim().toLowerCase()
+    if (coverageMode !== 'full' && coverageMode !== 'partial') {
+      return {
+        valid: false,
+        cannotGenerate: false,
+        message: `Gemini returned an invalid coverage_mode for ${normalizedControl.control_id}.`,
+      }
+    }
+  }
+
+  if (!isPlainObject(draft.definition)) {
+    return {
+      valid: false,
+      cannotGenerate: false,
+      message: `Gemini returned JSON without a valid definition for ${normalizedControl.control_id}.`,
+    }
+  }
+
+  if (!hasAwsTerraformResourceTypes(draft.definition)) {
+    return {
+      valid: false,
+      cannotGenerate: false,
+      message: `Gemini returned a definition without Terraform AWS resource_types for ${normalizedControl.control_id}.`,
+    }
+  }
+
+  if (HARDCODED_TERRAFORM_LOCAL_NAME_RE.test(JSON.stringify(draft.definition))) {
+    return {
+      valid: false,
+      cannotGenerate: false,
+      message: `Gemini hardcoded Terraform local resource names for ${normalizedControl.control_id}.`,
+    }
+  }
+
+  const usedResourceTypes = [...new Set(findResourceTypes(draft.definition))]
+  if (normalizedControl.resource_candidates.length > 0) {
+    const disallowedResourceTypes = usedResourceTypes.filter((resourceType) => !normalizedControl.resource_candidates.includes(resourceType))
+    if (disallowedResourceTypes.length > 0) {
+      return {
+        valid: false,
+        cannotGenerate: false,
+        message: `Gemini used resource types outside local candidates for ${normalizedControl.control_id}: ${disallowedResourceTypes.join(', ')}.`,
+      }
+    }
+  }
+
+  void normalizeStringArray(draft.not_covered_conditions)
+  return { valid: true, cannotGenerate: false, message: '' }
+}
+
 function resolveDraft(fileName: string, text: string, draft: LlmPolicyDraft | null, fallback: ResolvedPolicyDraft) {
   if (!draft) {
     return fallback
@@ -1082,23 +1806,10 @@ function resolveDraft(fileName: string, text: string, draft: LlmPolicyDraft | nu
     typeof draft.sourcePolicyTitle === 'string' && draft.sourcePolicyTitle.trim().length > 0
       ? cleanPolicyTitle(draft.sourcePolicyTitle)
       : fallback.sourcePolicyTitle
-  const policyName =
-    typeof draft.policyName === 'string' && draft.policyName.trim().length > 0
-      ? draft.policyName.trim()
-      : `${sourcePolicyId} ${sourcePolicyTitle}`.trim()
-
-  const fileNameSource =
-    typeof draft.fileName === 'string' && draft.fileName.trim().length > 0
-      ? draft.fileName.trim()
-      : `${sourcePolicyId}-${policyName}`
-
-  const normalizedFileName =
-    `${slugify(fileNameSource) || slugify(policyName) || slugify(fileName.replace(/\.pdf$/i, '')) || 'custom-policy'}.yaml`
+  const policyName = getGeneratedPolicyName(sourcePolicyId)
+  const normalizedFileName = getGeneratedPolicyFileName(sourcePolicyId)
   const definition = isPlainObject(draft.definition) ? draft.definition : fallback.definition
-  const policyId =
-    typeof draft.policyId === 'string' && draft.policyId.trim().length > 0
-      ? draft.policyId.trim()
-      : fallback.policyId
+  const policyId = getGeneratedPolicyId(sourcePolicyId)
 
   return {
     sourcePolicyId,
@@ -1122,6 +1833,10 @@ function resolveDraft(fileName: string, text: string, draft: LlmPolicyDraft | nu
 }
 
 function getDraftSignature(draft: ResolvedPolicyDraft) {
+  if (draft.yamlContent) {
+    return `${slugify(draft.policyName)}::yaml::${draft.yamlContent}`
+  }
+
   const resourceTypes = [...new Set(findResourceTypes(draft.definition))].sort().join(',')
   return `${slugify(draft.policyName)}::${resourceTypes}::${JSON.stringify(draft.definition)}`
 }
@@ -1325,8 +2040,8 @@ function buildBatchSummary(fileName: string, count: number, mode: PolicyGenerati
 }
 
 const POLICY_CLASSIFICATION_ATTEMPTS = [{ maxTokens: 1200 }] as const
-const POLICY_DEFINITION_ATTEMPTS = [{ maxTokens: 1200 }, { maxTokens: 1800 }] as const
-const POLICY_MINIMAL_DEFINITION_ATTEMPTS = [{ maxTokens: 700 }, { maxTokens: 1000 }] as const
+const POLICY_PACKAGE_MAX_TOKENS = 2400
+const POLICY_REPAIR_MAX_TOKENS = 2400
 
 function buildPolicyClassificationSystemPrompt() {
   return [
@@ -1369,48 +2084,87 @@ function buildPolicyClassificationSystemPrompt() {
 
 function buildPolicyDefinitionSystemPrompt() {
   return [
-    'You generate one Checkov custom policy definition for Terraform AWS.',
-    'Return JSON only.',
-    'Return the most compact valid JSON that satisfies the schema.',
-    'Return exactly one JSON object with this schema:',
+    'You are a Terraform static-analysis policy generator.',
+    '',
+    'You receive one compact normalized control object produced by deterministic code.',
+    'You must generate policy artifacts only from the provided JSON input.',
+    'Do not assume access to the original PDF, raw source text, or any unstated context.',
+    '',
+    'Hard rules:',
+    '1. Generate policy logic from:',
+    '   - control_objective',
+    '   - pass_conditions',
+    '   - fail_conditions',
+    '   - enforceable_conditions',
+    '   not from implementation_examples alone.',
+    '2. Treat implementation_examples as hints, not as mandatory logic, unless explicitly stated as mandatory in the input.',
+    '3. Use only resource types listed in resource_candidates.',
+    '4. Use only allowed_evidence_fields.',
+    '5. Never use forbidden_inferred_evidence.',
+    '6. Never invent tagging schemes or classification attributes such as:',
+    '   - tags.NetworkType',
+    '   - tags.subnet_type',
+    '   - tags.public_private',
+    '   unless explicitly present in the input as allowed evidence.',
+    '7. Never infer public/private separation from tags, labels, or naming conventions alone.',
+    '8. For topology or segmentation controls, prefer route tables, subnet associations, routing paths, and gateway attachments over tag checks.',
+    '9. Never hardcode Terraform local resource names such as:',
+    '   - aws_route_table.public',
+    '   - aws_nat_gateway.example',
+    '   - aws_subnet.private',
+    '   - aws_security_group.main',
+    '10. If terraform_applicability is "partial", generate only the enforceable subset and explicitly report uncovered conditions.',
+    '11. Do not convert operational, governance, approval, review-frequency, or human-process requirements into code.',
+    '12. Reject tautological logic, always-true logic, and always-false logic.',
+    '13. If the control requires evidence that is not available from the input, return status="cannot_generate".',
+    '14. Preserve source_severity unless explicitly overridden in the input.',
+    '15. Output valid JSON only. No markdown. No explanation.',
+    '',
+    'Return exactly this schema:',
     '{',
-    '  "guideline": string,',
-    '  "definition": object',
+    '  "status": "ok | cannot_generate",',
+    '  "policy_format": "string",',
+    '  "coverage_mode": "full | partial",',
+    '  "policies": [',
+    '    {',
+    '      "id": "string",',
+    '      "file_name": "string",',
+    '      "title": "string",',
+    '      "rationale": "string",',
+    '      "resource_types": ["string"],',
+    '      "content": "string"',
+    '    }',
+    '  ],',
+    '  "covered_conditions": ["string"],',
+    '  "not_covered_conditions": ["string"],',
+    '  "assumptions": ["string"],',
+    '  "limitations": ["string"],',
+    '  "generation_notes": ["string"]',
     '}',
-    'Do not include policyName, category, severity, sourcePolicyId, sourcePolicyTitle, description, summary, fileName, policyId, or provider.',
-    'The definition must follow Checkov YAML custom policy syntax.',
-    `The definition must target Terraform AWS resource_types such as: ${PREFERRED_AWS_TERRAFORM_RESOURCE_TYPES.join(', ')}.`,
-    'Every definition must include at least one aws_* Terraform resource_types entry.',
-    'Prefer a single concrete attribute or connection check.',
-    'Avoid composite rules unless they are strictly necessary.',
-    'Do not use long checks arrays when a single attribute rule or a single not-wrapped attribute rule is sufficient.',
-    'Keep guideline to one short sentence.',
-    'Do not return markdown. Do not wrap JSON in prose.',
   ].join('\n')
 }
 
-function buildMinimalPolicyDefinitionSystemPrompt() {
+function buildPolicyRepairSystemPrompt() {
   return [
-    'You generate one minimal Checkov custom policy definition for Terraform AWS.',
-    'Return JSON only.',
-    'Return exactly one JSON object with this schema:',
-    '{',
-    '  "definition": object',
-    '}',
-    'Return the shortest valid JSON possible.',
-    'Do not include guideline, policyName, category, severity, sourcePolicyId, sourcePolicyTitle, description, summary, fileName, policyId, or provider.',
-    'The definition must follow Checkov YAML custom policy syntax.',
-    'Use only one of these minimal shapes:',
-    '{ "definition": { "cond_type": "attribute", "resource_types": [string], "attribute": string, "operator": string, "value": string|number|boolean } }',
-    '{ "definition": { "not": { "cond_type": "attribute", "resource_types": [string], "attribute": string, "operator": string, "value": string|number|boolean } } }',
-    'Do not use checks arrays.',
-    'Do not use operator values "and" or "or".',
-    'Use exactly one Terraform AWS resource type when possible.',
-    'Do not return markdown. Do not wrap JSON in prose.',
+    'You are a policy-package repair engine.',
+    '',
+    'You receive:',
+    '1. a previously generated policy package',
+    '2. validator errors',
+    '3. the original normalized control input',
+    '',
+    'Fix only the reported issues while preserving valid parts.',
+    '',
+    'Rules:',
+    '1. Do not change the output JSON schema.',
+    '2. Do not introduce hardcoded Terraform resource names.',
+    '3. Do not introduce invented tag-based evidence or naming-based classification.',
+    '4. Do not add policy intent beyond the normalized control input.',
+    '5. If safe repair is not possible, return status="cannot_generate".',
+    '6. Output valid JSON only.',
   ].join('\n')
 }
-void POLICY_DEFINITION_ATTEMPTS
-void POLICY_MINIMAL_DEFINITION_ATTEMPTS
+void POLICY_CLASSIFICATION_ATTEMPTS
 void buildPolicyClassificationSystemPrompt
 
 function formatLlmJsonError(content: string, finishReason?: string) {
@@ -1420,6 +2174,85 @@ function formatLlmJsonError(content: string, finishReason?: string) {
   }
 
   return `Gemini returned non-JSON content. Preview: ${preview}${finishReason ? ` (finishReason: ${finishReason})` : ''}`
+}
+
+async function requestPolicyPackage(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
+): Promise<{ parsed: JsonObject | null; error?: string }> {
+  const response = await callConfiguredLlm({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    temperature: 0.2,
+    maxTokens,
+    responseMimeType: 'application/json',
+  })
+
+  if (response === null) {
+    return { parsed: null, error: 'Gemini is not configured. Set LLM_API_KEY or GEMINI_API_KEY.' }
+  }
+
+  if (!response.content) {
+    return { parsed: null, error: 'Gemini returned no usable content.' }
+  }
+
+  const parsed = parseJsonValue(response.content)
+  if (!isPlainObject(parsed)) {
+    return { parsed: null, error: formatLlmJsonError(response.content, response.finishReason) }
+  }
+
+  return { parsed }
+}
+
+function normalizeGeneratedFileName(fileName: string, fallback: string) {
+  const candidate = fileName.replace(/\\/g, '/').split('/').pop()?.trim() || fallback
+  const stem = candidate.replace(/\.ya?ml$/i, '')
+  return `${slugify(stem) || fallback.replace(/\.ya?ml$/i, '')}.yaml`
+}
+
+function normalizeGeneratedPolicyId(policyId: string, fallback: string) {
+  const normalized = policyId.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
+  return normalized || fallback
+}
+
+function normalizeGeneratedYamlContent(content: string) {
+  const normalized = content.replace(/\r/g, '').trim()
+  if (!normalized) {
+    return normalized
+  }
+
+  return normalized.startsWith('---') ? `${normalized}\n` : `---\n${normalized}\n`
+}
+
+function resolveGeneratedPolicyPackageDraft(
+  sourcePolicy: SourcePolicyItem,
+  policy: GeneratedPolicyPackagePolicy,
+  pkg: GeneratedPolicyPackage,
+  fallback: ResolvedPolicyDraft,
+): ResolvedPolicyDraft {
+  const notCoveredSummary =
+    pkg.coverage_mode === 'partial' && pkg.not_covered_conditions.length > 0
+      ? `Partial coverage. Not covered: ${pkg.not_covered_conditions.join('; ')}.`
+      : fallback.summary
+
+  return {
+    sourcePolicyId: sourcePolicy.sourcePolicyId,
+    sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+    policyName: policy.title || fallback.policyName,
+    description: policy.rationale || fallback.description,
+    summary: notCoveredSummary,
+    policyId: normalizeGeneratedPolicyId(policy.id, fallback.policyId),
+    category: fallback.category,
+    severity: fallback.severity,
+    provider: fallback.provider,
+    guideline: fallback.guideline,
+    fileName: normalizeGeneratedFileName(policy.file_name, fallback.fileName),
+    definition: fallback.definition,
+    yamlContent: normalizeGeneratedYamlContent(policy.content),
+  }
 }
 
 async function generateWithLlm(
@@ -1435,7 +2268,7 @@ async function generateWithLlm(
 
     for (const sourcePolicy of sourcePolicies) {
       const localClassification = classifySourcePolicyLocally(fileName, sourcePolicy)
-      if (!localClassification.convertible || !localClassification.fallbackDraft) {
+      if (!localClassification.convertible || !localClassification.fallbackDraft || !localClassification.normalizedControl) {
         skippedPolicies.push({
           sourcePolicyId: sourcePolicy.sourcePolicyId,
           sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
@@ -1444,125 +2277,100 @@ async function generateWithLlm(
         continue
       }
 
-      let generatedDraft: LlmPolicyDraft | null = null
-      let definitionError = 'Gemini returned no usable content.'
+      const initialResult = await requestPolicyPackage(
+        buildPolicyDefinitionSystemPrompt(),
+        buildPolicyUserPrompt(localClassification.normalizedControl),
+        POLICY_PACKAGE_MAX_TOKENS,
+      )
 
-      for (const attempt of POLICY_DEFINITION_ATTEMPTS) {
-        const response = await callConfiguredLlm({
-          messages: [
-            { role: 'system', content: buildPolicyDefinitionSystemPrompt() },
-            {
-              role: 'user',
-              content: buildPolicyDefinitionPrompt(
-                fileName,
-                sourcePolicy,
-                localClassification.fallbackDraft,
-                localClassification.signals,
-              ),
-            },
-          ],
-          temperature: 0.2,
-          maxTokens: attempt.maxTokens,
-          responseMimeType: 'application/json',
-        })
-
-        if (response === null) {
-          definitionError = 'Gemini is not configured. Set LLM_API_KEY or GEMINI_API_KEY.'
-          continue
-        }
-
-        if (!response.content) {
-          definitionError = `Gemini returned no usable definition content for ${sourcePolicy.sourcePolicyId}.`
-          continue
-        }
-
-        const parsed = parseJsonValue(response.content)
-        if (!isPlainObject(parsed)) {
-          definitionError = `${sourcePolicy.sourcePolicyId}: ${formatLlmJsonError(response.content, response.finishReason)}`
-          continue
-        }
-
-        if (!isPlainObject(parsed.definition)) {
-          definitionError = `Gemini returned JSON without a valid definition for ${sourcePolicy.sourcePolicyId}.`
-          continue
-        }
-
-        if (!hasAwsTerraformResourceTypes(parsed.definition)) {
-          definitionError = `Gemini returned a definition without Terraform AWS resource_types for ${sourcePolicy.sourcePolicyId}.`
-          continue
-        }
-
-        generatedDraft = {
-          guideline: parsed.guideline,
-          definition: parsed.definition,
-        }
-        break
-      }
-
-      if (!generatedDraft) {
-        for (const attempt of POLICY_MINIMAL_DEFINITION_ATTEMPTS) {
-          const response = await callConfiguredLlm({
-            messages: [
-              { role: 'system', content: buildMinimalPolicyDefinitionSystemPrompt() },
-              {
-                role: 'user',
-                content: buildMinimalDefinitionPrompt(
-                  fileName,
-                  sourcePolicy,
-                  localClassification.fallbackDraft,
-                  localClassification.signals,
-                ),
-              },
-            ],
-            temperature: 0.1,
-            maxTokens: attempt.maxTokens,
-            responseMimeType: 'application/json',
-          })
-
-          if (response === null) {
-            definitionError = 'Gemini is not configured. Set LLM_API_KEY or GEMINI_API_KEY.'
-            continue
-          }
-
-          if (!response.content) {
-            definitionError = `Gemini returned no usable minimal definition content for ${sourcePolicy.sourcePolicyId}.`
-            continue
-          }
-
-          const parsed = parseJsonValue(response.content)
-          if (!isPlainObject(parsed)) {
-            definitionError = `${sourcePolicy.sourcePolicyId}: ${formatLlmJsonError(response.content, response.finishReason)}`
-            continue
-          }
-
-          if (!isPlainObject(parsed.definition)) {
-            definitionError = `Gemini returned JSON without a valid minimal definition for ${sourcePolicy.sourcePolicyId}.`
-            continue
-          }
-
-          if (!hasAwsTerraformResourceTypes(parsed.definition)) {
-            definitionError = `Gemini returned a minimal definition without Terraform AWS resource_types for ${sourcePolicy.sourcePolicyId}.`
-            continue
-          }
-
-          generatedDraft = {
-            definition: parsed.definition,
-          }
-          break
-        }
-      }
-
-      if (!generatedDraft) {
+      if (!initialResult.parsed) {
+        const definitionError = `${sourcePolicy.sourcePolicyId}: ${initialResult.error || 'Gemini returned no usable content.'}`
         errors.push(definitionError)
         skippedPolicies.push({
           sourcePolicyId: sourcePolicy.sourcePolicyId,
           sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
-          reason: `Gemini could not generate a Checkov definition for a locally-convertible source policy. ${definitionError}`,
+          reason: `Gemini could not generate a grounded policy package. ${definitionError}`,
         })
         continue
       }
 
-      resolvedDrafts.push(resolveDraft(fileName, sourcePolicy.content, generatedDraft, localClassification.fallbackDraft))
+      let packageCandidate = initialResult.parsed
+      const initialStatus = typeof packageCandidate.status === 'string' ? packageCandidate.status.trim().toLowerCase() : ''
+      if (initialStatus === 'cannot_generate') {
+        skippedPolicies.push({
+          sourcePolicyId: sourcePolicy.sourcePolicyId,
+          sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+          reason: `Gemini returned cannot_generate for ${sourcePolicy.sourcePolicyId}.`,
+        })
+        continue
+      }
+
+      let validationErrors = validatePolicyPackage(packageCandidate, localClassification.normalizedControl)
+      if (validationErrors.length > 0) {
+        const repairResult = await requestPolicyPackage(
+          buildPolicyRepairSystemPrompt(),
+          buildRepairUserPrompt(localClassification.normalizedControl, packageCandidate, validationErrors),
+          POLICY_REPAIR_MAX_TOKENS,
+        )
+
+        if (!repairResult.parsed) {
+          const repairError = `${sourcePolicy.sourcePolicyId}: ${repairResult.error || 'Gemini repair returned no usable content.'}`
+          errors.push(repairError)
+          skippedPolicies.push({
+            sourcePolicyId: sourcePolicy.sourcePolicyId,
+            sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+            reason: `Validator rejected the generated package and repair failed. ${repairError}`,
+          })
+          continue
+        }
+
+        packageCandidate = repairResult.parsed
+        const repairedStatus = typeof packageCandidate.status === 'string' ? packageCandidate.status.trim().toLowerCase() : ''
+        if (repairedStatus === 'cannot_generate') {
+          skippedPolicies.push({
+            sourcePolicyId: sourcePolicy.sourcePolicyId,
+            sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+            reason: `Repair marked ${sourcePolicy.sourcePolicyId} as cannot_generate.`,
+          })
+          continue
+        }
+
+        validationErrors = validatePolicyPackage(packageCandidate, localClassification.normalizedControl)
+      }
+
+      if (validationErrors.length > 0) {
+        const definitionError = `${sourcePolicy.sourcePolicyId}: ${validationErrors.join(' | ')}`
+        errors.push(definitionError)
+        skippedPolicies.push({
+          sourcePolicyId: sourcePolicy.sourcePolicyId,
+          sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+          reason: `Validator rejected the generated package after one repair attempt. ${definitionError}`,
+        })
+        continue
+      }
+
+      const normalizedPackage = normalizeGeneratedPolicyPackage(packageCandidate)
+      if (!normalizedPackage || normalizedPackage.status !== 'ok' || normalizedPackage.policies.length === 0) {
+        const definitionError = `${sourcePolicy.sourcePolicyId}: generated package could not be normalized after validation.`
+        errors.push(definitionError)
+        skippedPolicies.push({
+          sourcePolicyId: sourcePolicy.sourcePolicyId,
+          sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+          reason: definitionError,
+        })
+        continue
+      }
+
+      for (const policy of normalizedPackage.policies) {
+        resolvedDrafts.push(
+          resolveGeneratedPolicyPackageDraft(
+            sourcePolicy,
+            policy,
+            normalizedPackage,
+            localClassification.fallbackDraft,
+          ),
+        )
+      }
     }
 
     return {
@@ -1632,11 +2440,13 @@ export async function generatePolicyFromPdf(input: GeneratePolicyRequest): Promi
   }
 
   const sourcePolicies = extractSourcePolicies(input.fileName, text)
+  const sourcePolicyMap = new Map(sourcePolicies.map((sourcePolicy) => [sourcePolicy.sourcePolicyId, sourcePolicy]))
   const llmResult = await generateWithLlm(input.fileName, sourcePolicies)
   const resolvedDrafts = llmResult?.drafts || []
   const policies = resolvedDrafts.map((draft) => ({
     sourcePolicyId: draft.sourcePolicyId,
     sourcePolicyTitle: draft.sourcePolicyTitle,
+    sourceExcerpt: sourcePolicyMap.get(draft.sourcePolicyId)?.content,
     policyName: draft.policyName,
     description: draft.description,
     summary: draft.summary,
@@ -1645,7 +2455,7 @@ export async function generatePolicyFromPdf(input: GeneratePolicyRequest): Promi
     targetProvider: draft.provider,
     policyId: draft.policyId,
     policyPath: `security/checkov/custom_policies/${draft.fileName}`,
-    yaml: buildCustomPolicyYaml(draft),
+    yaml: draft.yamlContent || buildCustomPolicyYaml(draft),
   }))
 
   return {

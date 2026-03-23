@@ -6,6 +6,7 @@ type WorkflowJob = Awaited<ReturnType<typeof getWorkflowRunJobs>>[number]
 type WorkflowJobLog = Awaited<ReturnType<typeof getWorkflowRunLogs>>['logs'][number]
 type RiskLevel = 'low' | 'medium' | 'high'
 type LlmStatus = 'not_attempted' | 'success' | 'failed'
+type AnalysisKind = 'failure' | 'informational'
 
 interface CandidateFile {
   path: string
@@ -13,6 +14,7 @@ interface CandidateFile {
 }
 
 interface SuggestionDraft {
+  analysisKind?: AnalysisKind
   ruleId: string
   title: string
   summary: string
@@ -41,6 +43,7 @@ interface GenerateFixSuggestionOptions {
   stepName?: string
   stepNumber?: number
   stepStatus?: string
+  stepConclusion?: string
   stepLog?: string
   annotations?: AnnotationSummaryInput[]
 }
@@ -49,6 +52,7 @@ export interface FixSuggestionResponse {
   ok: true
   runId: string
   message: string
+  analysisKind: AnalysisKind
   mode: 'rule-based' | 'llm' | 'hybrid'
   configuredModel?: string
   llmStatus: LlmStatus
@@ -107,6 +111,28 @@ function buildMessage(draft: SuggestionDraft): string {
     `원인: ${draft.rootCause}`,
     `위험도: ${draft.riskLevel}`,
   ]
+
+  if (draft.nextActions.length > 0) {
+    parts.push(`다음 조치: ${draft.nextActions.join(' / ')}`)
+  }
+
+  return parts.join('\n')
+}
+
+function buildSuggestionMessage(draft: SuggestionDraft, analysisKind: AnalysisKind): string {
+  const parts = [`[${draft.title}]`, draft.summary]
+
+  if (analysisKind === 'informational') {
+    parts.push(`설명: ${draft.rootCause}`)
+
+    if (draft.nextActions.length > 0) {
+      parts.push(`확인 포인트: ${draft.nextActions.join(' / ')}`)
+    }
+
+    return parts.join('\n')
+  }
+
+  parts.push(`원인: ${draft.rootCause}`, `위험도: ${draft.riskLevel}`)
 
   if (draft.nextActions.length > 0) {
     parts.push(`다음 조치: ${draft.nextActions.join(' / ')}`)
@@ -229,6 +255,29 @@ function buildCheckovAnnotationDraft(
     ],
     candidateFiles,
     patchIdea: 'Annotations에 나온 Terraform 파일을 중심으로 보안 설정을 보완하고 다시 Checkov를 실행합니다.',
+  }
+}
+
+function buildStepExplanationDraft(
+  jobName: string | undefined,
+  stepName: string | undefined,
+  logText: string,
+  jobs: WorkflowJob[],
+): SuggestionDraft {
+  return {
+    ruleId: 'workflow-step-explanation',
+    title: '선택 단계 설명',
+    summary: `${jobName || '선택한 job'}의 ${stepName || '선택한 단계'}는 실패 원인 분석이 아니라 단계 설명 모드로 분류했습니다.`,
+    rootCause: '이 단계가 무엇을 하는지, 로그에서 어떤 작업이 수행됐는지, 다음 단계와 어떻게 이어지는지만 설명합니다.',
+    riskLevel: 'low',
+    nextActions: [
+      '로그에 나온 명령과 설정 작업을 기준으로 단계의 역할을 확인합니다.',
+      '이 단계 다음에 이어지는 step과 입력값, 산출물을 함께 봅니다.',
+    ],
+    candidateFiles: uniqueByPath([
+      ...detectCandidateFilesFromStepLog(logText),
+      ...detectWorkflowFiles(logText, jobs),
+    ]),
   }
 }
 
@@ -426,12 +475,84 @@ function parseSuggestedFiles(llmResponse: string): SuggestedFile[] {
   return files
 }
 
+function buildLlmPromptSet(
+  analysisKind: AnalysisKind,
+  stepContext: string,
+  ruleBasedSummary: string,
+  annotationSummary: string,
+  truncatedLog: string,
+  terraformContext: string,
+) {
+  const prefix = `${stepContext}${stepContext ? '\n\n' : ''}Rule-based summary: ${ruleBasedSummary}`
+
+  if (analysisKind === 'informational') {
+    return {
+      systemPrompt: `You are a senior DevOps engineer familiar with AWS, Terraform, and GitHub Actions.
+Respond in Korean.
+If the selected step is not failing, do not invent an error cause. Explain the step in a concise operational way.
+Output format exactly:
+[What]
+- ...
+[Observed]
+- ...
+[Next]
+- ...
+[Checkpoints]
+- ...
+Constraints:
+- At most 2 bullets per section.
+- Each bullet must be one short sentence.
+- No introduction or conclusion.
+- Do not use markdown headings like ###.
+- Do not propose code changes unless clearly necessary.`,
+      userPrompt: `${prefix}
+
+${annotationSummary}
+
+[Selected step log]
+\`\`\`
+${truncatedLog}
+\`\`\`${terraformContext}`,
+    }
+  }
+
+  return {
+    systemPrompt: `You are a senior DevOps engineer familiar with AWS, Terraform, and GitHub Actions.
+Respond in Korean.
+Analyze the failure concisely.
+Output format exactly:
+[Cause]
+- ...
+[Impact]
+- ...
+[Next]
+- ...
+[Fix]
+- ...
+Constraints:
+- At most 2 bullets per section.
+- Each bullet must be one short sentence.
+- No introduction or conclusion.
+- Do not use markdown headings like ###.
+- Only include code change guidance when the log clearly supports it.`,
+    userPrompt: `${prefix}
+
+${annotationSummary}
+
+[Failure log]
+\`\`\`
+${truncatedLog}
+\`\`\`${terraformContext}`,
+  }
+}
+
 async function callLlmAnalysis(
   logText: string,
   ruleBasedSummary: string,
   annotationSummary: string,
   stepContext: string,
   terraformContext: string,
+  analysisKind: AnalysisKind,
 ): Promise<{ analysis: string | null; suggestedFiles: SuggestedFile[]; error?: string }> {
   if (!env.llmApiKey) {
     return {
@@ -442,6 +563,14 @@ async function callLlmAnalysis(
   }
 
   const truncatedLog = logText.length > 12000 ? logText.slice(-12000) : logText
+  const promptBundle = buildLlmPromptSet(
+    analysisKind,
+    stepContext,
+    ruleBasedSummary,
+    annotationSummary,
+    truncatedLog,
+    terraformContext,
+  )
 
   const systemPrompt = `당신은 AWS 클라우드 아키텍처 및 Terraform 프로비저닝에 정통한 시니어 DevOps 엔지니어입니다.
 현재 CI/CD PIPELINE(GitHub Actions)에서 Terraform 코드를 실행하던 중 에러가 발생했습니다.
@@ -478,8 +607,8 @@ ${truncatedLog}
   try {
     const response = await callConfiguredLlm({
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
+        { role: 'system', content: promptBundle.systemPrompt },
+        { role: 'user', content: promptBundle.userPrompt },
       ],
       maxTokens: 2000,
       temperature: 0.3,
@@ -494,7 +623,7 @@ ${truncatedLog}
     }
 
     const content = response.content
-    const suggestedFiles = content ? parseSuggestedFiles(content) : []
+    const suggestedFiles = analysisKind === 'failure' && content ? parseSuggestedFiles(content) : []
 
     return { analysis: content, suggestedFiles }
   } catch (error) {
@@ -514,10 +643,36 @@ export async function generateFixSuggestion(
     throw new Error('runId must be a number')
   }
 
-  const [jobs, logsResponse] = await Promise.all([
+  const selectedStepLog = options?.stepLog ? normalizeText(options.stepLog) : ''
+  const fallbackLogsResponse = {
+    runId: parsedRunId,
+    selectedJobIds: options?.jobId ? [options.jobId] : [],
+    logs: [],
+  }
+
+  const [jobsResult, logsResult] = await Promise.allSettled([
     getWorkflowRunJobs(parsedRunId),
-    getWorkflowRunLogs(parsedRunId, options?.jobId),
+    selectedStepLog
+      ? Promise.resolve(fallbackLogsResponse)
+      : getWorkflowRunLogs(parsedRunId, options?.jobId),
   ])
+
+  const jobs =
+    jobsResult.status === 'fulfilled'
+      ? jobsResult.value
+      : []
+  const logsResponse =
+    logsResult.status === 'fulfilled'
+      ? logsResult.value
+      : fallbackLogsResponse
+
+  if (jobsResult.status === 'rejected') {
+    console.warn('Failed to fetch workflow jobs for fix suggestion; continuing with limited context.', jobsResult.reason)
+  }
+
+  if (logsResult.status === 'rejected') {
+    console.warn('Failed to fetch workflow logs for fix suggestion; continuing with limited context.', logsResult.reason)
+  }
 
   const normalizedLogs = logsResponse.logs.map((log) => ({
     ...log,
@@ -525,10 +680,17 @@ export async function generateFixSuggestion(
   }))
 
   const normalizedAnnotations = normalizeAnnotationInputs(options?.annotations)
+  const selectedJob = options?.jobId != null
+    ? jobs.find((job) => job.id === options.jobId)
+    : undefined
+  const selectedJobStep =
+    selectedJob && options?.stepNumber != null
+      ? selectedJob.steps.find((step) => step.number === options.stepNumber)
+      : undefined
+  const selectedStepConclusion = selectedJobStep?.conclusion || options?.stepConclusion || null
   const filteredLogs = options?.jobId
     ? normalizedLogs.filter((log) => log.jobId === options.jobId)
     : normalizedLogs
-  const selectedStepLog = options?.stepLog ? normalizeText(options.stepLog) : ''
   const joinedLogText = selectedStepLog
     ? [
       `# ${options?.jobName || 'Selected job'} > ${options?.stepName || 'Selected step'}`,
@@ -538,10 +700,16 @@ export async function generateFixSuggestion(
       .map((log) => [`# ${log.name}`, log.content].join('\n'))
       .join('\n\n')
 
+  const analysisKind: AnalysisKind =
+    options?.stepName && normalizedAnnotations.length === 0 && selectedStepConclusion !== 'failure'
+      ? 'informational'
+      : 'failure'
   const draft =
-    normalizedAnnotations.length > 0
-      ? buildCheckovAnnotationDraft(options?.jobName, normalizedAnnotations)
-      : matchSuggestionRule(joinedLogText, jobs)
+    analysisKind === 'informational'
+      ? buildStepExplanationDraft(options?.jobName, options?.stepName, joinedLogText, jobs)
+      : normalizedAnnotations.length > 0
+        ? buildCheckovAnnotationDraft(options?.jobName, normalizedAnnotations)
+        : matchSuggestionRule(joinedLogText, jobs)
   draft.candidateFiles = uniqueByPath([
     ...detectCandidateFilesFromStepLog(selectedStepLog),
     ...draft.candidateFiles,
@@ -555,7 +723,7 @@ export async function generateFixSuggestion(
         failedSteps: collectFailedSteps(job),
       }))
     : buildRelatedJobs(jobs)
-  const ruleMessage = buildMessage(draft)
+  const ruleMessage = buildSuggestionMessage(draft, analysisKind)
   const stepContext = options?.stepName
     ? [
       '[선택된 분석 대상]',
@@ -563,6 +731,7 @@ export async function generateFixSuggestion(
       `- Step: ${options.stepName}`,
       options.stepNumber != null ? `- Step number: ${options.stepNumber}` : null,
       options.stepStatus ? `- Step status: ${options.stepStatus}` : null,
+      selectedStepConclusion ? `- Step conclusion: ${selectedStepConclusion}` : null,
     ]
       .filter((value): value is string => !!value)
       .join('\n')
@@ -590,7 +759,14 @@ export async function generateFixSuggestion(
 
   if (shouldAttemptLlm) {
     const terraformContext = await fetchTerraformContext(draft.candidateFiles)
-    const llmResult = await callLlmAnalysis(joinedLogText, ruleMessage, annotationSummaryText, stepContext, terraformContext)
+    const llmResult = await callLlmAnalysis(
+      joinedLogText,
+      ruleMessage,
+      annotationSummaryText,
+      stepContext,
+      terraformContext,
+      analysisKind,
+    )
     llmAnalysis = llmResult.analysis || undefined
     suggestedFiles = llmResult.suggestedFiles.length > 0 ? llmResult.suggestedFiles : undefined
     llmError = llmResult.error || undefined
@@ -602,6 +778,7 @@ export async function generateFixSuggestion(
     ok: true,
     runId,
     message: ruleMessage,
+    analysisKind,
     mode: llmAnalysis ? 'hybrid' : 'rule-based',
     configuredModel: env.llmModel,
     llmStatus,

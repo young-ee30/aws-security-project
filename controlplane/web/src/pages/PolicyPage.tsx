@@ -4,7 +4,6 @@ import {
   Check,
   CheckCircle2,
   Copy,
-  ExternalLink,
   Eye,
   EyeOff,
   FilePlus,
@@ -20,18 +19,13 @@ import ChartCard from '@/components/common/ChartCard'
 import { type PolicyStatus, type PolicyTemplate } from '@/data/mockData'
 import { API_BASE_URL } from '@/lib/env'
 
-type ProviderLabel = 'gemini' | 'fallback'
+type ProviderLabel = 'gemini'
 type PolicySeverity = 'INFO' | 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
-
-interface ApplyPullRequest {
-  number: number
-  htmlUrl: string
-  title: string
-}
 
 interface GeneratedPolicyItem {
   sourcePolicyId?: string
   sourcePolicyTitle?: string
+  sourceExcerpt?: string
   policyName: string
   description: string
   summary: string
@@ -43,13 +37,6 @@ interface GeneratedPolicyItem {
   yaml: string
 }
 
-interface ApplyPolicyPayload {
-  policyPath: string
-  yaml: string
-  policyName?: string
-  summary?: string
-}
-
 interface StoredPolicy extends PolicyTemplate {
   policyPath: string
   provider: ProviderLabel
@@ -57,7 +44,7 @@ interface StoredPolicy extends PolicyTemplate {
   category: string
   severity: PolicySeverity
   targetProvider: string
-  appliedPullRequest?: ApplyPullRequest | null
+  createdAt: string
   sourcePolicyId?: string
   sourcePolicyTitle?: string
 }
@@ -69,9 +56,8 @@ interface ApiErrorPayload {
 
 interface GeneratedPolicyResponse {
   ok: boolean
-  mode: 'llm' | 'fallback'
+  mode: 'llm'
   provider: ProviderLabel
-  attemptedProvider?: 'gemini'
   llmError?: string
   fileName: string
   summary: string
@@ -100,7 +86,6 @@ interface ApplyPolicyResponse {
   fileCount: number
   branchName: string
   commitSha: string
-  pullRequest?: ApplyPullRequest | null
 }
 
 interface DeletePolicyResponse {
@@ -109,7 +94,6 @@ interface DeletePolicyResponse {
   githubFileDeleted: boolean
   branchName?: string
   commitSha?: string
-  pullRequest?: ApplyPullRequest | null
 }
 
 const legacyPolicyStatusStyles: Record<PolicyStatus, { label: string; className: string }> = {
@@ -194,16 +178,55 @@ function formatTimestamp() {
   })
 }
 
-function formatPageUpdatedAt() {
-  return new Date().toLocaleTimeString('ko-KR', {
+function getTimestampMs(value?: string | null) {
+  if (!value) {
+    return null
+  }
+
+  const timestampMs = new Date(value).getTime()
+  return Number.isNaN(timestampMs) ? null : timestampMs
+}
+
+function formatHeaderTimestamp(value?: string | null) {
+  if (!value) {
+    return undefined
+  }
+
+  const timestampMs = getTimestampMs(value)
+  if (timestampMs == null) {
+    return value
+  }
+
+  return new Date(timestampMs).toLocaleTimeString('ko-KR', {
     hour: '2-digit',
     minute: '2-digit',
   })
 }
 
-function getProviderLabel(provider: ProviderLabel) {
-  if (provider === 'gemini') return 'Gemini'
-  return 'Fallback'
+function getLastPolicyInsertedAt(policies: StoredPolicy[]) {
+  if (policies.length === 0) {
+    return undefined
+  }
+
+  let latestPolicy = policies[0]
+  let latestValue = latestPolicy.createdAt || latestPolicy.lastUpdated
+  let latestTimestampMs = getTimestampMs(latestValue)
+
+  for (const policy of policies.slice(1)) {
+    const currentValue = policy.createdAt || policy.lastUpdated
+    const currentTimestampMs = getTimestampMs(currentValue)
+    if (currentTimestampMs == null) {
+      continue
+    }
+
+    if (latestTimestampMs == null || currentTimestampMs > latestTimestampMs) {
+      latestPolicy = policy
+      latestValue = currentValue
+      latestTimestampMs = currentTimestampMs
+    }
+  }
+
+  return formatHeaderTimestamp(latestValue)
 }
 
 function getSeverityTone(severity: PolicySeverity) {
@@ -250,40 +273,68 @@ function buildStoredPolicy(
   sourceFileName: string,
   policy: GeneratedPolicyItem,
   provider: ProviderLabel,
-  appliedPullRequest?: ApplyPullRequest | null,
 ): StoredPolicy {
+  const createdAt = new Date().toISOString()
+  const generatedPolicyName = getGeneratedPolicyDisplayName(policy)
+  const generatedFileName = getPreviewPolicyFileName(policy)
+
   return {
     id: `policy-${Date.now()}-${policy.policyId}`,
-    name: policy.policyName,
+    name: generatedPolicyName,
     description: policy.description,
     source: sourceFileName,
     checks: 1,
+    createdAt,
     status: 'draft',
     lastUpdated: formatTimestamp(),
     yaml: policy.yaml,
-    policyPath: policy.policyPath,
+    policyPath: `security/checkov/custom_policies/${generatedFileName}`,
     provider,
     policyId: policy.policyId,
     category: policy.category,
     severity: policy.severity,
     targetProvider: policy.targetProvider,
-    appliedPullRequest: appliedPullRequest || null,
     sourcePolicyId: policy.sourcePolicyId,
     sourcePolicyTitle: policy.sourcePolicyTitle,
   }
 }
 
-function getPreviewPolicyTitle(policy: GeneratedPolicyItem) {
-  const sourceId = policy.sourcePolicyId?.trim()
-  if (sourceId) {
-    return `정책 ${sourceId.toLowerCase()}`
+function formatSourcePolicyKey(value?: string | null) {
+  if (!value) {
+    return null
   }
 
-  return policy.policyName
+  return value.trim().toUpperCase().replace(/-/g, '_')
+}
+
+function getGeneratedPolicyDisplayName(policy: GeneratedPolicyItem) {
+  const sourceKey = formatSourcePolicyKey(policy.sourcePolicyId)
+  return sourceKey ? `custom_policy_${sourceKey}` : policy.policyName
+}
+
+function getPreviewPolicyTitle(policy: GeneratedPolicyItem) {
+  return getGeneratedPolicyDisplayName(policy)
 }
 
 function getPolicyFileName(policyPath: string) {
   return policyPath.split('/').pop() || policyPath
+}
+
+function normalizePreviewText(text: string) {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function getDisplayDescription(policy: GeneratedPolicyItem | StoredPolicy) {
+  const sourceExcerpt = 'sourceExcerpt' in policy && typeof policy.sourceExcerpt === 'string'
+    ? policy.sourceExcerpt
+    : ''
+
+  return normalizePreviewText(sourceExcerpt || policy.description)
+}
+
+function getPreviewPolicyFileName(policy: GeneratedPolicyItem) {
+  const sourceKey = formatSourcePolicyKey(policy.sourcePolicyId)
+  return sourceKey ? `custom_policy_${sourceKey}.yaml` : getPolicyFileName(policy.policyPath)
 }
 
 function BatchPreviewList({
@@ -312,28 +363,24 @@ function BatchPreviewList({
         return (
           <div key={policy.policyId} className="overflow-hidden rounded-xl border border-gray-200 bg-white">
             <div className="border-b border-gray-100 bg-gray-50 px-5 py-4">
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.15fr)_minmax(240px,0.85fr)]">
-                <div className="min-w-0 lg:max-w-2xl">
-                  <p className="text-sm font-semibold text-gray-900">{getPreviewPolicyTitle(policy)}</p>
-                  <p className="mt-2 text-sm leading-6 text-gray-600">{policy.description}</p>
-                  <p className="mt-2 text-xs text-gray-500">{policy.summary}</p>
-                </div>
-                <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3">
-                  <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Policy File</p>
-                  <p className="mt-2 text-sm font-semibold text-gray-900">{getPolicyFileName(policy.policyPath)}</p>
-                  <p className="mt-1 text-xs text-gray-500">Checkov custom policy 파일</p>
-                </div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-gray-900">{getPreviewPolicyTitle(policy)}</p>
+                <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-gray-600">
+                  {getDisplayDescription(policy)}
+                </p>
+                {policy.summary && (
+                  <p className="mt-2 text-xs leading-5 text-gray-500">{policy.summary}</p>
+                )}
               </div>
             </div>
 
             <div className="space-y-4 px-5 py-4">
               <div className="flex flex-wrap gap-2">
-                <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs text-indigo-700">
-                  {policy.policyId}
-                </span>
-                <span className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700">
-                  {policy.category}
-                </span>
+                {formatSourcePolicyKey(policy.sourcePolicyId) && (
+                  <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs text-indigo-700">
+                    {formatSourcePolicyKey(policy.sourcePolicyId)}
+                  </span>
+                )}
                 <span className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700">
                   {policy.severity}
                 </span>
@@ -382,12 +429,8 @@ function BatchPreviewList({
 
 function PolicyUploadCard({
   onCreate,
-  onApplyDraft,
-  onBatchApplied,
 }: {
   onCreate: (policies: StoredPolicy[]) => Promise<void>
-  onApplyDraft: (policies: ApplyPolicyPayload[]) => Promise<ApplyPolicyResponse>
-  onBatchApplied: (policyPaths: string[], pullRequest?: ApplyPullRequest | null) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [dragOver, setDragOver] = useState(false)
@@ -397,12 +440,7 @@ function PolicyUploadCard({
   const [createdPolicyIds, setCreatedPolicyIds] = useState<string[]>([])
   const [copiedPolicyId, setCopiedPolicyId] = useState<string | null>(null)
   const [openPreviewId, setOpenPreviewId] = useState<string | null>(null)
-  const [created, setCreated] = useState(false)
-  const [copiedAll, setCopiedAll] = useState(false)
-  const [applying, setApplying] = useState(false)
-  const [applyResult, setApplyResult] = useState<ApplyPolicyResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const copied = copiedAll
 
   const analyzeFile = async (file: File) => {
     setGenerating(true)
@@ -457,38 +495,6 @@ function PolicyUploadCard({
     }
   }
 
-  const handleCreate = async () => {
-    if (!selectedFile || !preview) return
-
-    try {
-      await onCreate(
-        preview.policies.map((policy) =>
-          buildStoredPolicy(selectedFile.name, policy, preview.mode === 'llm' ? preview.provider : 'fallback', applyResult?.pullRequest),
-        ),
-      )
-
-      setCreated(true)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : '정책 저장에 실패했습니다.'
-      setError(message)
-      setCreated(false)
-    }
-  }
-
-  const handleCopyAllYaml = async () => {
-    if (!preview) return
-
-    const combinedYaml = preview.policies.map((policy) => `# ${policy.policyPath}\n${policy.yaml.trim()}`).join('\n\n')
-
-    try {
-      await navigator.clipboard.writeText(combinedYaml)
-      setCopiedAll(true)
-      window.setTimeout(() => setCopiedAll(false), 1500)
-    } catch {
-      setCopiedAll(false)
-    }
-  }
-
   const handleCopyYaml = async (policy: GeneratedPolicyItem) => {
     try {
       await navigator.clipboard.writeText(policy.yaml)
@@ -503,36 +509,11 @@ function PolicyUploadCard({
     if (!selectedFile || !preview) return
 
     try {
-      await onCreate([buildStoredPolicy(selectedFile.name, policy, preview.mode === 'llm' ? preview.provider : 'fallback')])
+      await onCreate([buildStoredPolicy(selectedFile.name, policy, preview.provider)])
       setCreatedPolicyIds((current) => (current.includes(policy.policyId) ? current : [...current, policy.policyId]))
     } catch (err) {
       const message = err instanceof Error ? err.message : '?뺤콉 ??μ뿉 ?ㅽ뙣?덉뒿?덈떎.'
       setError(message)
-    }
-  }
-
-  const handleApply = async () => {
-    if (!preview) return
-
-    setApplying(true)
-    setError(null)
-
-    try {
-      const result = await onApplyDraft(
-        preview.policies.map((policy) => ({
-          policyPath: policy.policyPath,
-          yaml: policy.yaml,
-          policyName: policy.policyName,
-          summary: policy.summary,
-        })),
-      )
-      setApplyResult(result)
-      onBatchApplied(result.policyPaths, result.pullRequest || null)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'GitHub 적용에 실패했습니다.'
-      setError(message)
-    } finally {
-      setApplying(false)
     }
   }
 
@@ -649,17 +630,12 @@ function PolicyUploadCard({
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Generated</p>
                 <p className="mt-1 text-lg font-semibold text-gray-900">{preview.policyCount}</p>
-                <p className="mt-1 text-xs text-gray-500">생성된 Checkov 정책</p>
+                <p className="mt-1 text-xs text-gray-500">생성 완료 정책</p>
               </div>
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Skipped</p>
                 <p className="mt-1 text-lg font-semibold text-gray-900">{preview.skippedPolicies?.length || 0}</p>
-                <p className="mt-1 text-xs text-gray-500">YAML로 만들지 않은 원문 정책</p>
-              </div>
-              <div className="hidden rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Provider</p>
-                <p className="mt-1 text-lg font-semibold text-gray-900">{getProviderLabel(preview.provider)}</p>
-                <p className="mt-1 text-xs text-gray-500">정책 생성 모델</p>
+                <p className="mt-1 text-xs text-gray-500">생성 실패 정책</p>
               </div>
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Source File</p>
@@ -667,33 +643,9 @@ function PolicyUploadCard({
                 <p className="mt-1 text-xs text-gray-500">업로드한 문서</p>
               </div>
             </div>
-
-            <div className="hidden grid grid-cols-1 gap-3 sm:grid-cols-4">
-              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-xs text-gray-500">생성 모드</p>
-                <p className="mt-1 text-sm font-medium text-gray-800">{preview.mode === 'llm' ? 'LLM 분석' : 'Fallback'}</p>
-              </div>
-              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-xs text-gray-500">공급자</p>
-                <p className="mt-1 text-sm font-medium text-gray-800">
-                  {preview.mode === 'llm'
-                    ? getProviderLabel(preview.provider)
-                    : `${preview.attemptedProvider ? `${getProviderLabel(preview.attemptedProvider)} 시도` : 'Fallback'}`}
-                </p>
-              </div>
-              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-xs text-gray-500">카테고리</p>
-                <p className="mt-1 text-sm font-medium text-gray-800">{preview.policyCount}</p>
-              </div>
-              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-xs text-gray-500">심각도</p>
-                <p className="mt-1 text-sm font-medium text-gray-800">{preview.fileName}</p>
-              </div>
-            </div>
-
             {preview.llmError && (
               <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
-                <p className="text-sm font-medium text-amber-800">Gemini 호출 실패로 fallback 생성됨</p>
+                <p className="text-sm font-medium text-amber-800">Gemini 호출에 실패했습니다.</p>
                 <p className="mt-1 text-xs text-amber-700">{preview.llmError}</p>
               </div>
             )}
@@ -712,62 +664,6 @@ function PolicyUploadCard({
                 </div>
               </div>
             )}
-
-            {applyResult?.pullRequest ? (
-              <div className="hidden rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-emerald-700">GitHub 반영 완료</p>
-                    <p className="mt-1 text-xs text-emerald-700/80">
-                      브랜치 `{applyResult.branchName}` 에 custom policy 파일을 push하고 PR #{applyResult.pullRequest.number} 를 만들었습니다.
-                    </p>
-                  </div>
-                  <a
-                    href={applyResult.pullRequest.htmlUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-white px-3 py-2 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-100"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                    PR 보기
-                  </a>
-                </div>
-              </div>
-            ) : null}
-
-
-            <div className="hidden flex-wrap gap-2">
-              <button
-                onClick={handleCopyAllYaml}
-                className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100"
-              >
-                {copiedAll ? <Check className="h-4 w-4 text-indigo-600" /> : <Copy className="h-4 w-4" />}
-                {copied ? '복사됨' : 'YAML 복사'}
-              </button>
-              <button
-                onClick={() => void handleApply()}
-                disabled={applying}
-                className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <Sparkles className="h-4 w-4" />
-                {applying ? 'GitHub 적용 중...' : 'GitHub 적용(PR 생성)'}
-              </button>
-              {!created ? (
-                <button
-                  onClick={handleCreate}
-                  className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
-                >
-                  <FilePlus className="h-4 w-4" />
-                  정책 목록에 추가
-                </button>
-              ) : (
-                <div className="flex items-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-medium text-indigo-700">
-                  <CheckCircle2 className="h-4 w-4" />
-                  정책 목록에 추가됨
-                </div>
-              )}
-            </div>
-
             <BatchPreviewList
               policies={preview.policies}
               openId={openPreviewId}
@@ -845,7 +741,7 @@ function PolicyList({
                       <p className="mt-0.5 truncate text-xs text-gray-500">{policy.source}</p>
                     </div>
                   </div>
-                  <p className="mt-3 text-sm text-gray-600">{policy.description}</p>
+                  <p className="mt-3 text-sm text-gray-600">{getDisplayDescription(policy)}</p>
                 </div>
                 <span className={`inline-flex h-6 shrink-0 items-center justify-center whitespace-nowrap rounded-full border px-2.5 text-[11px] leading-none ${statusClassName}`}>{statusLabel}</span>
               </div>
@@ -864,28 +760,6 @@ function PolicyList({
                   </div>
                 ))}
               </div>
-
-              {/*
-              {false && policy.appliedPullRequest && (
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-medium text-emerald-700">GitHub 반영됨</p>
-                      <p className="mt-1 text-xs text-emerald-700/80">PR #{policy.appliedPullRequest.number} 에 custom policy 파일이 등록되어 있습니다.</p>
-                    </div>
-                    <a
-                      href={policy.appliedPullRequest!.htmlUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-white px-3 py-2 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-100"
-                    >
-                      <ExternalLink className="h-3.5 w-3.5" />
-                      PR 보기
-                    </a>
-                  </div>
-                </div>
-              )}
-              */}
 
               {isOpen && (
                 <pre className="max-h-56 overflow-auto rounded-2xl border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed text-slate-800 shadow-inner">
@@ -911,32 +785,22 @@ function PolicyList({
                 <button
                   onClick={() => onToggleStatus(policy.id)}
                   disabled={isApplying}
-                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[0] transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                     isActive
                       ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
                       : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
                   }`}
                 >
                   <Sparkles className="h-3.5 w-3.5" />
-                  <span className="text-xs">{isApplying ? (isActive ? '비활성화 중...' : '활성화 중...') : isActive ? '비활성화' : '활성화'}</span>
-                  {isApplying ? '적용 중...' : 'GitHub 적용'}
-                </button>
-                <button
-                  onClick={() => undefined}
-                  className="hidden"
-                >
-                  <span />
-                  {policy.status === 'active' ? '정책 중지' : '정책 활성화'}
+                  <span>{isApplying ? (isActive ? '비활성화 중...' : '활성화 중...') : isActive ? '비활성화' : '활성화'}</span>
                 </button>
                 <button
                   onClick={() => onDelete(policy.id)}
                   disabled={isDeleting}
-                  className="ml-auto flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[0] text-red-600 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="ml-auto flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
-                  <span className="text-xs">{isDeleting ? '삭제 중...' : '삭제'}</span>
                   <span>{isDeleting ? '삭제 중...' : '삭제'}</span>
-                  삭제
                 </button>
               </div>
             </div>
@@ -951,6 +815,7 @@ export default function PolicyPage() {
   const [policies, setPolicies] = useState<StoredPolicy[]>([])
   const [applyingId, setApplyingId] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const lastPolicyInsertedAt = getLastPolicyInsertedAt(policies)
 
   useEffect(() => {
     let cancelled = false
@@ -970,14 +835,6 @@ export default function PolicyPage() {
     }
   }, [])
 
-  const applyDraft = async (draftPolicies: ApplyPolicyPayload[]) => {
-    return apiFetch<ApplyPolicyResponse>('/api/policies/apply', {
-      method: 'POST',
-      body: JSON.stringify({
-        policies: draftPolicies,
-      }),
-    })
-  }
 
   const handleCreatePolicy = async (nextPolicies: StoredPolicy[]) => {
     const result = await apiFetch<RegistryPoliciesResponse>('/api/policies/registry', {
@@ -988,34 +845,6 @@ export default function PolicyPage() {
     setPolicies((current) => [...result.policies, ...current.filter((policy) => !result.policies.some((created) => created.id === policy.id))])
   }
 
-  const handleBatchApplied = (policyPaths: string[], pullRequest?: ApplyPullRequest | null) => {
-    setPolicies((current) => {
-      const lastUpdated = formatTimestamp()
-      const next = current.map((policy) =>
-        policyPaths.includes(policy.policyPath)
-          ? {
-              ...policy,
-              status: 'active' as PolicyStatus,
-              appliedPullRequest: pullRequest || null,
-              lastUpdated,
-            }
-          : policy,
-      )
-
-      for (const policy of next.filter((item) => policyPaths.includes(item.policyPath))) {
-        void apiFetch<RegistryPolicyResponse>(`/api/policies/registry/${policy.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            status: policy.status,
-            appliedPullRequest: policy.appliedPullRequest ?? null,
-            lastUpdated: policy.lastUpdated,
-          }),
-        })
-      }
-
-      return next
-    })
-  }
 
   const handleTogglePolicyStatus = async (id: string) => {
     const target = policies.find((policy) => policy.id === id)
@@ -1037,7 +866,6 @@ export default function PolicyPage() {
               ? {
                   ...policy,
                   status: 'paused' as PolicyStatus,
-                  appliedPullRequest: null,
                   lastUpdated,
                 }
               : policy,
@@ -1048,7 +876,6 @@ export default function PolicyPage() {
           method: 'PATCH',
           body: JSON.stringify({
             status: 'paused',
-            appliedPullRequest: null,
             lastUpdated,
           }),
         })
@@ -1077,7 +904,6 @@ export default function PolicyPage() {
             ? {
                 ...policy,
                 status: 'active' as PolicyStatus,
-                appliedPullRequest: null,
                 lastUpdated,
               }
             : policy,
@@ -1088,7 +914,6 @@ export default function PolicyPage() {
         method: 'PATCH',
         body: JSON.stringify({
           status: 'active',
-          appliedPullRequest: null,
           lastUpdated,
         }),
       })
@@ -1102,9 +927,7 @@ export default function PolicyPage() {
     if (!target) return
 
     const confirmedMessage = `정책 "${target.name}" 을(를) 삭제할까요?\n\n목록에서 제거되고, GitHub에는 ${target.policyPath} 가 기본 브랜치에서 바로 삭제됩니다.`
-    const confirmed = window.confirm(confirmedMessage) /*
-      `정책 "${target.name}" 을(를) 삭제할까요?\n\n목록에서 제거되고, GitHub에는 ${target.policyPath} 삭제 PR이 생성됩니다.`,
-    ) */
+    const confirmed = window.confirm(confirmedMessage)
     if (!confirmed) return
 
     setDeletingId(id)
@@ -1124,7 +947,8 @@ export default function PolicyPage() {
       <PageHeader
         title="보안 정책"
         subtitle="KISA 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드 PDF를 분석해 Checkov custom policy YAML을 만들고 이를 반영합니다."
-        lastUpdated={formatPageUpdatedAt()}
+        lastUpdated={lastPolicyInsertedAt}
+        lastUpdatedLabel="마지막 정책 등록"
         titleAction={
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs font-medium text-gray-600">
@@ -1138,7 +962,7 @@ export default function PolicyPage() {
       />
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
-        <PolicyUploadCard onCreate={handleCreatePolicy} onApplyDraft={applyDraft} onBatchApplied={handleBatchApplied} />
+        <PolicyUploadCard onCreate={handleCreatePolicy} />
 
         <ChartCard
           title="정책 목록"

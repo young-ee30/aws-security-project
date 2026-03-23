@@ -9,7 +9,7 @@ data "aws_iam_policy_document" "ecs_task_assume_role" {
   }
 }
 
-# CloudFront 관리형 Prefix List — ALB가 CloudFront 엣지 노드 트래픽만 수락
+# CloudFront 愿由ы삎 Prefix List ??ALB媛 CloudFront ?ｌ? ?몃뱶 ?몃옒?쎈쭔 ?섎씫
 data "aws_ec2_managed_prefix_list" "cloudfront" {
   name = "com.amazonaws.global.cloudfront.origin-facing"
 }
@@ -79,6 +79,29 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume_role.json
 
   tags = var.tags
+}
+
+resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
+  count = length(var.ecs_task_execution_secret_arns) > 0 ? 1 : 0
+
+  name = "${var.name_prefix}-ecs-task-execution-secrets-policy"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadInjectedSecrets"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "ssm:GetParameter",
+          "ssm:GetParameters"
+        ]
+        Resource = var.ecs_task_execution_secret_arns
+      }
+    ]
+  })
 }
 
 resource "aws_iam_role_policy" "ecs_task_reviews" {

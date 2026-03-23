@@ -18,6 +18,7 @@ export interface RegistryPolicy {
   source: string
   checks: number
   status: PolicyStatus
+  createdAt: string
   lastUpdated: string
   yaml: string
   policyPath: string
@@ -97,6 +98,7 @@ function normalizePolicy(value: unknown): RegistryPolicy | null {
     source: value.source,
     checks: value.checks,
     status: value.status as PolicyStatus,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : value.lastUpdated,
     lastUpdated: value.lastUpdated,
     yaml: value.yaml,
     policyPath: value.policyPath,
@@ -157,7 +159,10 @@ export async function createRegistryPolicies(input: RegistryPolicy[]) {
     }
 
     existingIds.add(policy.id)
-    nextPolicies.push(policy)
+    nextPolicies.push({
+      ...policy,
+      createdAt: typeof policy.createdAt === 'string' && policy.createdAt ? policy.createdAt : policy.lastUpdated,
+    })
   }
 
   const policies = [...nextPolicies, ...store.policies]
@@ -177,6 +182,7 @@ export async function updateRegistryPolicy(id: string, patch: Partial<RegistryPo
     ...current,
     ...patch,
     id: current.id,
+    createdAt: current.createdAt,
   }
   store.policies[index] = next
   await writeStore(store)

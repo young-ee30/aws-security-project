@@ -9,6 +9,7 @@ ecr_repositories = [
   "api-node",
   "api-python",
   "api-spring",
+  "controlplane-api",
   "frontend"
 ]
 
@@ -65,6 +66,31 @@ services = {
     priority       = 30
     path_patterns  = ["/spring*", "/api/spring*"]
     health_check   = "/api/health"
+  }
+  controlplane-api = {
+    cpu            = 512
+    memory         = 1024
+    container_port = 4000
+    desired_count  = 1
+    image          = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/devsecops-prod/controlplane-api:latest"
+    environment    = {
+      PORT                = "4000"
+      NODE_ENV            = "production"
+      API_BASE_PATH       = "/controlplane"
+      FRONTEND_ORIGIN     = "https://replace-me.example.com"
+      GITHUB_OWNER        = "aws-security-project"
+      GITHUB_REPO         = "aws-security-project"
+      GITHUB_APP_ID       = "1234567"
+      GITHUB_APP_CLIENT_ID = ""
+      LLM_MODEL           = "gemini-2.5-flash-lite"
+    }
+    secrets       = {
+      GITHUB_APP_PRIVATE_KEY = "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:devsecops-prod/controlplane/github-app-private-key"
+      GEMINI_API_KEY         = "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:devsecops-prod/controlplane/gemini-api-key"
+    }
+    priority      = 40
+    path_patterns = ["/controlplane/*"]
+    health_check  = "/health"
   }
 }
 

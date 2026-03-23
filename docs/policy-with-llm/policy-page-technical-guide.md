@@ -1,638 +1,580 @@
-# Policy Page README
+# Policy Page Technical Guide
 
-이 문서는 `/policy` 페이지가 현재 저장소에서 실제로 어떻게 동작하는지, 어떤 기술이 연결되어 있는지, 어떤 코드가 핵심인지 설명하는 구현 가이드다. 문서 설명은 현재 코드 기준이며, 화면 문구나 타입 이름에 남아 있는 예전 PR/fallback 표현과 실제 백엔드 동작이 다른 부분도 같이 정리한다.
+## 개요
 
-## 1. 이 페이지가 하는 일
+이 문서는 `/policy` 페이지를 구성하는 파일들이 어떻게 연결되어 정책 생성 기능을 완성하는지 설명하는 기술 문서다.
 
-정책 페이지는 PDF 형태의 보안 점검 기준서나 가이드를 업로드하면, 그 안의 항목을 읽어 Terraform AWS용 Checkov custom policy YAML로 변환하고, 결과를 미리 본 뒤 정책 목록에 저장하거나 GitHub 저장소에 반영하는 화면이다.
+이 페이지는 단순 업로드 화면이 아니다. 실제로는 아래 기능이 하나의 흐름으로 묶여 있다.
 
-현재 기준 사용자 흐름은 아래와 같다.
+- 보안 가이드 PDF 업로드
+- PDF 텍스트 추출
+- 문서를 정책 항목 단위로 분리
+- Checkov custom policy YAML 초안 생성
+- 생성 결과 preview 표시
+- registry 저장
+- GitHub 저장소 반영
+- 정책 비활성화 / 삭제
 
-1. 사용자가 PDF를 업로드한다.
-2. 백엔드가 PDF 텍스트를 추출하고 항목별로 분리한다.
-3. 항목별로 Gemini에 정의 생성 요청을 보내 Checkov YAML 초안을 만든다.
-4. 프론트가 생성 결과를 preview로 보여 준다.
-5. 사용자가 정책을 registry에 저장한다.
-6. 저장된 정책을 활성화하면 GitHub 저장소의 기본 브랜치에 YAML 파일이 직접 커밋된다.
-7. 비활성화하거나 삭제하면 GitHub 기본 브랜치에서 해당 YAML 파일이 직접 삭제된다.
+이 페이지를 이해할 때 가장 중요한 관점은 다음이다.
 
-## 2. 전체 아키텍처
+> `PolicyPage.tsx`가 화면의 오케스트레이터이고, `routes/policy.ts`는 HTTP 진입점이며, `policy/*.ts`가 실제 생성/적용/삭제/저장 로직을 수행하는 서비스 레이어다.
+
+즉, 핵심은 개별 함수 하나가 아니라 "프론트 컨트롤러 -> Express 라우터 -> 정책 서비스 모듈 -> GitHub/LLM"의 연결 구조다.
+
+## 이 페이지에 필요한 파일 트리
+
+아래 트리는 저장소 전체가 아니라, 정책 페이지를 설명할 때 직접 필요한 파일만 추린 것이다.
 
 ```text
-Browser
-  -> controlplane/web/src/pages/PolicyPage.tsx
-  -> /api/policies/*
-     -> controlplane/api/src/routes/policy.ts
-        -> generate.ts   # PDF -> source policy -> Gemini -> YAML preview
-        -> registry.ts   # 로컬 정책 저장소(JSON)
-        -> apply.ts      # GitHub 기본 브랜치로 파일 커밋
-        -> remove.ts     # GitHub 기본 브랜치에서 파일 삭제
-        -> github/app.ts
-        -> github/changes.ts
-        -> llm/client.ts # Gemini API 호출
-  -> GitHub repository
-     -> security/checkov/custom_policies/*.yaml
+aws-security-project/
+├─ controlplane/
+│  ├─ web/
+│  │  └─ src/
+│  │     ├─ App.tsx                                      # /policy 라우트를 등록한다.
+│  │     ├─ pages/
+│  │     │  └─ PolicyPage.tsx                            # 이 페이지의 메인 컨트롤러. 업로드, preview, 저장, 적용, 삭제 액션이 모인다.
+│  │     └─ data/
+│  │        └─ mockData.ts                               # 정책 페이지에서 쓰는 타입 기반을 제공한다.
+│  └─ api/
+│     ├─ data/
+│     │  └─ policy-registry.json                         # 생성된 정책 메타데이터를 저장하는 로컬 registry
+│     └─ src/
+│        ├─ server.ts                                    # Express 서버 시작점. policyRouter를 연결한다.
+│        ├─ routes/
+│        │  └─ policy.ts                                 # generate, apply, deactivate, registry CRUD API를 제공한다.
+│        ├─ policy/
+│        │  ├─ generate.ts                               # PDF -> 텍스트 -> 정책 항목 분리 -> LLM -> Checkov YAML 생성
+│        │  ├─ apply.ts                                  # 생성된 YAML을 GitHub 기본 브랜치에 커밋한다.
+│        │  ├─ remove.ts                                 # GitHub 기본 브랜치에서 기존 정책 파일을 삭제한다.
+│        │  └─ registry.ts                               # policy-registry.json을 읽고 쓴다.
+│        ├─ github/
+│        │  ├─ app.ts                                    # GitHub App 인증과 installation token 발급을 담당한다.
+│        │  └─ changes.ts                                # 기본 브랜치 커밋에 사용하는 GitHub Git Data API 유틸
+│        └─ llm/
+│           └─ client.ts                                 # Gemini 호출 공통 어댑터
+├─ security/
+│  └─ checkov/
+│     └─ custom_policies/                                # 최종 YAML이 저장소에 들어가는 경로
+└─ docs/
+   └─ policy-with-llm/
+      └─ policy-page-technical-guide.md                  # 현재 문서
 ```
 
-핵심 포인트는 두 가지다.
+## 기술 스택
 
-- 프론트는 GitHub나 Gemini를 직접 호출하지 않는다. 모든 외부 연동은 `controlplane/api`가 담당한다.
-- 정책 페이지의 GitHub 반영은 현재 PR 생성 방식이 아니라 기본 브랜치 직접 커밋 방식이다.
+| 기술 | 왜 쓰는가 | 실제 구현 위치 |
+| --- | --- | --- |
+| React + TypeScript + Vite | 업로드, preview, 상태 전환이 많은 운영 화면을 만들기 위해 | `controlplane/web/src/pages/PolicyPage.tsx` |
+| Express + TypeScript | PDF 처리, LLM 호출, GitHub 반영을 서버에서 안전하게 수행하기 위해 | `controlplane/api/src/server.ts` |
+| `pdf-parse` | PDF에서 실제 텍스트를 추출하기 위해 | `controlplane/api/src/policy/generate.ts` |
+| Gemini API | 문서 문장을 Checkov policy definition으로 변환하기 위해 | `controlplane/api/src/llm/client.ts` |
+| GitHub App + Octokit | 브라우저에 토큰을 숨기고 저장소를 제어하기 위해 | `controlplane/api/src/github/app.ts` |
+| Git Data API | PR 없이 기본 브랜치에 직접 커밋/삭제하기 위해 | `controlplane/api/src/github/changes.ts` |
+| JSON registry | 정책 목록과 메타데이터를 가볍게 저장하기 위해 | `controlplane/api/src/policy/registry.ts` |
+| Checkov custom policy YAML | Terraform 리소스를 코드 정책으로 검사하기 위해 | `controlplane/api/src/policy/generate.ts` |
 
-## 3. 기술 스택
+## 전체 연결 구조
 
-- 프론트엔드: React + TypeScript + Vite
-- UI 아이콘: `lucide-react`
-- 백엔드: Express + TypeScript
-- PDF 파싱: `pdf-parse`
-- AI: Google Gemini Generative Language API
-- GitHub 연동: GitHub App + installation token + Octokit
-- 정책 저장소: 로컬 JSON 파일
-- 정책 포맷: Checkov custom policy YAML
-- 타깃 인프라: Terraform AWS
+이 페이지는 아래 4개 층이 연결되어 동작한다.
 
-## 4. 핵심 파일과 역할
+```text
+1. 라우팅 층
+   App.tsx
+   -> /policy
 
-- `controlplane/web/src/pages/PolicyPage.tsx`
-  정책 페이지 전체 UI와 상태 관리. 업로드, preview, registry 저장, 활성화, 비활성화, 삭제를 모두 여기서 제어한다.
-- `controlplane/web/src/data/mockData.ts`
-  `PolicyTemplate`, `PolicyStatus` 같은 프론트 공통 타입의 기반을 제공한다.
-- `controlplane/api/src/routes/policy.ts`
-  정책 관련 모든 HTTP 엔드포인트를 정의한다.
-- `controlplane/api/src/policy/generate.ts`
-  PDF 텍스트 추출, source policy 분리, 섹션/시그널 추출, Gemini 호출, YAML 직렬화를 담당한다.
-- `controlplane/api/src/policy/apply.ts`
-  생성한 YAML을 GitHub 저장소에 반영한다. 현재는 PR이 아니라 기본 브랜치 직접 커밋이다.
-- `controlplane/api/src/policy/remove.ts`
-  활성 정책을 비활성화하거나 삭제할 때 GitHub 기본 브랜치에서 파일을 지운다.
-- `controlplane/api/src/policy/registry.ts`
-  정책 목록을 `policy-registry.json` 파일에 저장한다.
-- `controlplane/api/src/github/app.ts`
-  GitHub App private key를 로드하고 installation token 기반 Octokit 클라이언트를 만든다.
-- `controlplane/api/src/github/changes.ts`
-  GitHub blob/tree/commit/ref 업데이트와 PR 생성 유틸리티를 제공한다.
-- `controlplane/api/src/llm/client.ts`
-  Gemini 모델 이름 정규화, HTTP 호출, 응답 파싱을 담당한다.
-- `controlplane/api/src/config/env.ts`
-  GitHub App, LLM, CORS 관련 환경 변수를 로드한다.
-- `controlplane/api/.env.example`
-  로컬 실행용 예시 환경 변수 파일이다. 다만 여기의 LLM 모델 예시는 현재 런타임 구현과 어긋난다.
+2. 프론트 컨트롤러 층
+   PolicyPage.tsx
+   -> 업로드
+   -> preview 상태 관리
+   -> registry 조회/저장
+   -> apply / deactivate / delete 버튼 처리
 
-## 5. 프론트엔드 구현
+3. 백엔드 진입 층
+   server.ts
+   -> routes/policy.ts
 
-### 5.1 페이지 진입 시 동작
+4. 서비스 층
+   policy/generate.ts
+   -> PDF 분석 + YAML 생성
+   policy/apply.ts
+   -> GitHub 반영
+   policy/remove.ts
+   -> GitHub 삭제
+   policy/registry.ts
+   -> 로컬 registry 저장
+   github/app.ts
+   -> GitHub App 인증
+   github/changes.ts
+   -> 기본 브랜치 커밋
+   llm/client.ts
+   -> Gemini 호출
+```
 
-`PolicyPage.tsx`는 마운트되면 `GET /api/policies/registry`를 호출해 저장된 정책 목록을 불러온다.
+즉, 페이지 기능은 다음처럼 완성된다.
 
-- registry 응답은 `policies` 배열이다.
-- 프론트는 이를 `StoredPolicy[]` 상태로 관리한다.
-- 이 상태가 오른쪽 정책 목록 카드의 데이터 소스가 된다.
+```text
+사용자 PDF 업로드 또는 버튼 클릭
+  -> PolicyPage.tsx
+  -> /api/policies/*
+  -> routes/policy.ts
+  -> policy/generate.ts / apply.ts / remove.ts / registry.ts
+  -> 필요 시 github/app.ts + github/changes.ts 사용
+  -> 필요 시 llm/client.ts 로 Gemini 호출
+  -> 결과를 다시 PolicyPage.tsx가 받아서 preview나 목록에 반영
+```
 
-### 5.2 PDF 업로드와 분석
+## 기능 기준으로 파일 연결 보기
 
-업로드 UI는 `PolicyUploadCard`가 담당한다.
+이 표가 가장 실무적으로 중요하다. 각 기능이 어떤 파일들을 거쳐 완성되는지 한 번에 보여준다.
 
-- `handleFile()`이 파일 확장자가 `.pdf`인지 먼저 확인한다.
-- `fileToBase64()`가 브라우저에서 파일을 base64로 인코딩한다.
-- `analyzeFile()`이 `/api/policies/generate`로 아래 payload를 보낸다.
+| 사용자 기능 | 프론트 시작점 | API 진입점 | 실제 처리 파일 | 결과 |
+| --- | --- | --- | --- | --- |
+| registry 목록 표시 | `PolicyPage.tsx`의 초기 `useEffect()` | `GET /api/policies/registry` | `routes/policy.ts` -> `policy/registry.ts`의 `listRegistryPolicies()` | 저장된 정책 목록 표시 |
+| PDF 분석 시작 | `analyzeFile()` | `POST /api/policies/generate` | `routes/policy.ts` -> `policy/generate.ts`의 `generatePolicyFromPdf()` | preview용 YAML 초안 생성 |
+| preview 저장 | `handleCreatePolicy()` | `POST /api/policies/registry` | `routes/policy.ts` -> `policy/registry.ts`의 `createRegistryPolicies()` | registry에 정책 메타데이터 저장 |
+| 정책 활성화 | `handleTogglePolicyStatus()` | `POST /api/policies/apply` | `routes/policy.ts` -> `policy/apply.ts` -> `github/changes.ts` | YAML을 기본 브랜치에 커밋 |
+| 정책 비활성화 | `handleTogglePolicyStatus()` | `POST /api/policies/deactivate` | `routes/policy.ts` -> `policy/remove.ts` -> `github/changes.ts` | 기본 브랜치에서 YAML 삭제 |
+| 정책 메타데이터 상태 반영 | `handleTogglePolicyStatus()` | `PATCH /api/policies/registry/:id` | `routes/policy.ts` -> `policy/registry.ts`의 `updateRegistryPolicy()` | registry status 갱신 |
+| 정책 완전 삭제 | `handleDeletePolicy()` | `DELETE /api/policies/registry/:id` | `routes/policy.ts` -> `policy/remove.ts` + `policy/registry.ts` | GitHub 파일 삭제 후 registry 항목 제거 |
 
-```json
-{
-  "fileName": "kisa-policy.pdf",
-  "mimeType": "application/pdf",
-  "contentBase64": "JVBERi0xLjcK..."
+## 자세한 설명
+
+### 1. 진입점: `App.tsx`
+
+이 파일은 정책 페이지가 앱 안에서 어느 경로로 열릴지 결정한다.
+
+```tsx
+<Route path="policy" element={<PolicyPage />} />
+```
+
+역할은 하나다.
+
+- `/policy` URL과 `PolicyPage.tsx`를 연결한다.
+
+즉, 이 파일은 기능 수행 파일은 아니지만 페이지 진입 경로를 정의하는 시작점이다.
+
+### 2. 프론트의 중심: `PolicyPage.tsx`
+
+이 파일이 정책 페이지의 화면 컨트롤러다. 실제 사용자가 보는 기능 대부분이 여기서 시작된다.
+
+이 파일이 맡는 역할은 다음과 같다.
+
+- PDF 업로드
+- 업로드 파일 검증
+- base64 변환
+- preview 상태 관리
+- registry 목록 로드
+- 정책 저장
+- 정책 활성화 / 비활성화
+- 정책 삭제
+
+#### 핵심 코드 1: 공통 API 진입점
+
+```ts
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.body ? { 'Content-Type': 'application/json' } : undefined),
+      ...(init?.headers || {}),
+    },
+  })
+  ...
 }
 ```
 
-응답이 오면 preview 상태를 저장하고 첫 번째 정책을 기본 오픈 상태로 보여 준다.
+Git Actions 페이지와 비슷하게 정책 페이지도 거의 모든 기능이 이 함수로 서버에 들어간다.
 
-### 5.3 Preview에서 현재 실제로 보이는 기능
+- registry 조회
+- 정책 생성
+- registry 저장
+- apply
+- deactivate
+- delete
 
-preview 정책 카드에서 현재 보이는 액션은 아래 3개다.
+즉, 프론트와 백엔드를 잇는 공통 관문이다.
 
-- YAML 보기/닫기
-- YAML 복사
-- 정책 목록 추가
+#### 핵심 코드 2: PDF 업로드 후 생성 요청
 
-즉, 현재 사용자 입장에서 보이는 주 흐름은 "PDF 분석 -> preview 확인 -> 정책 목록 저장"이다.
+```ts
+const analyzeFile = async (file: File) => {
+  const contentBase64 = await fileToBase64(file)
+  const result = await apiFetch('/api/policies/generate', {
+    method: 'POST',
+    body: JSON.stringify({
+      fileName: file.name,
+      mimeType: file.type || 'application/pdf',
+      contentBase64,
+    }),
+  })
 
-### 5.4 코드에는 있지만 현재 숨겨진 기능
+  setPreview(result)
+}
+```
 
-`PolicyUploadCard` 안에는 아래 기능이 코드상 존재하지만 `className="hidden"` 처리되어 있다.
+이 코드가 보여주는 구조는 명확하다.
 
-- preview 전체 YAML 복사
-- preview 전체를 GitHub에 일괄 적용
-- preview 전체를 정책 목록에 일괄 추가
-- PR 결과 배너
+- 브라우저는 PDF 바이너리를 직접 multipart로 보내지 않는다.
+- 먼저 base64로 바꾼 뒤 JSON body로 `/generate`에 보낸다.
+- 백엔드가 이 요청을 받아 실제 PDF 처리와 YAML 생성을 수행한다.
 
-또한 프론트 타입에는 `ApplyPullRequest`, `pullRequest`, `mode: 'fallback'` 같은 이름이 남아 있지만, 현재 백엔드 정책 플로우는 이 값들을 실사용하지 않는다.
+즉, `PolicyPage.tsx`는 문서를 직접 해석하지 않고 생성 요청만 시작한다.
 
-### 5.5 Registry 저장 방식
+#### 핵심 코드 3: registry 초기 로드
 
-preview에서 "정책 목록 추가"를 누르면 `handleCreatePolicy()`가 실행된다.
+```ts
+useEffect(() => {
+  void apiFetch('/api/policies/registry')
+    .then((result) => {
+      setPolicies(Array.isArray(result.policies) ? result.policies : [])
+    })
+}, [])
+```
 
-- `buildStoredPolicy()`가 프론트용 정책 객체를 만든다.
-- 기본 상태는 `draft`다.
-- `POST /api/policies/registry`로 저장한다.
-- 저장 후 오른쪽 정책 목록에 즉시 반영한다.
+즉, 페이지가 열리면 먼저 로컬 registry에 저장된 정책 목록을 가져와 화면 오른쪽 목록에 표시한다.
 
-정책 하나씩 저장할 수도 있고, 숨겨진 bulk create 코드도 남아 있지만 현재 화면에서는 개별 저장이 실제 사용 흐름이다.
+#### 핵심 코드 4: 정책 활성화 / 비활성화
 
-### 5.6 정책 활성화/비활성화
+```ts
+if (target.status === 'active') {
+  await apiFetch('/api/policies/deactivate', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  })
+} else {
+  await apiFetch('/api/policies/apply', {
+    method: 'POST',
+    body: JSON.stringify({
+      policies: [{ policyPath: target.policyPath, yaml: target.yaml }],
+    }),
+  })
+}
+```
 
-오른쪽 `PolicyList`에서 정책 상태 토글 버튼을 누르면 `handleTogglePolicyStatus()`가 실행된다.
+이 코드의 의미는 다음과 같다.
 
-- 현재 상태가 `active`면 `POST /api/policies/deactivate`
-- 현재 상태가 `draft` 또는 `paused`면 `POST /api/policies/apply`
+- 생성과 저장은 다르다.
+- registry에 저장된 정책이 있어도 실제 GitHub 저장소에 반영되지 않을 수 있다.
+- `active` / `paused` 전환은 결국 GitHub YAML 파일을 넣거나 빼는 작업이다.
 
-성공하면 프론트는 상태를 아래처럼 바꾼다.
+즉, `PolicyPage.tsx`는 정책을 "생성"하는 화면이면서 동시에 "운영"하는 화면이다.
 
-- `draft` 또는 `paused` -> `active`
-- `active` -> `paused`
+### 3. Express 진입점: `server.ts`
 
-여기서 중요한 점은 "활성화 = PR 생성"이 아니라 "활성화 = 기본 브랜치 직접 커밋"이라는 것이다.
+`server.ts`는 정책 기능을 직접 구현하지는 않지만, `policyRouter`를 Express에 붙여서 브라우저 요청이 백엔드로 들어오게 만든다.
 
-### 5.7 정책 삭제
+핵심 구조는 다음과 같다.
 
-정책 삭제는 `handleDeletePolicy()`가 담당한다.
+```ts
+app.use(policyRouter)
+```
 
-- 먼저 confirm 창을 띄운다.
-- confirm 문구에 "기본 브랜치에서 바로 삭제됩니다"라는 설명이 이미 들어 있다.
-- `DELETE /api/policies/registry/:id`를 호출한다.
-- 백엔드는 GitHub 파일 삭제 후 registry에서도 제거한다.
+즉, 정책 관련 모든 브라우저 요청은 결국 `routes/policy.ts`로 들어간다.
 
-즉, 삭제는 단순히 목록에서만 지우는 것이 아니라 GitHub 저장소의 정책 파일도 지우는 동작이다.
+### 4. HTTP 계약 층: `routes/policy.ts`
 
-## 6. 백엔드 API
+이 파일은 정책 페이지에서 쓰는 모든 API 명세를 제공한다. 실제 로직을 길게 갖지 않고, 검증 후 서비스 함수에 위임한다.
 
-정책 관련 엔드포인트는 `controlplane/api/src/routes/policy.ts`에 정의되어 있다.
+이 파일이 제공하는 대표 API는 다음과 같다.
 
-| Endpoint | Method | 실제 역할 |
-| --- | --- | --- |
-| `/api/policies/registry` | `GET` | 현재 registry에 저장된 정책 목록 조회 |
-| `/api/policies/registry` | `POST` | registry에 정책 저장 |
-| `/api/policies/registry/:id` | `PATCH` | status, lastUpdated, appliedPullRequest 수정 |
-| `/api/policies/registry/:id` | `DELETE` | registry 삭제 + GitHub 파일 삭제 시도 |
-| `/api/policies/generate` | `POST` | PDF를 분석해 Checkov YAML preview 생성 |
-| `/api/policies/apply` | `POST` | YAML 파일을 GitHub 기본 브랜치에 직접 커밋 |
-| `/api/policies/deactivate` | `POST` | GitHub 기본 브랜치에서 YAML 파일 삭제 |
+- `GET /api/policies/registry`
+- `POST /api/policies/registry`
+- `PATCH /api/policies/registry/:id`
+- `DELETE /api/policies/registry/:id`
+- `POST /api/policies/generate`
+- `POST /api/policies/apply`
+- `POST /api/policies/deactivate`
 
-`/api/policies/apply`는 두 가지 입력 형태를 모두 허용한다.
+#### 핵심 코드: generate 요청 위임
 
-- `policies` 배열
-- 또는 단일 `policyPath`, `yaml` 필드
+```ts
+policyRouter.post('/api/policies/generate', async (req, res, next) => {
+  const result = await generatePolicyFromPdf({
+    fileName: body.fileName || '',
+    contentBase64: body.contentBase64 || '',
+    mimeType: body.mimeType,
+  })
+  res.json(result)
+})
+```
 
-라우터가 내부적으로 이를 배열 형태로 정규화해서 `applyPolicyworkflow()`에 넘긴다.
+이 파일의 역할은 분명하다.
 
-## 7. PDF -> Checkov YAML 생성 파이프라인
+- request body 구조를 받는다.
+- 필요한 최소 검증을 한다.
+- 실제 생성/적용/삭제/저장 로직은 `policy/*.ts`에 맡긴다.
 
-정책 생성 핵심 로직은 `controlplane/api/src/policy/generate.ts`에 있다.
+즉, `routes/policy.ts`는 정책 페이지 백엔드의 HTTP 관문이다.
 
-### 7.1 입력 검증
+### 5. PDF -> YAML 생성 엔진: `policy/generate.ts`
 
-`generatePolicyFromPdf()`는 먼저 아래를 확인한다.
+이 파일이 정책 페이지의 핵심이다. 업로드된 PDF를 사람이 읽는 문서에서 기계가 검사할 수 있는 Checkov YAML로 변환한다.
 
-- `fileName` 존재 여부
-- `contentBase64` 존재 여부
-- `mimeType === application/pdf`
-- 파일명이 `.pdf`로 끝나는지
-- base64 디코딩 가능 여부
-- PDF에 읽을 수 있는 텍스트가 있는지
+이 파일의 내부 흐름은 다음과 같다.
 
-### 7.2 PDF 텍스트 추출
+```text
+PDF 입력
+  -> 입력 검증
+  -> base64 디코딩
+  -> PDF 텍스트 추출
+  -> source policy 단위 분리
+  -> 로컬 분류
+  -> Gemini 호출
+  -> LLM 응답 검증
+  -> Checkov YAML 직렬화
+  -> preview 응답 반환
+```
 
-`extractPdfText()`는 `pdf-parse`의 `PDFParse`를 사용한다.
+#### 핵심 코드 1: 전체 진입 함수
 
-처리 순서는 아래와 같다.
+```ts
+export async function generatePolicyFromPdf(input: GeneratePolicyRequest): Promise<GeneratePolicyResponse> {
+  const sourcePolicies = extractSourcePolicies(input.fileName, text)
+  const llmResult = await generateWithLlm(input.fileName, sourcePolicies)
+  const policies = resolvedDrafts.map((draft) => ({
+    policyPath: `security/checkov/custom_policies/${draft.fileName}`,
+    yaml: buildCustomPolicyYaml(draft),
+    ...
+  }))
 
-1. base64를 `Buffer`로 변환
-2. `PDFParse({ data: buffer })`
-3. `parser.getText()`
-4. 공백 정리
-
-현재 구현에는 OCR이 없다. 따라서 스캔 이미지 기반 PDF나 텍스트 레이어가 없는 PDF는 실패할 수 있다.
-
-### 7.3 source policy 항목 분리
-
-`extractSourcePolicies()`는 PDF 텍스트를 여러 개의 source policy 항목으로 분리한다.
-
-우선순위는 아래와 같다.
-
-1. 헤딩 기반 분리
-   `CA-07`, `CA 07`, `CA_07`, `1. CA-07 설명` 같은 패턴을 잡는다.
-2. 본문 regex fallback
-   본문 전체에서 `AA-00` 패턴을 다시 찾는다.
-3. 최후 fallback
-   아무 ID도 못 찾으면 문서 전체를 `POLICY-1` 한 건으로 본다.
-
-이 단계의 목표는 "PDF 전체"를 한 번에 AI에 던지지 않고, 항목 단위로 잘라서 변환하는 것이다.
-
-### 7.4 섹션 추출
-
-`extractPolicySections()`는 항목 본문에서 아래 구조를 추출한다.
-
-- `purpose`
-- `inspectionCriteria`
-- `risk`
-- `remediation`
-- `excerpt`
-
-한국어/영문 라벨을 섞어서 찾고, 라벨이 없더라도 일부 텍스트를 잘라 힌트로 사용한다.
-
-### 7.5 시그널 추출
-
-`extractPolicySignals()`는 Terraform AWS 변환 가능성을 높이기 위한 힌트를 만든다.
-
-- `likelyConvertible`
-- `candidateProviders`
-- `candidateResourceTypes`
-- `matchedTopics`
-
-예를 들어 아래 같은 키워드에서 힌트를 만든다.
-
-- `security group`, `ingress`, `0.0.0.0/0`
-- `s3`, `bucket`
-- `rds`, `database`
-- `kms`
-- `cloudtrail`, `logging`
-- `route table`, `internet gateway`
-
-이 시그널은 Gemini에게 넘기는 입력을 더 구조화하는 역할을 한다.
-
-### 7.6 로컬 분류와 baseline draft
-
-`classifySourcePolicyLocally()`는 항목이 코드 정책으로 변환 가능한지 1차 판단한다.
-
-- 사람이 해야 하는 절차성 정책인지
-- 주기 점검, 교육, 운영 절차 같은 항목인지
-- Terraform 리소스 타입으로 표현 가능한지
-
-이 단계에서 변환 가능성이 낮으면 아예 skip 후보가 된다. 반대로 변환 가능성이 높으면 fallback 성격의 baseline draft를 만들고, 이를 Gemini 프롬프트의 힌트로 사용한다.
-
-### 7.7 Gemini 호출
-
-AI 호출 진입점은 `generateWithLlm()`이다.
-
-한 source policy마다 아래 순서로 시도한다.
-
-1. 일반 definition 생성 프롬프트
-2. 실패 시 minimal definition 프롬프트
-
-Gemini에 넘기는 입력은 "PDF 전문"이 아니라 아래 같은 구조화 JSON이다.
-
-```json
-{
-  "sourcePolicyId": "CA-07",
-  "sourcePolicyTitle": "Extracted Policy CA-07",
-  "sections": {
-    "purpose": "...",
-    "inspectionCriteria": "...",
-    "risk": "...",
-    "remediation": "...",
-    "excerpt": "..."
-  },
-  "signals": {
-    "likelyConvertible": true,
-    "candidateProviders": ["aws"],
-    "candidateResourceTypes": ["aws_route_table", "aws_route", "aws_subnet"],
-    "matchedTopics": ["route-table"]
+  return {
+    ok: true,
+    mode: 'llm',
+    ...
   }
 }
 ```
 
-이 설계의 의도는 LLM이 문서 전체를 해석하는 부담을 줄이고, "이미 추출된 보안 항목을 Terraform AWS Checkov rule로 바꾸는 작업"에 집중시키는 것이다.
+이 코드가 보여주는 구조는 다음과 같다.
 
-### 7.8 Gemini 응답 검증
+- PDF 전체를 바로 저장하지 않는다.
+- 먼저 source policy 단위로 나눈다.
+- 그 결과를 Checkov YAML 아티팩트로 변환한다.
+- 최종 결과는 저장소 경로까지 포함한 preview 형태로 반환된다.
 
-Gemini 응답은 바로 믿지 않고 서버에서 검증한다.
+#### 핵심 코드 2: source policy 단위 분리
 
-- JSON 파싱 가능해야 한다.
-- `definition`이 객체여야 한다.
-- `definition` 안에 최소 하나 이상의 `aws_*` Terraform `resource_types`가 있어야 한다.
+`extractSourcePolicies()`가 문서를 항목 단위로 쪼개는 이유는, PDF 전체를 한 번에 LLM에 넘기면 결과가 불안정해질 수 있기 때문이다.
 
-이 조건을 통과하지 못하면 해당 항목은 최종 정책으로 채택되지 않는다.
+즉, 이 파일은 "긴 문서 전체를 한 번에 처리"하는 대신 "작은 정책 단위로 분해해서 처리"하는 구조다.
 
-### 7.9 YAML 직렬화
+#### 핵심 코드 3: LLM 생성 + 검증
 
-최종 draft가 확정되면 `buildCustomPolicyYaml()`이 Checkov YAML 문자열을 만든다.
-
-구조는 아래와 같다.
-
-```yaml
-metadata:
-  id: CKV2_CUSTOM_...
-  name: ...
-  category: ...
-  severity: ...
-  guideline: ...
-scope:
-  provider: aws
-definition:
+```ts
+for (const sourcePolicy of sourcePolicies) {
+  const localClassification = classifySourcePolicyLocally(fileName, sourcePolicy)
   ...
+  const response = await callConfiguredLlm({
+    messages: [
+      { role: 'system', content: buildPolicyDefinitionSystemPrompt() },
+      { role: 'user', content: buildPolicyDefinitionPrompt(...) },
+    ],
+    responseMimeType: 'application/json',
+  })
+  ...
+}
 ```
 
-파일 경로는 항상 아래 패턴으로 내려간다.
+이 부분이 중요한 이유는, 이 프로젝트가 "AI에게 아무 JSON이나 받아서 바로 저장"하지 않기 때문이다.
+
+실제로는 다음 검증이 들어간다.
+
+- JSON 파싱 가능한지
+- `definition`이 객체인지
+- Terraform AWS `resource_types`가 들어 있는지
+
+즉, `generate.ts`는 단순 AI 호출 파일이 아니라 "생성 + 검증 + 직렬화"를 모두 맡는 핵심 모듈이다.
+
+#### 핵심 코드 4: 최종 YAML 생성
+
+`buildCustomPolicyYaml()`이 최종 Checkov YAML 문자열을 만든다. 즉, LLM 응답을 그대로 저장하지 않고, 프로젝트가 기대하는 YAML 포맷으로 다시 직렬화한다.
+
+### 6. LLM 전송 레이어: `llm/client.ts`
+
+이 파일은 정책 생성 비즈니스 로직의 중심이 아니다. `generate.ts`가 준비한 프롬프트를 Gemini API로 보내는 전송 계층이다.
+
+핵심 코드:
+
+```ts
+export async function callConfiguredLlm(input: LlmRequest): Promise<LlmResponse | null> {
+  if (!env.llmApiKey) {
+    return null
+  }
+
+  return callGemini(input)
+}
+```
+
+즉, `client.ts`는 다음만 담당한다.
+
+- API 키 확인
+- Gemini 요청 body 조립
+- 실제 `generateContent` 호출
+
+이 파일이 분리된 이유는 다음과 같다.
+
+- `generate.ts`의 정책 생성 로직과 LLM 통신 로직을 섞지 않기 위해
+- provider 교체 여지를 남기기 위해
+- API 키를 브라우저에 숨기기 위해
+
+### 7. registry 저장소: `policy/registry.ts`
+
+이 파일은 생성된 정책 메타데이터를 로컬 JSON 파일에 저장한다. 정책 페이지가 단순 생성 화면이 아니라 "운영 목록" 화면이 될 수 있는 이유가 이 파일 때문이다.
+
+핵심 코드:
+
+```ts
+const STORE_PATH = path.resolve(process.cwd(), 'data', 'policy-registry.json')
+```
+
+즉, registry는 DB가 아니라 `controlplane/api/data/policy-registry.json` 파일 기반이다.
+
+이 파일의 역할은 다음과 같다.
+
+- 정책 목록 읽기
+- 정책 단건 조회
+- 정책 여러 개 생성
+- 정책 상태 업데이트
+- 정책 삭제
+
+#### 핵심 코드: 정책 생성
+
+```ts
+export async function createRegistryPolicies(input: RegistryPolicy[]) {
+  const store = await readStore()
+  ...
+  const policies = [...nextPolicies, ...store.policies]
+  await writeStore({ policies })
+  return nextPolicies
+}
+```
+
+즉, registry는 실제 YAML 파일 저장소가 아니라:
+
+- 정책 카드 목록
+- 상태값 `draft / active / paused`
+- description, severity, provider
+
+같은 운영 메타데이터를 관리하는 저장소다.
+
+### 8. GitHub 반영 엔진: `policy/apply.ts`
+
+이 파일은 생성된 YAML을 실제 저장소에 넣는 역할을 한다. 중요한 점은 현재 구조가 PR 생성이 아니라 기본 브랜치 직접 커밋이라는 점이다.
+
+핵심 코드:
+
+```ts
+export async function applyPolicyworkflow(input: ApplyPolicyRequest): Promise<ApplyPolicyResponse> {
+  const policies = rawPolicies.map(validatePolicyFile)
+  const result = await commitFilesToDefaultBranch({
+    runId: `policy-${Date.now()}`,
+    commitMessage: ...,
+    files: policies.map((policy) => ({
+      path: policy.policyPath,
+      content: policy.yaml,
+    })),
+  })
+  ...
+}
+```
+
+이 코드가 보여주는 구조는 다음과 같다.
+
+- policyPath가 `security/checkov/custom_policies/*.yaml`인지 검증
+- yaml 안에 `metadata`와 `definition` 블록이 있는지 검증
+- 검증된 파일만 기본 브랜치에 직접 커밋
+
+즉, `apply.ts`는 "생성된 결과를 실제 정책 파일로 배포하는 모듈"이다.
+
+### 9. GitHub 삭제 엔진: `policy/remove.ts`
+
+이 파일은 apply의 반대 역할을 한다. registry에서 정책을 없애기 전에, 실제 GitHub 저장소의 YAML 파일도 지워 준다.
+
+핵심 코드:
+
+```ts
+const existsOnBase = await checkFileExistsOnDefaultBranch(policyPath, baseBranch)
+
+if (!existsOnBase) {
+  return {
+    ok: true,
+    deleted: true,
+    githubFileDeleted: false,
+  }
+}
+
+const result = await commitFilesToDefaultBranch({
+  runId: `policy-delete-${Date.now()}`,
+  commitMessage: `policy: remove ${fileName}`,
+  files: [{ path: policyPath, delete: true }],
+})
+```
+
+이 구조가 중요한 이유는 다음과 같다.
+
+- 먼저 실제 GitHub 기본 브랜치에 파일이 있는지 확인한다.
+- 있으면 delete commit을 만든다.
+- 없으면 registry 삭제만 성공 처리한다.
+
+즉, `remove.ts`는 "정책 삭제"를 GitHub 파일 상태까지 맞춰 주는 정리 모듈이다.
+
+### 10. GitHub 인증과 커밋 유틸: `github/app.ts`, `github/changes.ts`
+
+정책 페이지도 GitHub 저장소를 수정해야 하므로 브라우저가 직접 GitHub를 호출하면 안 된다. 그래서 `github/app.ts`와 `github/changes.ts`가 필요하다.
+
+#### `github/app.ts`
+
+이 파일은 GitHub App 인증과 installation token 기반 Octokit 생성 역할을 한다.
+
+핵심 구조:
+
+```ts
+export async function getRepoOctokit() {
+  const installation = await getInstallationForRepository()
+  return githubApp.getInstallationOctokit(installation.id)
+}
+```
+
+즉, 정책 apply/delete는 모두 이 인증 흐름 위에서 수행된다.
+
+#### `github/changes.ts`
+
+정책 페이지에서는 `commitFilesToDefaultBranch()`가 핵심이다.
+
+이 함수는 다음 순서로 동작한다.
+
+1. 기본 브랜치 ref 조회
+2. base commit 조회
+3. 파일을 blob/tree로 구성
+4. commit 생성
+5. 기본 브랜치 ref 업데이트
+
+즉, 정책 페이지는 PR을 만들지 않고 기본 브랜치를 직접 전진시키는 구조다.
+
+### 11. 최종 저장 위치: `security/checkov/custom_policies/`
+
+정책 페이지의 산출물은 메모리 안에서 끝나지 않는다. 최종적으로는 저장소 안의 실제 Checkov 정책 파일이 된다.
+
+경로는 항상 이 패턴을 따른다.
 
 ```text
 security/checkov/custom_policies/<generated-file>.yaml
 ```
 
-## 8. AI 연동 상세
+즉, 이 폴더는 정책 페이지의 "배포 대상"이다. registry는 메타데이터용이고, 이 폴더 안 YAML은 실제 검사 자산이다.
 
-AI 클라이언트는 `controlplane/api/src/llm/client.ts`에 있다.
+## 발표할 때 설명 순서
 
-### 8.1 실제 provider
+이 페이지를 설명할 때는 파일 이름 나열보다 연결 구조로 설명하는 편이 좋다.
 
-현재 런타임에서 지원하는 provider 타입은 사실상 하나뿐이다.
+1. `App.tsx`가 `/policy`를 `PolicyPage.tsx`에 연결한다.
+2. `PolicyPage.tsx`가 PDF 업로드, preview, 목록, apply/deactivate/delete 버튼을 관리한다.
+3. `routes/policy.ts`가 generate, apply, deactivate, registry API를 받아 적절한 서비스 모듈로 넘긴다.
+4. `policy/generate.ts`가 PDF를 읽고 정책 항목을 분리한 뒤 Gemini를 통해 Checkov YAML을 만든다.
+5. `policy/registry.ts`가 생성된 정책 메타데이터를 JSON registry에 저장한다.
+6. `policy/apply.ts`와 `policy/remove.ts`가 GitHub 저장소의 실제 YAML 파일을 넣거나 삭제한다.
+7. 이 과정에서 `github/app.ts`가 GitHub App 인증을 담당하고, `github/changes.ts`가 기본 브랜치 커밋을 수행한다.
 
-- `LlmProvider = 'gemini'`
-- `resolveProvider()`도 항상 `'gemini'`를 반환한다.
-- 실제 HTTP 호출도 Google Generative Language API `generateContent` 엔드포인트로 간다.
+짧게 한 문장으로 정리하면 다음과 같다.
 
-즉, 정책 페이지의 AI 연동은 현재 Gemini 전용 구현이다.
-
-### 8.2 환경 변수 해석
-
-`env.ts` 기준 LLM 관련 해석은 아래와 같다.
-
-- `GEMINI_API_KEY` 또는 `LLM_API_KEY`
-- `GEMINI_MODEL` 또는 `LLM_MODEL`
-- 기본 모델 fallback은 `gemini-2.5-flash-lite`
-
-주의할 점:
-
-- `controlplane/api/.env.example`에는 `LLM_MODEL=gpt-5.4-mini`가 적혀 있다.
-- 하지만 실제 `llm/client.ts`는 OpenAI를 호출하지 않고 Gemini만 호출한다.
-
-즉, 예시 env의 모델 이름과 실제 런타임 구현이 현재 불일치한다.
-
-### 8.3 프롬프트 설계
-
-정책 생성 프롬프트의 핵심 제약은 아래와 같다.
-
-- Terraform AWS Checkov policy만 생성
-- `aws_*` resource type이 없는 규칙은 허용하지 않음
-- 운영 절차나 사람 중심 정책은 `not_convertible`로 보냄
-- 가능한 단순한 attribute rule 선호
-- markdown 없이 JSON만 반환
-
-이 제약 덕분에 "문장 요약"보다 "실제로 Checkov가 해석할 수 있는 rule object 생성"에 더 집중하게 되어 있다.
-
-### 8.4 현재 fallback의 실제 의미
-
-코드에는 `fallback` 타입과 템플릿이 남아 있다. 하지만 현재 공개 응답 흐름은 사실상 Gemini 성공 결과만 `policies`에 담는다.
-
-- Gemini 성공: `policies`에 포함
-- Gemini 실패: `skippedPolicies`로 빠짐
-
-즉, 이름만 보면 fallback까지 완전히 동작하는 것처럼 보이지만, 현재 최종 응답은 실질적으로 "Gemini 성공분만 반환"에 가깝다.
-
-## 9. GitHub 연동 상세
-
-### 9.1 GitHub App 인증
-
-`controlplane/api/src/github/app.ts`가 GitHub App 초기화를 담당한다.
-
-- `GITHUB_APP_PRIVATE_KEY`는 PEM 문자열 자체이거나 `.pem` 파일 경로일 수 있다.
-- `normalizePrivateKey()`가 개행과 파일 경로를 정리한다.
-- `GET /repos/{owner}/{repo}/installation`로 installation을 찾는다.
-- `githubApp.getInstallationOctokit()`으로 installation token 기반 Octokit을 만든다.
-
-이 구조 덕분에 프론트가 GitHub 토큰을 직접 들고 있지 않아도 된다.
-
-### 9.2 apply가 실제로 하는 일
-
-`controlplane/api/src/policy/apply.ts`는 `commitFilesToDefaultBranch()`를 호출한다.
-
-이 함수는 내부적으로 아래 순서로 동작한다.
-
-1. 기본 브랜치 ref 조회
-2. 현재 commit 조회
-3. blob 생성
-4. tree 생성
-5. commit 생성
-6. `heads/<default_branch>` ref를 새 commit으로 업데이트
-
-즉, 정책 활성화는 PR 생성이 아니라 기본 브랜치 ref 업데이트다.
-
-반환값도 실제로는 아래 정도만 준다.
-
-```json
-{
-  "ok": true,
-  "policyPaths": ["security/checkov/custom_policies/example.yaml"],
-  "fileCount": 1,
-  "branchName": "main",
-  "commitSha": "abc123..."
-}
-```
-
-`branchName`은 별도 작업 브랜치가 아니라 실제로 커밋된 브랜치 이름이다. 보통 저장소 기본 브랜치와 같다.
-
-### 9.3 remove가 실제로 하는 일
-
-`controlplane/api/src/policy/remove.ts`도 동일하게 `commitFilesToDefaultBranch()`를 쓴다.
-
-동작 순서는 아래와 같다.
-
-1. registry에 저장된 `policyPath` 검증
-2. GitHub 기본 브랜치에 파일이 실제로 있는지 조회
-3. 있으면 delete tree entry로 새 commit 생성
-4. 기본 브랜치 ref 업데이트
-5. 없으면 GitHub 삭제 없이 registry 삭제만 성공 처리
-
-즉, 비활성화와 삭제 모두 기본 브랜치 직접 삭제 기반이다.
-
-### 9.4 PR 유틸은 있지만 정책 플로우에서는 미사용
-
-`controlplane/api/src/github/changes.ts`에는 `createPullRequestFromFiles()`도 구현돼 있다.
-
-하지만 현재 정책 페이지는 이 함수를 쓰지 않는다. 따라서 문서나 프론트 타입에 `pullRequest`가 남아 있어도 실제 정책 페이지의 GitHub 반영은 PR 기반이 아니다.
-
-## 10. Registry 구조
-
-registry는 `controlplane/api/src/policy/registry.ts`에서 관리한다.
-
-저장 위치는 아래 계산식으로 정해진다.
-
-```ts
-path.resolve(process.cwd(), "data", "policy-registry.json")
-```
-
-보통 API를 `controlplane/api` 기준으로 실행하므로 실제 파일은 아래 경로가 된다.
-
-```text
-controlplane/api/data/policy-registry.json
-```
-
-저장 필드는 아래가 핵심이다.
-
-- `id`
-- `name`
-- `description`
-- `source`
-- `status`
-- `yaml`
-- `policyPath`
-- `provider`
-- `policyId`
-- `category`
-- `severity`
-- `targetProvider`
-- `appliedPullRequest`
-- `sourcePolicyId`
-- `sourcePolicyTitle`
-
-상태 값 의미는 아래와 같다.
-
-- `draft`: registry에만 저장되고 GitHub에는 아직 반영되지 않음
-- `active`: GitHub 저장소에 현재 policy 파일이 존재한다고 간주
-- `paused`: registry에는 남아 있지만 GitHub에서는 제거된 상태
-
-중요한 구현 포인트:
-
-- 중복 방지는 `id` 기준만 한다.
-- 같은 `policyPath`나 같은 `policyId`라도 다른 `id`로 여러 번 저장될 수 있다.
-- 따라서 동일 PDF를 여러 번 생성하면 registry 중복이 생길 수 있다.
-
-## 11. 주요 요청/응답 예시
-
-### 11.1 정책 생성 요청
-
-```json
-POST /api/policies/generate
-{
-  "fileName": "kisa-network-guide.pdf",
-  "mimeType": "application/pdf",
-  "contentBase64": "JVBERi0xLjcK..."
-}
-```
-
-### 11.2 정책 생성 응답
-
-```json
-{
-  "ok": true,
-  "mode": "llm",
-  "provider": "gemini",
-  "attemptedProvider": "gemini",
-  "fileName": "kisa-network-guide.pdf",
-  "summary": "Generated 2 Checkov custom policies from KISA network guide.",
-  "policyCount": 2,
-  "policies": [
-    {
-      "sourcePolicyId": "CA-07",
-      "sourcePolicyTitle": "Private route table control",
-      "policyName": "Ensure private route tables do not route to an Internet Gateway",
-      "description": "Require private route tables to avoid direct Internet Gateway routes.",
-      "summary": "Derived a networking control from the uploaded guidance.",
-      "category": "NETWORKING",
-      "severity": "HIGH",
-      "targetProvider": "aws",
-      "policyId": "CKV2_CUSTOM_CA_07",
-      "policyPath": "security/checkov/custom_policies/ca-07-private-route-table.yaml",
-      "yaml": "---\nmetadata:\n  ..."
-    }
-  ],
-  "skippedPolicies": []
-}
-```
-
-### 11.3 정책 활성화 요청
-
-```json
-POST /api/policies/apply
-{
-  "policies": [
-    {
-      "policyPath": "security/checkov/custom_policies/ca-07-private-route-table.yaml",
-      "yaml": "---\nmetadata:\n  ...",
-      "policyName": "Ensure private route tables do not route to an Internet Gateway",
-      "summary": "Derived a networking control from the uploaded guidance."
-    }
-  ]
-}
-```
-
-### 11.4 정책 활성화 응답
-
-```json
-{
-  "ok": true,
-  "policyPaths": ["security/checkov/custom_policies/ca-07-private-route-table.yaml"],
-  "fileCount": 1,
-  "branchName": "main",
-  "commitSha": "abc123def456"
-}
-```
-
-### 11.5 비활성화/삭제 응답
-
-```json
-{
-  "ok": true,
-  "deleted": true,
-  "githubFileDeleted": true,
-  "branchName": "main",
-  "commitSha": "def456abc123"
-}
-```
-
-`githubFileDeleted: false`면 registry에서는 삭제되었지만 GitHub 기본 브랜치에는 원래 파일이 없어서 실제 삭제 커밋은 발생하지 않았다는 뜻이다.
-
-## 12. 이 페이지를 설명할 때 핵심 메시지
-
-발표나 데모에서 아래 흐름으로 설명하면 된다.
-
-1. 프론트는 PDF 업로드와 결과 preview를 담당한다.
-2. 백엔드는 PDF 파싱, 정책 항목 분리, AI 호출, YAML 생성, GitHub 반영을 모두 담당한다.
-3. AI에는 PDF 전체가 아니라 항목별 구조화 입력을 전달한다.
-4. AI 출력은 서버에서 `aws_* resource_types`까지 검증한 뒤에만 채택한다.
-5. 저장된 정책은 registry에 남고, 활성화 시 GitHub 저장소에 실제 Checkov custom policy 파일이 생긴다.
-6. 현재 정책 페이지의 GitHub 반영은 PR이 아니라 기본 브랜치 직접 커밋이다.
-
-짧게 요약하면 아래 한 문장으로도 설명할 수 있다.
-
-> 정책 페이지는 PDF 기반 보안 가이드를 Terraform AWS용 Checkov 정책 파일로 바꿔서, 검토 후 registry에 저장하고 GitHub 저장소에 반영하는 백엔드 주도형 생성/배포 화면이다.
-
-## 13. 현재 구현의 한계와 주의점
-
-- 정책 활성화와 삭제가 기본 브랜치 직접 커밋이다. 승인용 PR 워크플로우가 아니다.
-- 프론트 타입과 숨겨진 UI에는 여전히 `pullRequest`, `fallback`, `PR 생성` 표현이 남아 있다.
-- `.env.example`의 `LLM_MODEL=gpt-5.4-mini`는 현재 런타임 구현과 맞지 않는다. 실제 코드는 Gemini만 호출한다.
-- OCR이 없어서 이미지 기반 PDF는 잘 안 된다.
-- registry가 로컬 JSON 파일이라 서버 인스턴스 간 공유나 다중 사용자 동기화에 약하다.
-- registry 중복 방지가 `id` 기준뿐이라 동일 정책을 여러 번 저장할 수 있다.
-- `handleTogglePolicyStatus()`는 apply 응답의 PR 정보를 저장하도록 설계된 흔적이 있지만, 현재 백엔드 응답과는 맞지 않는다.
-- bulk apply/create UI는 코드상 존재하지만 실제 화면에서는 숨겨져 있다.
-
-## 14. 다음 개선 포인트
-
-- `apply.ts`, `remove.ts`를 `createPullRequestFromFiles()` 기반으로 바꿔 PR 승인 플로우로 전환
-- 숨겨진 bulk apply UI를 실제 백엔드 동작과 맞게 정리
-- registry를 DynamoDB 같은 외부 저장소로 이전
-- `policyPath` 또는 `policyId` 기준 중복 방지 추가
-- OCR 또는 문서 전처리 계층 추가
-- provider 추상화를 실제 구현과 맞추거나 Gemini 전용임을 명확히 정리
-
-## 15. 구현을 다시 해야 한다면 어디부터 보면 되는가
-
-작업 목적별로 보면 아래 순서가 가장 빠르다.
-
-- 화면 동작 이해:
-  `controlplane/web/src/pages/PolicyPage.tsx`
-- API 입출력 이해:
-  `controlplane/api/src/routes/policy.ts`
-- PDF -> YAML 변환 이해:
-  `controlplane/api/src/policy/generate.ts`
-- GitHub 반영 방식 이해:
-  `controlplane/api/src/policy/apply.ts`
-  `controlplane/api/src/policy/remove.ts`
-  `controlplane/api/src/github/changes.ts`
-- GitHub App 인증 이해:
-  `controlplane/api/src/github/app.ts`
-- AI 설정 이해:
-  `controlplane/api/src/llm/client.ts`
-  `controlplane/api/src/config/env.ts`
-
-이 순서대로 보면 정책 페이지를 기술적으로 설명하거나, 같은 구조를 다시 구현하거나, PR 기반으로 개편하는 작업까지 이어서 진행할 수 있다.
+> 정책 페이지는 `PolicyPage.tsx`가 여러 백엔드 모듈을 조합해 보안 가이드 PDF를 Checkov custom policy YAML로 변환하고, 그 결과를 registry와 GitHub 저장소에 반영하는 운영 대시보드다.

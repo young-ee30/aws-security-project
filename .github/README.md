@@ -1,255 +1,278 @@
-# GitHub Actions 전체 흐름 가이드
+# GitHub Actions Flow
 
-이 문서는 현재 저장소의 [`.github/workflows`](./workflows), [`.github/actions`](./actions) 가 실제로 어떻게 연결되어 돌아가는지 설명하는 운영 문서입니다.
+이 문서는 현재 저장소의 GitHub Actions가 어떤 순서로 실행되는지, 어떤 조건에서 멈추는지, 그리고 각 workflow가 무슨 역할을 하는지 정리한 운영 문서다.
 
-목표는 하나입니다.
+기준 파일:
 
-"이 저장소에서 어떤 이벤트가 들어오면, 어떤 workflow가 왜 실행되고, 어디서 멈추며, ECS에는 언제 무엇이 배포되는지"를 이 문서 하나만 읽고 이해할 수 있게 만드는 것.
+- `.github/workflows/bootstrap-terraform-state.yml`
+- `.github/workflows/terraform-dev-plan-apply.yml`
+- `.github/workflows/ex-ecs-deploy.yml`
+- `.github/workflows/pull-request-security-scans.yml`
+- `.github/actions/deploy-ecs-service/action.yml`
 
-설명 기준은 문서가 아니라 현재 저장소에 들어 있는 실제 YAML입니다.
+## 현재 결론
 
-## 1. 먼저 전체 지도부터
+- GitHub Actions에서 `semgrep`은 현재 쓰이지 않는다.
+- 현재 보안 스캔은 `Gitleaks`, `Trivy`, `Checkov` 조합이다.
+- `main` 또는 `young`에 특정 경로 변경이 push되면 bootstrap이 시작된다.
+- bootstrap이 성공하면 Terraform plan/apply workflow가 이어진다.
+- Terraform apply가 성공하면 ECS 배포 workflow가 이어진다.
+- PR에서는 Terraform plan까지만 가고, apply와 ECS 배포는 하지 않는다.
 
-현재 실제 흐름의 중심은 아래 4개 파일입니다.
+## Semgrep 사용 여부
 
-- [`workflows/bootstrap-terraform-state.yml`](./workflows/bootstrap-terraform-state.yml)
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml)
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml)
-- [`actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml)
+현재 `.github/workflows` 와 `.github/actions` 안에는 `semgrep` step이 없다.
 
-이 4개를 한 줄로 보면 구조는 이렇게 됩니다.
+실제로 들어가 있는 스캔은 아래뿐이다.
+
+- `gitleaks/gitleaks-action@v2`
+- `aquasecurity/trivy-action@master`
+- `bridgecrewio/checkov-action@master`
+
+즉 현재 GitHub Actions 기준으로는:
+
+- Secret scan: Gitleaks
+- IaC scan: Trivy config mode + Checkov
+- Dependency / image scan: Trivy
+- Semgrep: 없음
+
+나중에 Semgrep을 붙이려면 보통 아래 둘 중 하나에 넣으면 된다.
+
+- `pull-request-security-scans.yml` 에 PR 정적 분석 job 추가
+- `deploy-ecs-service` 전에 서비스 소스코드 정적 분석 job 추가
+
+## 전체 흐름
+
+가장 중요한 자동 흐름은 아래다.
 
 ```text
-main push
+push(main or young, selected paths)
   -> Bootstrap Terraform State
      -> Terraform Dev Plan and Apply
-        -> Deploy Selected Services to ECS
-           -> Deploy ECS Service (composite action)
+        -> Terraform Apply
+           -> Deploy Selected Services to ECS
+              -> Deploy ECS Service (composite action)
 ```
 
-PR 흐름은 따로 움직입니다.
+PR 흐름은 아래다.
 
 ```text
 pull request to main
   -> Pull Request Security Scans
   -> Terraform Dev Plan and Apply
-     -> plan만 실행
-     -> apply 안 함
-     -> ECS 배포 안 함
+     -> Terraform Plan only
+     -> no Terraform Apply
+     -> no ECS deploy
 ```
 
-수동 실행은 사람이 직접 원하는 workflow를 누르는 방식입니다.
+수동 실행은 아래처럼 독립적으로 가능하다.
 
 ```text
-manual run
+workflow_dispatch
   -> bootstrap-terraform-state.yml
   -> terraform-dev-plan-apply.yml
   -> pull-request-security-scans.yml
   -> ex-ecs-deploy.yml
 ```
 
-중요한 구분은 아래입니다.
-
-- `workflow`는 언제 실행할지와 어떤 서비스를 처리할지를 결정합니다.
-- `action`은 실제 빌드, 스캔, ECR 푸시, ECS 반영을 수행합니다.
-
-즉:
-
-- [`.github/workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) 은 "무엇을 배포할지" 결정하는 파일
-- [`.github/actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml) 은 "어떻게 배포할지" 실행하는 파일
-
-입니다.
-
-## 2. 어떤 파일이 언제 실행되는가
-
-현재 `.github` 안의 주요 파일 역할은 아래처럼 나뉩니다.
-
-| 파일 | 역할 | 직접 실행 조건 |
-|---|---|---|
-| [`workflows/bootstrap-terraform-state.yml`](./workflows/bootstrap-terraform-state.yml) | Terraform state bucket 준비 | `main` push, manual run |
-| [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml) | Terraform plan/apply | bootstrap 성공 후 자동, PR, manual run |
-| [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) | 이번 실행에서 배포할 서비스 결정 후 ECS 배포 시작 | Terraform workflow 성공 후 자동, manual run |
-| [`workflows/pull-request-security-scans.yml`](./workflows/pull-request-security-scans.yml) | PR 보안 검사 | PR, manual run |
-| [`actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml) | 서비스 1개 실제 배포 | `ex-ecs-deploy.yml`이 호출할 때만 실행 |
-
-여기서 가장 많이 헷갈리는 부분은 마지막 줄입니다.
-
-[`.github/actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml) 은 GitHub Actions 탭에서 혼자 시작되지 않습니다.  
-항상 [`.github/workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) 안에서 `uses: ./.github/actions/deploy-ecs-service` 로 호출될 때만 실행됩니다.
-
-## 3. 이벤트별 전체 흐름
-
-이제부터는 "무슨 이벤트가 들어왔을 때 실제로 무슨 일이 벌어지는가"를 기준으로 설명합니다.
-
-### 3-1. `main` 브랜치에 push한 경우
-
-가장 중요한 자동 배포 흐름입니다.
-
-단, 아무 push나 다 반응하는 것은 아니고 아래 경로가 바뀌었을 때만 시작됩니다.
-
-- `terraform/**`
-- `services/ecommerce-app-node/**`
-- `services/ecommerce-app-fastapi/**`
-- `services/ecommerce-app-spring/**`
-- `services/frontend/ecommerce-app-frontend/frontend/**`
-- `.github/actions/**`
-- `.github/workflows/**`
-
-즉, `main`에 push했더라도 위 경로와 무관한 파일만 바뀌었다면 이 자동 배포 체인은 시작되지 않습니다.
-
-자동 흐름은 아래 순서입니다.
-
-```text
-main push
-  -> Bootstrap Terraform State
-  -> Terraform Dev Plan and Apply
-  -> Deploy Selected Services to ECS
-  -> 서비스별 Deploy ECS Service action 실행
-```
-
-#### Step 1. Bootstrap Terraform State
+## 1. Bootstrap Terraform State
 
 파일:
 
-- [`workflows/bootstrap-terraform-state.yml`](./workflows/bootstrap-terraform-state.yml)
+- `.github/workflows/bootstrap-terraform-state.yml`
 
-하는 일:
+트리거:
 
-1. AWS OIDC 인증
-2. 이미 사용할 Terraform state bucket이 있는지 확인
-3. 있으면 재사용
-4. 없으면 `terraform/bootstrap` 으로 새 bucket 생성
-5. 어떤 bucket을 쓰게 되었는지 summary에 기록
+- `push`
+- 대상 브랜치: `main`, `young`
+- 대상 경로:
+  - `terraform/**`
+  - `services/ecommerce-app-node/**`
+  - `services/ecommerce-app-fastapi/**`
+  - `services/ecommerce-app-spring/**`
+  - `services/frontend/ecommerce-app-frontend/frontend/**`
+  - `.github/actions/**`
+  - `.github/workflows/**`
+- `workflow_dispatch`
 
-핵심 포인트:
+역할:
 
-- `vars.TF_STATE_BUCKET` 이 있으면 그 bucket을 우선 사용하려고 합니다.
-- 값이 설정되어 있는데 실제 bucket이 없으면 바로 실패합니다.
-- 값이 없으면 `devsecops-tfstate-...` prefix 기준으로 기존 bucket을 찾고, 가장 적절한 bucket을 재사용합니다.
-- 아무 bucket도 없으면 bootstrap Terraform으로 새로 만듭니다.
+- Terraform remote state용 S3 bucket이 있는지 확인한다.
+- 있으면 재사용한다.
+- 없으면 `terraform/bootstrap` 으로 새로 만든다.
 
-실패하면:
+핵심 동작:
 
-- 여기서 전체 자동 흐름이 멈춥니다.
-- 다음 Terraform workflow는 시작되지 않습니다.
+1. 저장소 checkout
+2. GitHub OIDC로 AWS role assume
+3. `vars.TF_STATE_BUCKET` 값이 있으면 그 bucket 존재 여부 확인
+4. 값이 없으면 `devsecops-tfstate-{account}-{region}` 규칙으로 목표 bucket 계산
+5. bucket이 없으면 `terraform apply` 로 bootstrap
+6. summary에 최종 bucket 이름 기록
 
-성공하면:
+중요 포인트:
 
-- 이름이 정확히 `"Bootstrap Terraform State"` 인 workflow가 성공 완료되었기 때문에
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml) 이 `workflow_run` 으로 이어집니다.
+- 이 workflow는 인프라 본체를 배포하지 않는다.
+- Terraform이 사용할 state bucket을 준비하는 선행 단계다.
+- `push` 트리거는 `young`도 포함하지만, 뒤의 자동 apply 흐름은 사실상 `main` 중심으로 이어진다.
 
-#### Step 2. Terraform Dev Plan and Apply
+## 2. Terraform Dev Plan and Apply
 
 파일:
 
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml)
+- `.github/workflows/terraform-dev-plan-apply.yml`
 
-이 workflow는 job이 2개입니다.
+트리거:
+
+- `workflow_run`
+  - 대상 workflow: `Bootstrap Terraform State`
+  - `completed`
+- `pull_request`
+  - 대상 브랜치: `main`
+  - 대상 경로:
+    - `terraform/**`
+    - `.github/actions/**`
+    - `.github/workflows/**`
+- `workflow_dispatch`
+
+job 구성:
 
 - `terraform-plan`
 - `terraform-apply`
 
-##### `terraform-plan` 이 하는 일
+### 2-1. terraform-plan
 
-1. AWS 인증
-2. Terraform 설치
-3. state bucket 재확인
-4. `TF_VAR_DB_PASSWORD` secret 존재 확인
-5. `backend.hcl` 생성
-6. `terraform fmt -check`
+실행 조건:
+
+- bootstrap workflow가 성공했을 때
+- 또는 `main` 대상 PR일 때
+- 또는 수동 실행일 때
+
+주요 단계:
+
+1. 대상 revision checkout
+2. AWS role assume
+3. Terraform setup
+4. state bucket resolve
+5. `TF_VAR_DB_PASSWORD` secret 확인
+6. `backend.hcl` 생성
+7. `terraform fmt -check`
+8. `terraform init`
+9. `terraform validate`
+10. `Checkov IaC Scan`
+11. `terraform plan`
+
+보안 관련:
+
+- 여기서 `Checkov`가 실행된다.
+- `security/checkov/custom_policies` 아래 커스텀 정책도 함께 읽는다.
+- `soft_fail: true` 라서 위반이 있어도 workflow를 즉시 죽이지는 않는다.
+
+현재 없는 것:
+
+- Semgrep step 없음
+
+### 2-2. terraform-apply
+
+실행 조건:
+
+- `workflow_run` 으로 들어왔고, upstream이 성공했고, upstream event가 `pull_request` 가 아닐 때
+- 또는 `workflow_dispatch` 이면서 현재 ref가 `refs/heads/main` 일 때
+
+즉:
+
+- PR에서는 실행 안 됨
+- 자동 체인에서는 bootstrap 성공 후 이어짐
+- 수동 실행도 `main`에서만 apply 허용
+
+주요 단계:
+
+1. checkout
+2. AWS role assume
+3. Terraform setup
+4. state bucket resolve
+5. secret 확인
+6. `backend.hcl` 생성
 7. `terraform init`
-8. `terraform validate`
-9. Checkov 실행
-10. `terraform plan`
+8. orphan IAM role import 시도
+9. orphan CloudWatch log group import 시도
+10. orphan EFS 정리
+11. `terraform apply`
 
-여기서 중요한 점:
+중요 포인트:
 
-- `terraform fmt -check` 는 `continue-on-error: true` 입니다.
-- 즉 포맷 문제는 기록되지만 그 이유만으로는 workflow가 멈추지 않습니다.
-- 반면 `init`, `validate`, Checkov, `plan` 실패는 실제 실패로 처리됩니다.
+- 이 workflow에는 기존 AWS 리소스를 state로 편입하려는 보정 로직이 들어 있다.
+- 그래서 단순 apply보다 조금 더 운영 지향적으로 짜여 있다.
 
-##### `terraform-apply` 가 하는 일
-
-`terraform-plan` 이 성공해야 시작됩니다.
-
-그리고 `main` push 자동 흐름에서는 실제 apply까지 갑니다.
-
-실행 순서:
-
-1. AWS 인증
-2. Terraform 설치
-3. state bucket 재확인
-4. secret 확인
-5. `backend.hcl` 생성
-6. `terraform init`
-7. orphan IAM role import 시도
-8. orphan CloudWatch Log Group import 시도
-9. orphan EFS 정리
-10. `terraform apply`
-
-이 단계가 있는 이유:
-
-- 이미 AWS에 있는데 Terraform state에는 없는 리소스 때문에 apply가 깨지는 상황을 줄이기 위해서입니다.
-- 즉 "기존 AWS 리소스와 state가 살짝 어긋난 상태"를 보정하려는 로직이 들어 있습니다.
-
-실패하면:
-
-- ECS 배포 workflow는 시작되지 않습니다.
-- 인프라 반영이 중간에 멈췄을 수 있으므로 apply 로그를 먼저 확인해야 합니다.
-
-성공하면:
-
-- 이름이 정확히 `"Terraform Dev Plan and Apply"` 인 workflow가 성공 완료되었기 때문에
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) 이 `workflow_run` 으로 이어집니다.
-
-#### Step 3. Deploy Selected Services to ECS
+## 3. Deploy Selected Services to ECS
 
 파일:
 
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml)
+- `.github/workflows/ex-ecs-deploy.yml`
 
-이 파일이 현재 ECS 배포의 중심입니다.
+트리거:
 
-이 workflow는 job이 2개입니다.
+- `workflow_run`
+  - 대상 workflow: `Terraform Dev Plan and Apply`
+  - `completed`
+- `workflow_dispatch`
+
+job 구성:
 
 - `resolve-targets`
 - `deploy-selected`
 
-##### `resolve-targets` 가 하는 일
+### 3-1. resolve-targets
 
-목적은 하나입니다.
+실행 조건:
 
-"이번 실행에서 어떤 서비스를 배포 대상으로 삼을지" 결정하는 것.
+- Terraform workflow가 성공했고, 그 이벤트가 PR이 아닐 때
+- 또는 수동 실행일 때
 
-자동 실행일 때 판단 규칙:
+역할:
 
-1. 현재 기준 커밋 SHA를 잡습니다.
-2. 그 커밋과 바로 이전 커밋을 비교해 changed files를 구합니다.
-3. 아래 경로가 하나라도 바뀌면 4개 서비스를 모두 배포 대상으로 잡습니다.
+- 이번 revision에서 어떤 서비스를 실제로 재배포할지 계산한다.
 
-- `terraform/**`
-- `.github/actions/**`
-- `.github/workflows/**`
+주요 단계:
 
-4. 위 경로가 아니면 서비스별 경로를 보고 해당 서비스만 대상으로 잡습니다.
+1. 배포 대상 SHA 결정
+2. 해당 SHA checkout
+3. `terraform/envs/dev/terraform.tfvars` 에서 `active_backend` 읽기
+4. 변경 파일 기준으로 배포 대상 계산
 
-- `services/ecommerce-app-node/` -> `api-node`
-- `services/ecommerce-app-fastapi/` -> `api-python`
-- `services/ecommerce-app-spring/` -> `api-spring`
-- `services/frontend/ecommerce-app-frontend/frontend/` -> `frontend`
+배포 대상 계산 규칙:
 
-5. 아무 대상도 없으면 `has_targets=false` 로 끝내고 실제 배포 job은 아예 건너뜁니다.
+- 아래가 바뀌면 `frontend` 와 `active_backend` 둘 다 배포
+  - `terraform/**`
+  - `.github/actions/**`
+  - `.github/workflows/**`
+- 서비스 코드만 바뀌면 해당 서비스만 배포
+  - frontend 변경 -> `frontend`
+  - node 변경 + active backend가 node -> `api-node`
+  - fastapi 변경 + active backend가 python -> `api-python`
+  - spring 변경 + active backend가 spring -> `api-spring`
+- 첫 commit처럼 이전 commit이 없으면 `frontend` 와 `active_backend` 둘 다 배포
+- 아무 대상이 없으면 noop matrix를 만들어 실제 배포를 skip
 
-중요한 사실:
+중요 포인트:
 
-- 자동 배포의 변경 감지는 "최신 커밋 vs 그 부모 커밋" 기준입니다.
-- 즉 한 번의 push에 여러 commit이 들어오더라도 현재 로직은 마지막 commit 기준으로 대상을 계산합니다.
+- 이 workflow는 "무조건 다 배포"가 아니다.
+- 변경 파일과 `active_backend` 값 기준으로 타겟을 줄인다.
 
-##### `deploy-selected` 가 하는 일
+### 3-2. deploy-selected
 
-`resolve-targets` 가 뽑아낸 서비스 목록을 matrix로 하나씩 처리합니다.
+역할:
 
-서비스마다 먼저 아래 정보를 고정값으로 계산합니다.
+- `resolve-targets` 가 만든 matrix를 기준으로 서비스별 배포를 병렬 실행한다.
+
+주요 단계:
+
+1. noop이면 설명만 남기고 종료
+2. 대상 revision checkout
+3. 서비스별 설정 해석
+4. composite action `./.github/actions/deploy-ecs-service` 호출
+
+서비스별로 주입되는 값:
 
 - `app_path`
 - `ecr_repository`
@@ -258,495 +281,167 @@ main push
 - `ecs_task_definition`
 - `container_name`
 
-그 뒤 실제 자동 실행에서는 각 대상 서비스에 대해 바로 배포 action을 호출합니다.
-
-즉 자동 실행에서의 원칙은:
-
-- 대상에 들어온 서비스는 배포
-- 대상에 안 들어온 서비스는 미배포
-
-#### Step 4. Deploy ECS Service action
+## 4. Deploy ECS Service Composite Action
 
 파일:
 
-- [`actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml)
+- `.github/actions/deploy-ecs-service/action.yml`
 
-이 action은 서비스 1개를 실제로 배포하는 엔진입니다.
+역할:
 
-실행 순서:
+- 단일 서비스 이미지 빌드, 스캔, ECR push, ECS 반영까지 실제 작업을 수행한다.
 
-1. Gitleaks 실행
-2. AWS OIDC 인증
-3. ECR 로그인
+주요 단계:
+
+1. `Gitleaks` 실행
+   - 단, `workflow_run` 이벤트에서는 skip
+2. AWS role assume
+3. ECR login
 4. Docker image build
-5. Trivy image scan
+5. `Trivy` 이미지 스캔
 6. ECR push
 7. 현재 ECS task definition 다운로드
-8. 새 이미지로 task definition 갱신
+8. 새 image tag로 task definition 렌더링
 9. ECS 서비스 배포
-10. desired count가 0이면 1로 올려서 scale from zero 처리
+10. desired count가 0인 서비스는 scale-up 하지 않음
 
-즉 `main` 자동 배포 전체를 문장으로 다시 쓰면 이렇게 됩니다.
+보안 관련:
 
-> `main`에 배포 관련 변경이 push되면, 먼저 state bucket을 준비하고, 그다음 Terraform plan/apply로 인프라를 반영한 뒤, 마지막에 변경된 서비스만 골라 Docker build와 이미지 스캔을 거쳐 ECS에 새 task definition을 배포한다.
+- 여기서는 `Gitleaks`, `Trivy` 만 있다.
+- Semgrep은 없다.
 
-### 3-2. `main`이 아닌 브랜치에 push했고 PR도 없는 경우
+왜 `workflow_run`에서는 Gitleaks를 skip하나:
 
-이 경우 기본적으로 자동 실행은 없습니다.
+- 상위 workflow 체인에서 이미 checkout된 revision을 기준으로 바로 배포까지 넘기기 때문이다.
+- 배포 체인 중복 스캔 시간을 줄이려는 의도다.
 
-이유:
-
-- bootstrap workflow의 `push` 트리거가 `branches: [main]` 이기 때문입니다.
-
-즉:
-
-```text
-feature branch push
-  -> 자동 실행 없음
-```
-
-이 상태에서 뭔가 돌리고 싶다면 manual run을 해야 합니다.
-
-### 3-3. `main` 대상 PR이 열려 있는 브랜치에 push한 경우
-
-이 경우는 "브랜치에 push" 이면서 동시에 "PR 업데이트" 입니다.
-
-현재 PR 흐름은 자동 배포가 아니라 검사 중심 흐름입니다.
-
-기본 큰 그림은 이렇습니다.
-
-```text
-PR update
-  -> Pull Request Security Scans
-  -> Terraform Dev Plan and Apply
-     -> 조건이 맞을 때만 실행
-     -> plan까지만 실행
-  -> apply 없음
-  -> ECS 배포 없음
-```
-
-하지만 여기에는 중요한 조건 차이가 있습니다.
-
-#### PR Security Scans
+## 5. Pull Request Security Scans
 
 파일:
 
-- [`workflows/pull-request-security-scans.yml`](./workflows/pull-request-security-scans.yml)
+- `.github/workflows/pull-request-security-scans.yml`
 
-이 workflow는 `main` 대상 PR이면 실행됩니다.
+트리거:
 
-여기서는 아래 검사를 합니다.
+- `pull_request`
+  - 대상 브랜치: `main`
+- `workflow_dispatch`
 
-1. Gitleaks secret scan
-2. Trivy IaC scan
-3. Trivy SCA scan
-4. Checkov scan
+job 구성:
+
+- `secret-scan`
+- `trivy-iac-scan`
+- `trivy-sca-scan`
+- `checkov-scan`
+
+각 job의 역할:
+
+- `secret-scan`
+  - Gitleaks로 secret 탐지
+- `trivy-iac-scan`
+  - Terraform / config 스캔
+- `trivy-sca-scan`
+  - `./services` 기준 dependency / filesystem 스캔
+- `checkov-scan`
+  - Terraform + custom Checkov policy 스캔
+
+중요 포인트:
+
+- 이 PR 보안 스캔 workflow에도 Semgrep은 없다.
+- 대부분 `continue-on-error: true` 또는 soft fail 형태라서, "탐지"와 "리포트" 중심이다.
+
+## 6. 이벤트별 실제 동작
+
+### 6-1. `main` push
+
+조건:
+
+- push 대상이 `main`
+- bootstrap workflow의 paths 조건에 걸리는 파일 변경
+
+동작:
+
+1. Bootstrap Terraform State
+2. Terraform Plan
+3. Terraform Apply
+4. ECS 대상 계산
+5. 대상 서비스만 ECS 배포
+
+### 6-2. `young` push
+
+조건:
+
+- push 대상이 `young`
+- bootstrap workflow의 paths 조건에 걸리는 파일 변경
+
+동작:
+
+1. Bootstrap Terraform State는 실행될 수 있음
+2. 이후 Terraform workflow가 `workflow_run` 으로 이어질 수 있음
+3. 다만 apply와 ECS 배포는 브랜치/이벤트 조건에 따라 기대와 다를 수 있으니 운영 브랜치로 보기는 어렵다
+
+실무 해석:
+
+- `young`은 bootstrap 테스트 성격이 강하다.
+- 실제 자동 반영 체인은 `main` 기준으로 보는 게 안전하다.
+
+### 6-3. `main` 대상 PR
+
+동작:
+
+1. Pull Request Security Scans 실행
+2. Terraform Plan 실행
+3. Terraform Apply 안 함
+4. ECS 배포 안 함
+
+즉 PR은 검증용이다.
+
+### 6-4. 수동 실행
+
+가능:
+
+- state bucket bootstrap
+- Terraform plan/apply
+- PR security scans
+- ECS 선택 배포
 
 특징:
 
-- 서비스 코드만 바뀌어도 PR이면 실행됩니다.
-- 실제 배포는 하지 않습니다.
+- ECS workflow는 `deploy_frontend`, `deploy_active_backend` 입력으로 수동 제어 가능
+- Terraform apply는 `main`에서만 허용되도록 조건이 걸려 있음
 
-#### Terraform Dev Plan and Apply in PR
+## 7. 현재 보안 스캔 체계 요약
 
-파일:
+PR 검증:
 
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml)
+- Gitleaks
+- Trivy IaC
+- Trivy SCA
+- Checkov
 
-이 workflow는 PR이라고 해서 항상 뜨는 것은 아닙니다.
+Terraform workflow:
 
-PR에서 아래 경로가 바뀌었을 때만 시작됩니다.
+- Checkov
 
-- `terraform/**`
-- `.github/actions/**`
-- `.github/workflows/**`
+서비스 배포 workflow:
 
-즉:
+- Gitleaks
+- Trivy image scan
 
-- PR에서 서비스 코드만 바뀐 경우  
-  `pull-request-security-scans.yml` 은 실행되지만  
-  `terraform-dev-plan-apply.yml` 은 아예 시작되지 않을 수 있습니다.
+현재 빠져 있는 것:
 
-- PR에서 Terraform 또는 GitHub Actions 관련 코드가 바뀐 경우  
-  `terraform-dev-plan-apply.yml` 이 실행되고 `terraform-plan` 까지 수행합니다.
+- Semgrep
+- CodeQL
+- SAST 전용 언어별 정적 분석
 
-PR에서 이 workflow가 시작되더라도:
+## 8. 운영 시 기억할 점
 
-- `terraform-plan` 만 실행
-- `terraform-apply` 는 실행 안 함
-- `ex-ecs-deploy.yml` 자동 배포로 이어지지 않음
+- 커스텀 Checkov 정책은 `security/checkov/custom_policies` 에서 읽힌다.
+- 정책 YAML을 GitHub에 직접 반영하면 이후 PR scan과 Terraform workflow의 Checkov에서 바로 사용된다.
+- ECS 배포 대상은 "모든 서비스"가 아니라 "변경 파일 + active_backend" 기준이다.
+- `workflow_run` 체인을 쓰기 때문에 upstream workflow 이름이 바뀌면 downstream 연결이 끊어진다.
+- 현재 구조는 IaC 중심 자동화이며, 애플리케이션 정적 분석은 아직 약하다.
 
-왜냐하면 `ex-ecs-deploy.yml` 은 `workflow_run` 으로 Terraform workflow를 듣고는 있지만, job 조건에서 `workflow_run.event != 'pull_request'` 를 요구하기 때문입니다.
+## 9. 한 줄 요약
 
-즉 PR 흐름의 한 줄 요약은 아래입니다.
-
-> PR에서는 보안 검사와 Terraform plan까지만 본다. 실제 AWS 변경과 ECS 배포는 하지 않는다.
-
-### 3-4. 사람이 직접 manual run 한 경우
-
-현재 manual run 가능한 workflow는 4개입니다.
-
-- [`workflows/bootstrap-terraform-state.yml`](./workflows/bootstrap-terraform-state.yml)
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml)
-- [`workflows/pull-request-security-scans.yml`](./workflows/pull-request-security-scans.yml)
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml)
-
-각각 의미가 다릅니다.
-
-#### bootstrap manual run
-
-언제 쓰나:
-
-- state bucket을 수동으로 먼저 만들거나 재확인하고 싶을 때
-
-입력값:
-
-- `aws_region`
-- `project_name`
-
-결과:
-
-- bucket을 재사용하거나 새로 만듭니다.
-- 자동으로 Terraform workflow를 이어서 타게 할 수도 있습니다.
-
-#### terraform manual run
-
-언제 쓰나:
-
-- bootstrap과 무관하게 Terraform을 단독으로 다시 돌려보고 싶을 때
-
-주의:
-
-- `terraform-plan` 은 manual run이면 실행됩니다.
-- `terraform-apply` 는 manual run이라도 선택한 ref가 `main` 일 때만 실행됩니다.
-
-즉:
-
-- manual run on `main` -> plan + apply 가능
-- manual run on non-`main` branch -> 사실상 plan만 실행
-
-#### PR security scans manual run
-
-언제 쓰나:
-
-- PR이 아니어도 보안 검사를 한 번 수동으로 돌려보고 싶을 때
-
-결과:
-
-- Gitleaks, Trivy, Checkov 검사만 수행합니다.
-- 인프라 변경이나 ECS 배포는 하지 않습니다.
-
-#### ECS deploy manual run
-
-파일:
-
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml)
-
-이게 운영에서 가장 많이 볼 manual run 입니다.
-
-입력값:
-
-- `deploy_api_node`
-- `deploy_api_python`
-- `deploy_api_spring`
-- `deploy_frontend`
-
-즉 수동 실행 시점에 4개 서비스 중 원하는 것만 `true/false` 로 선택할 수 있습니다.
-
-예:
-
-- node만 배포하고 싶으면 `deploy_api_node=true`
-- node + frontend만 배포하고 싶으면 `deploy_api_node=true`, `deploy_frontend=true`
-
-그런데 여기서 중요한 점이 하나 더 있습니다.
-
-수동 실행에서 `true` 로 선택했다고 해서 무조건 배포되지는 않습니다.
-
-선택된 각 서비스에 대해 아래 순서로 다시 판단합니다.
-
-1. Terraform / workflow / action 코드가 바뀌었는가
-2. 해당 서비스 소스 코드가 바뀌었는가
-3. 현재 ECS 서비스가 이미 떠 있는가
-
-판정 결과:
-
-- 위 조건 중 하나라도 참이면 deploy
-- 모두 아니면 skip
-
-즉 manual run의 의미는 아래에 가깝습니다.
-
-> "내가 지정한 서비스 후보들 중에서, 실제로 다시 배포할 필요가 있는 서비스만 배포해라"
-
-예를 들면:
-
-- `api-node=true`, `frontend=true` 로 수동 실행
-- 최근 관련 변경이 없고 둘 다 ECS에 정상적으로 떠 있으면
-- 둘 다 skip 될 수 있습니다.
-
-반대로:
-
-- `frontend=true` 로 수동 실행
-- frontend 관련 코드가 바뀌었거나
-- frontend ECS 서비스가 아직 안 떠 있으면
-- frontend만 배포됩니다.
-
-## 4. 배포 대상 결정 규칙
-
-ECS 배포가 헷갈리기 쉬운 이유는, 실제로는 "선택" 과 "실행" 이 분리되어 있기 때문입니다.
-
-### 자동 실행에서의 대상 결정
-
-자동 실행은 [`.github/workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml) 의 `resolve-targets` 가 대상을 정합니다.
-
-규칙은 아래와 같습니다.
-
-| 변경 내용 | 결과 |
-|---|---|
-| `terraform/**` 변경 | 4개 서비스 모두 대상 |
-| `.github/actions/**` 변경 | 4개 서비스 모두 대상 |
-| `.github/workflows/**` 변경 | 4개 서비스 모두 대상 |
-| `services/ecommerce-app-node/**` 변경 | `api-node` 대상 |
-| `services/ecommerce-app-fastapi/**` 변경 | `api-python` 대상 |
-| `services/ecommerce-app-spring/**` 변경 | `api-spring` 대상 |
-| `services/frontend/ecommerce-app-frontend/frontend/**` 변경 | `frontend` 대상 |
-| 위에 해당 없음 | 배포 안 함 |
-
-### 수동 실행에서의 대상 결정
-
-수동 실행은 2단계입니다.
-
-1. 사용자가 `true/false` 로 후보 서비스 선택
-2. 선택된 각 서비스에 대해 "지금 실제로 배포가 필요한가" 재판단
-
-재판단 기준:
-
-| 조건 | 결과 |
-|---|---|
-| Terraform / workflow / action 변경 감지 | deploy |
-| 선택한 서비스 코드 변경 감지 | deploy |
-| ECS 서비스가 미배포 상태 | deploy |
-| 위 조건 모두 아님 | skip |
-
-즉 수동 실행은 강제 전체 재배포 버튼이 아니라, 선택한 서비스들에 대한 "스마트 재배포" 버튼에 가깝습니다.
-
-## 5. 실패하면 어디서 멈추는가
-
-운영에서 가장 중요한 부분입니다.
-
-### bootstrap 단계 실패
-
-파일:
-
-- [`workflows/bootstrap-terraform-state.yml`](./workflows/bootstrap-terraform-state.yml)
-
-대표 원인:
-
-- `AWS_ROLE_ARN` 문제로 AWS 인증 실패
-- `TF_STATE_BUCKET` 값이 잘못되었거나 bucket이 실제로 없음
-- bootstrap Terraform 자체 실패
-
-영향:
-
-- Terraform workflow로 이어지지 않음
-- ECS 배포도 없음
-
-### terraform-plan 실패
-
-파일:
-
-- [`workflows/terraform-dev-plan-apply.yml`](./workflows/terraform-dev-plan-apply.yml)
-
-대표 원인:
-
-- state bucket 탐색 실패
-- `TF_VAR_DB_PASSWORD` 없음
-- `terraform init` 실패
-- `terraform validate` 실패
-- Checkov 위반
-- `terraform plan` 실패
-
-영향:
-
-- `terraform-apply` 시작 안 함
-- ECS 배포도 시작 안 함
-
-예외:
-
-- `terraform fmt -check` 실패만으로는 전체가 멈추지 않음
-
-### terraform-apply 실패
-
-대표 원인:
-
-- orphan IAM role import 실패
-- orphan Log Group import 실패
-- orphan EFS 정리 실패
-- `terraform apply` 실패
-
-영향:
-
-- `ex-ecs-deploy.yml` 자동 실행 안 됨
-- 인프라가 중간 상태일 수 있으므로 apply 로그 확인이 우선
-
-### PR security scan 실패
-
-파일:
-
-- [`workflows/pull-request-security-scans.yml`](./workflows/pull-request-security-scans.yml)
-
-대표 원인:
-
-- Gitleaks 탐지
-- Trivy IaC 탐지
-- Trivy SCA 탐지
-- Checkov 위반
-
-영향:
-
-- PR check 실패
-- 보통 문제를 해결하기 전까지 merge하지 않는 것이 안전
-
-### ECS 배포 단계 실패
-
-파일:
-
-- [`workflows/ex-ecs-deploy.yml`](./workflows/ex-ecs-deploy.yml)
-- [`actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml)
-
-대표 원인:
-
-- Gitleaks 실패
-- Docker build 실패
-- Trivy image scan 실패
-- ECR push 실패
-- ECS task definition 반영 실패
-- ECS 서비스 안정화 실패
-
-영향:
-
-- 해당 서비스는 실패
-- matrix 전략이 `fail-fast: false` 이므로 다른 서비스는 계속 시도할 수 있음
-- 하지만 전체 workflow 결과는 실패로 남을 수 있음
-
-## 6. 현재 설정에서 "실패 강도" 는 어느 정도인가
-
-| 항목 | 현재 설정 | 의미 |
-|---|---|---|
-| Terraform fmt | `continue-on-error: true` | 포맷 문제는 기록만 하고 계속 진행 |
-| Gitleaks | 기본 실패 동작 | 시크릿 탐지 시 실패 |
-| Trivy IaC | `exit-code: 1` | IaC 취약점 탐지 시 실패 |
-| Trivy SCA | `exit-code: 1` | 라이브러리 취약점 탐지 시 실패 |
-| Trivy Image | `exit-code: 1` | 이미지 취약점 탐지 시 해당 서비스 배포 실패 |
-| Checkov | `soft_fail: false` | 정책 위반 시 실패 |
-
-즉 지금 구조는 "보안 검사가 걸리면 그냥 경고만 찍고 넘어가는 구조"가 아니라, 꽤 엄격하게 막는 구조입니다.
-
-## 7. `.github/actions` 폴더는 왜 있는가
-
-[`.github/actions`](./actions) 는 "공통 작업을 재사용하기 위한 로컬 composite action" 폴더입니다.
-
-현재 실제로 들어 있는 것은 아래 action입니다.
-
-- [`actions/deploy-ecs-service/action.yml`](./actions/deploy-ecs-service/action.yml)
-
-이 파일을 따로 둔 이유는, 서비스가 여러 개여도 배포 절차 자체는 거의 같기 때문입니다.
-
-공통 배포 절차:
-
-1. Gitleaks
-2. AWS 인증
-3. ECR 로그인
-4. Docker build
-5. Trivy image scan
-6. ECR push
-7. ECS task definition 교체
-8. ECS deploy
-
-이걸 workflow 파일마다 복붙하지 않고 한 군데에 모아 둔 것입니다.
-
-그래서 구조를 이렇게 이해하면 됩니다.
-
-- `workflows` = 언제 실행할지, 어떤 서비스를 처리할지 결정
-- `actions` = 실제 공통 작업 수행
-
-## 8. 운영에서 자주 마주치는 실제 예시
-
-### 예시 1. `main`에 frontend 코드만 push
-
-흐름:
-
-1. bootstrap 실행
-2. terraform plan/apply 실행
-3. ex-ecs-deploy 실행
-4. 변경 파일을 보고 `frontend` 만 대상 선정
-5. frontend만 Docker build, scan, push, ECS 배포
-
-### 예시 2. `main`에 Terraform 코드 push
-
-흐름:
-
-1. bootstrap 실행
-2. terraform plan/apply 실행
-3. ex-ecs-deploy 실행
-4. `terraform/**` 변경을 감지
-5. `api-node`, `api-python`, `api-spring`, `frontend` 모두 배포 대상 선정
-6. 4개 서비스를 각각 배포
-
-### 예시 3. PR에서 서비스 코드만 변경
-
-흐름:
-
-1. pull-request-security-scans 실행
-2. terraform workflow는 시작되지 않을 수 있음
-3. ECS 배포 없음
-
-핵심:
-
-- PR에서는 서비스 코드 변경만으로 바로 ECS 배포가 일어나지 않습니다.
-
-### 예시 4. 수동으로 node + frontend만 선택 실행
-
-흐름:
-
-1. `deploy_api_node=true`
-2. `deploy_frontend=true`
-3. 각 서비스에 대해 변경 여부와 현재 ECS 배포 상태 확인
-4. 필요한 서비스만 deploy
-5. 필요 없으면 skip
-
-즉 "선택한 서비스를 무조건 배포"가 아니라 "선택한 서비스 중 필요한 것만 배포"입니다.
-
-## 9. 필요한 GitHub 설정
-
-Secrets:
-
-- `AWS_ROLE_ARN`
-- `TF_VAR_DB_PASSWORD`
-
-Variables:
-
-- `TF_STATE_BUCKET`
-
-자동 제공:
-
-- `GITHUB_TOKEN`
-
-주의:
-
-- `AWS_ROLE_ARN` 이 없으면 bootstrap, terraform, ECS deploy 모두 AWS 접근에서 실패합니다.
-- `TF_VAR_DB_PASSWORD` 가 없으면 Terraform plan/apply 가 실패합니다.
-- `TF_STATE_BUCKET` 은 선택 사항이지만, 잘못 설정하면 bootstrap이 오히려 실패할 수 있습니다.
-
-## 10. 마지막으로 정말 핵심만 다시 요약
-
-이 저장소의 GitHub Actions를 운영 관점에서 한 줄씩 요약하면 아래와 같습니다.
-
-- `main push` 는 실제 자동 배포 체인이다.
-- `PR` 은 검사와 plan 중심 흐름이고, 실제 apply와 ECS 배포는 하지 않는다.
-- `ex-ecs-deploy.yml` 이 ECS 배포의 관문이다.
-- `deploy-ecs-service/action.yml` 이 실제 배포 엔진이다.
-- 자동 배포는 변경된 서비스만, 수동 배포는 선택된 서비스 중 필요한 것만 처리한다.
-
-가장 짧게 압축하면 현재 구조는 아래 문장 하나로 설명할 수 있습니다.
-
-> `main push -> state bucket 준비 -> Terraform 반영 -> 배포 대상 선정 -> 서비스별 ECS 배포`
+현재 Actions 체인은 `state bucket 준비 -> Terraform plan/apply -> 변경 서비스만 ECS 배포` 구조이고, 보안 스캔은 `Gitleaks + Trivy + Checkov` 조합이며 `Semgrep`은 아직 붙어 있지 않다.

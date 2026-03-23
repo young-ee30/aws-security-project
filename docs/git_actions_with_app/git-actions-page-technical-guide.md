@@ -1,765 +1,723 @@
-# GitHub Actions Log Page README
+# Git Actions Page Technical Guide
 
-## 1. 이 문서의 목적
+## 개요
 
-이 문서는 `controlplane/web/src/pages/GitActionsPage.tsx` 기반의 GitHub Actions 로그 페이지를 직접 설명하고, 같은 구조를 다시 구현할 수 있게 만드는 기술 문서다.
+이 문서는 `/git-actions` 페이지를 구성하는 파일들이 어떻게 유기적으로 연결되는지 설명하는 기술 문서다.
 
-설명 대상은 다음 전체 흐름이다.
+이 페이지는 단순 로그 뷰어가 아니다. 실제로는 아래 기능이 한 화면에 묶여 있다.
 
-1. 대시보드에서 GitHub App 연결 상태 확인
-2. 최근 GitHub Actions run 목록 조회
-3. 선택한 run의 job, step, 로그, annotation, 요약 조회
-4. 전체 파이프라인 실행 또는 재실행
-5. 실패 로그를 rule-based + LLM으로 분석
-6. AI 제안 파일을 새 브랜치와 PR로 생성
-7. PR 머지 또는 닫기
+- GitHub App 연결 상태 확인
+- 최근 GitHub Actions run 목록 조회
+- 선택한 run의 jobs, steps, logs, annotations, summary 표시
+- 전체 파이프라인 실행
+- 현재 run 재실행 / 실패 job만 재실행
+- 실패 원인 AI 제안
+- AI 수정안을 PR로 생성
+- 생성된 PR 조회, merge, close
 
-짧게 설명하면 이 페이지는 "GitHub Actions 관제 화면 + 실패 원인 분석기 + AI 수정 제안기 + PR 생성기"다.
+이 페이지를 이해할 때 가장 중요한 관점은 다음이다.
 
-## 2. 페이지가 실제로 하는 일
+> `GitActionsPage.tsx`가 화면의 오케스트레이터이고, `routes/*.ts`는 HTTP 진입점이며, `github/*.ts`와 `fix/*.ts`가 실제 기능을 수행하는 서비스 레이어다.
 
-라우트는 `controlplane/web/src/App.tsx`에서 `/git-actions`로 연결된다.
+즉, 핵심은 개별 파일 하나가 아니라 "프론트 컨트롤러 -> Express 라우터 -> GitHub/AI 서비스 모듈 -> GitHub API"의 연결 구조다.
+
+## 이 페이지에 필요한 파일 트리
+
+아래 트리는 저장소 전체가 아니라, Git Actions 페이지를 설명할 때 직접 필요한 파일만 추린 것이다.
+
+```text
+aws-security-project/
+├─ controlplane/
+│  ├─ web/
+│  │  └─ src/
+│  │     ├─ App.tsx                                      # /git-actions 라우트를 등록한다.
+│  │     ├─ pages/
+│  │     │  └─ GitActionsPage.tsx                        # 이 페이지의 메인 컨트롤러. 데이터 로드, 버튼 액션, 상태 관리가 모두 모인다.
+│  │     └─ components/
+│  │        └─ pipeline/
+│  │           ├─ PipelineGraph.tsx                      # workflow/job 구조를 운영 화면용 그래프로 재구성한다.
+│  │           └─ StepTimeline.tsx                       # step 상태, 요약, 선택 UI를 담당한다.
+│  └─ api/
+│     └─ src/
+│        ├─ server.ts                                    # Express 서버 시작점. githubRouter, fixRouter를 연결한다.
+│        ├─ routes/
+│        │  ├─ github.ts                                 # run 조회, logs 조회, rerun, dispatch, PR 조회/merge/close API를 제공한다.
+│        │  └─ fix.ts                                    # AI 제안 생성과 PR 생성 confirm API를 제공한다.
+│        ├─ github/
+│        │  ├─ app.ts                                    # GitHub App 인증과 installation token 발급을 담당한다.
+│        │  ├─ actions.ts                                # GitHub Actions REST API, PR API 호출을 실제로 수행한다.
+│        │  └─ changes.ts                                # Git Data API로 branch, tree, commit, PR을 만든다.
+│        ├─ fix/
+│        │  ├─ summarize.ts                              # run/job/step을 사람이 읽기 쉬운 요약으로 바꾼다.
+│        │  └─ suggest.ts                                # 로그를 규칙 기반으로 분석하고, 필요 시 AI 제안을 붙인다.
+│        └─ llm/
+│           └─ client.ts                                 # Gemini 호출 공통 어댑터
+├─ .github/
+│  ├─ workflows/
+│  │  └─ ex-ecs-deploy.yml                               # 배포 workflow. 어떤 서비스를 배포할지 결정한다.
+│  └─ actions/
+│     └─ deploy-ecs-service/
+│        └─ action.yml                                   # ECS 배포 공통 단계를 실제로 수행하는 composite action
+└─ docs/
+   └─ git_actions_with_app/
+      └─ git-actions-page-technical-guide.md             # 현재 문서
+```
+
+## 기술 스택
+
+| 기술 | 왜 쓰는가 | 실제 구현 위치 |
+| --- | --- | --- |
+| React + TypeScript + Vite | 상태가 많은 운영 대시보드 UI를 만들기 위해 | `controlplane/web/src/pages/GitActionsPage.tsx` |
+| React Router | `/git-actions` 라우트를 연결하기 위해 | `controlplane/web/src/App.tsx` |
+| Express + TypeScript | 브라우저와 GitHub/AI 사이의 중간 API 서버를 만들기 위해 | `controlplane/api/src/server.ts` |
+| GitHub App + Octokit | 브라우저에 토큰을 노출하지 않고 GitHub를 제어하기 위해 | `controlplane/api/src/github/app.ts` |
+| GitHub Actions REST API | runs, jobs, logs, rerun, dispatch를 다루기 위해 | `controlplane/api/src/github/actions.ts` |
+| Git Data API | 로컬 git clone 없이 branch, commit, PR을 만들기 위해 | `controlplane/api/src/github/changes.ts` |
+| Rule-based analyzer | 실패 유형을 빠르게 분류하고 후보 파일을 찾기 위해 | `controlplane/api/src/fix/suggest.ts` |
+| Gemini API | 로그 원인 설명과 수정안 생성을 보조하기 위해 | `controlplane/api/src/llm/client.ts` |
+| Polling | webhook 없이 run 상태를 주기적으로 갱신하기 위해 | `controlplane/web/src/pages/GitActionsPage.tsx` |
+| Composite GitHub Action | ECS 배포 공통 단계를 workflow 밖으로 분리하기 위해 | `.github/actions/deploy-ecs-service/action.yml` |
+
+## 전체 연결 구조
+
+이 페이지는 아래 4개 층이 연결되어 동작한다.
+
+```text
+1. 라우팅 층
+   App.tsx
+   -> /git-actions
+
+2. 프론트 컨트롤러 층
+   GitActionsPage.tsx
+   -> 상태 관리
+   -> API 호출
+   -> PipelineGraph / StepTimeline 렌더링
+
+3. 백엔드 진입 층
+   server.ts
+   -> routes/github.ts
+   -> routes/fix.ts
+
+4. 서비스 층
+   github/app.ts
+   -> GitHub App 인증
+   github/actions.ts
+   -> run/jobs/logs/dispatch/rerun/PR 조회
+   github/changes.ts
+   -> branch/commit/PR 생성
+   fix/summarize.ts
+   -> run 요약 생성
+   fix/suggest.ts
+   -> 로그 분석 + AI 제안
+   llm/client.ts
+   -> Gemini 호출
+```
+
+즉, 페이지 기능은 다음처럼 완성된다.
+
+```text
+사용자 버튼 클릭
+  -> GitActionsPage.tsx
+  -> /api/github/* 또는 /api/github/fix-sessions/*
+  -> routes/github.ts 또는 routes/fix.ts
+  -> github/actions.ts / fix/suggest.ts / github/changes.ts
+  -> github/app.ts 로 인증된 Octokit 사용
+  -> GitHub API 또는 Gemini API 호출
+  -> 결과를 다시 GitActionsPage.tsx가 받아서 화면에 반영
+```
+
+## 기능 기준으로 파일 연결 보기
+
+이 표가 가장 실무적으로 중요하다. 각 기능이 어떤 파일들을 거쳐 완성되는지 한 번에 보여준다.
+
+| 사용자 기능 | 프론트 시작점 | API 진입점 | 실제 처리 파일 | 결과 |
+| --- | --- | --- | --- | --- |
+| run 목록 표시 | `GitActionsPage.tsx`의 `fetchRuns()` | `GET /api/github/runs` | `routes/github.ts` -> `github/actions.ts`의 `listWorkflowRuns()` | 최근 workflow run 목록 표시 |
+| run 상세 표시 | `loadRunDetail()` | `GET /api/github/runs/:runId/jobs` | `routes/github.ts` -> `github/actions.ts`의 `getWorkflowRunJobs()` | job/step 목록 표시 |
+| run 요약 표시 | `loadRunSummary()` | `GET /api/github/runs/:runId/summary` | `routes/github.ts` -> `fix/summarize.ts`의 `generateRunSummary()` | 사람 친화적 요약 표시 |
+| 로그 표시 | `loadRunLogs()` | `GET /api/github/runs/:runId/logs` | `routes/github.ts` -> `github/actions.ts`의 `getWorkflowRunLogs()` | 실패 job 또는 선택 job 로그 표시 |
+| annotation 표시 | `loadRunAnnotations()` | `GET /api/github/runs/:runId/annotations` | `routes/github.ts` -> `github/actions.ts`의 `getWorkflowRunAnnotations()` | Checkov/GitHub annotation 표시 |
+| 전체 파이프라인 실행 | `handleExecuteworkflow()` | `POST /api/github/pipeline/run-all` | `routes/github.ts` -> `github/actions.ts`의 `dispatchFullPipeline()` | Bootstrap workflow부터 새 run 시작 |
+| rerun / rerun failed | `handleRerun()` | `POST /api/github/runs/:runId/rerun*` | `routes/github.ts` -> `github/actions.ts`의 `rerunWorkflowRun()` / `rerunFailedJobs()` | 기존 run 재실행 |
+| AI 제안 | `handleSuggest*()` | `POST /api/github/fix-sessions/:runId/suggest` | `routes/fix.ts` -> `fix/suggest.ts` -> `llm/client.ts` | 원인 요약, 후보 파일, 수정안 생성 |
+| PR 생성 | `handleApply()` | `POST /api/github/fix-sessions/:runId/confirm` | `routes/fix.ts` -> `github/changes.ts`의 `createPullRequestFromFiles()` | 새 branch, commit, PR 생성 |
+| PR merge / close | `handleMergePr()`, `handleClosePr()` | `POST /merge`, `PATCH /close` | `routes/github.ts` -> `github/actions.ts` | PR 상태 변경 |
+
+## 자세한 설명
+
+### 1. 진입점: `App.tsx`
+
+이 파일은 단순하지만 중요하다. Git Actions 페이지가 애플리케이션 안에서 어느 경로로 진입하는지 결정한다.
 
 ```tsx
 <Route path="git-actions" element={<GitActionsPage />} />
 ```
 
-이 페이지는 단순 로그 뷰어가 아니다. 아래 기능이 한 화면에 모여 있다.
+역할은 하나다.
 
-- GitHub App 연결 확인
-- 3개 핵심 workflow 체인 상태 표시
-- run별 job/step 타임라인 시각화
-- 실패 로그 복사
-- run 전체 재실행
-- 실패 job만 재실행
-- AI 원인 분석
-- AI가 제안한 파일로 PR 생성
-- 생성된 PR 머지/닫기
+- `/git-actions` URL과 `GitActionsPage.tsx`를 연결한다.
 
-## 3. 구현에 필요한 기술 스택
+즉, 이 파일은 기능을 수행하지는 않지만, 페이지가 앱 안에 들어오는 시작점이다.
 
-| 영역 | 현재 사용 기술 | 역할 |
-| --- | --- | --- |
-| 프론트엔드 | React 18, TypeScript, Vite, React Router | 페이지 렌더링, 라우팅, 상태 관리 |
-| UI | Tailwind 계열 클래스, lucide-react | 상태 배지, 로그 카드, 타임라인 UI |
-| 백엔드 | Node.js, Express 4, TypeScript | GitHub API 중계, AI 분석, PR 생성 |
-| GitHub 연동 | GitHub App + Octokit | installation token 발급, Actions/PR/Contents API 호출 |
-| 로그 수집 | GitHub REST API + redirect log download | job 로그 텍스트 다운로드 |
-| AI 분석 | rule-based analyzer + LLM adapter | 실패 원인 설명, 수정안 생성 |
-| 코드 반영 | Git blobs / trees / commits / pulls API | 브랜치 생성, 커밋, PR 생성 |
-| 갱신 방식 | polling | 실시간 대신 주기적 새로고침 |
+### 2. 프론트의 중심: `GitActionsPage.tsx`
 
-중요한 설계 원칙은 아래와 같다.
+이 파일이 사실상 화면의 오케스트레이터다. 페이지 기능의 대부분이 여기서 시작된다.
 
-- 브라우저는 GitHub를 직접 호출하지 않는다.
-- GitHub 제어는 모두 `controlplane/api`가 수행한다.
-- 인증은 PAT가 아니라 GitHub App installation token을 쓴다.
-- AI 수정은 `main` 직접 push가 아니라 `branch -> commit -> PR` 흐름으로 처리한다.
+이 파일이 맡는 역할은 다음과 같다.
 
-## 4. 관련 파일 맵
+- API 호출 공통 함수 제공
+- run 목록, 선택된 run, jobs, logs, annotations, summary 상태 관리
+- polling 처리
+- workflow 실행, rerun, AI 제안, PR 생성 버튼 핸들러 처리
+- `PipelineGraph.tsx`, `StepTimeline.tsx`에 가공된 데이터를 넘김
 
-### 프론트엔드
-
-| 파일 | 역할 |
-| --- | --- |
-| `controlplane/web/src/App.tsx` | `/git-actions` 라우트 연결 |
-| `controlplane/web/src/pages/GitActionsPage.tsx` | 페이지 전체 상태와 액션 핸들러 |
-| `controlplane/web/src/components/pipeline/PipelineGraph.tsx` | workflow/job 단위 파이프라인 그래프 |
-| `controlplane/web/src/components/pipeline/StepTimeline.tsx` | job 내부 step 타임라인 |
-| `controlplane/web/src/lib/env.ts` | `VITE_API_BASE_URL` 해석 |
-| `controlplane/web/vite.config.ts` | 로컬 개발 시 `/api` 프록시 |
-
-### 백엔드
-
-| 파일 | 역할 |
-| --- | --- |
-| `controlplane/api/src/server.ts` | Express 앱 부팅, CORS, 라우터 연결 |
-| `controlplane/api/src/config/env.ts` | 환경변수 검증 |
-| `controlplane/api/src/routes/github.ts` | GitHub 상태, run, logs, rerun, dispatch, PR API |
-| `controlplane/api/src/routes/fix.ts` | AI 제안과 confirm(PR 생성) API |
-| `controlplane/api/src/github/app.ts` | GitHub App 인증과 installation token 발급 |
-| `controlplane/api/src/github/actions.ts` | workflow runs, jobs, logs, annotations, dispatch, rerun |
-| `controlplane/api/src/fix/summarize.ts` | run/job/step 요약 문장 생성 |
-| `controlplane/api/src/fix/suggest.ts` | 실패 로그 rule-based 분석 + LLM 분석 |
-| `controlplane/api/src/github/changes.ts` | 브랜치/커밋/PR 생성 |
-| `controlplane/api/src/llm/client.ts` | LLM 호출 어댑터 |
-
-## 5. 전체 요청 흐름
-
-```text
-Browser
-  -> GitActionsPage.tsx
-  -> controlplane/api
-       -> GitHub App auth
-       -> GitHub REST API
-       -> LLM API
-       -> Git blobs / trees / commits / pulls API
-  -> GitHub Actions / Pull Requests
-```
-
-### 페이지 최초 진입
-
-1. `loadStatus()`가 `/api/github/status` 호출
-2. `loadRuns()`가 `/api/github/runs` 호출
-3. 적절한 기본 run을 선택
-4. 선택된 run에 대해 아래를 병렬 로드
-   - `/jobs`
-   - `/summary`
-   - `/logs`
-   - `/annotations`
-
-### 사용자가 "전체 실행" 클릭
-
-1. 프론트가 `/api/github/pipeline/run-all` 호출
-2. 백엔드가 `bootstrap-terraform-state.yml`에 `workflow_dispatch`
-3. 프론트가 새 run이 생길 때까지 짧은 polling
-4. 새 run이 감지되면 자동 선택
-
-### 사용자가 "AI 도움 받기" 클릭
-
-1. 프론트가 `/api/github/fix-sessions/:runId/suggest` 호출
-2. 백엔드가 jobs + logs 조회
-3. rule-based 분류 수행
-4. 필요한 경우 LLM 호출
-5. 분석 결과와 suggested files 반환
-
-### 사용자가 "적용 (PR 생성)" 클릭
-
-1. 프론트가 `/api/github/fix-sessions/:runId/confirm` 호출
-2. 백엔드가 새 branch 생성
-3. 파일 blob/tree/commit 생성
-4. PR 생성
-5. 프론트가 `/api/github/pulls/:prNumber` 재조회
-
-## 6. 프론트엔드 구현 설명
-
-## 6-1. API 진입점과 로컬 프록시
-
-`controlplane/web/src/lib/env.ts`는 프론트가 어디로 API를 보낼지 결정한다.
+#### 핵심 코드 1: 공통 API 진입점
 
 ```ts
-const rawApiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || ''
-export const API_BASE_URL = rawApiBaseUrl.replace(/\/$/, '')
-```
-
-로컬 개발에서는 `VITE_API_BASE_URL`을 비워두고 `controlplane/web/vite.config.ts`의 프록시를 사용한다.
-
-```ts
-server: {
-  proxy: {
-    '/api': { target: 'http://localhost:4000', changeOrigin: true },
-    '/health': { target: 'http://localhost:4000', changeOrigin: true },
-  },
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.body ? { 'Content-Type': 'application/json' } : undefined),
+      ...(init?.headers || {}),
+    },
+  })
+  ...
 }
 ```
 
-즉, 프론트는 `http://localhost:5173`, API는 `http://localhost:4000`으로 띄우되 브라우저에서는 같은 origin처럼 `/api/...`를 호출한다.
+이 함수가 중요한 이유는, 페이지의 거의 모든 기능이 결국 이 함수로 서버에 들어가기 때문이다.
 
-## 6-2. 핵심 상태 설계
+- run 조회
+- logs 조회
+- rerun
+- dispatch
+- AI 제안
+- PR 생성
 
-`GitActionsPage.tsx`는 아래 상태를 중심으로 동작한다.
+즉, 프론트와 백엔드를 잇는 단일 관문이다.
 
-- `status`: GitHub App 연결 상태
-- `runs`: 최근 workflow run 목록
-- `selectedRunId`: 현재 사용자가 보고 있는 run
-- `jobs`: 선택한 run의 job/step 정보
-- `logs`: 선택한 run에서 가져온 로그 텍스트
-- `annotations`: GitHub annotations
-- `runSummary`: 사람이 읽기 쉬운 단계 요약
-- `suggestion`: AI 분석 결과
-- `prReview`: 생성된 PR 상세 정보
-- `actionMessage`: 버튼 실행 결과 메시지
-
-이 페이지가 중요한 이유는 "한 번의 선택"으로 여러 비동기 요청이 연쇄적으로 나가므로, stale response 방지가 꼭 필요하다는 점이다.
-
-## 6-3. stale response 방지
-
-이 페이지는 최신 요청만 반영하기 위해 request id ref를 쓴다.
+#### 핵심 코드 2: run 선택 시 상세 데이터를 한 번에 로드
 
 ```ts
-const latestDetailRequestIdRef = useRef(0)
-const selectedRunIdRef = useRef<number | null>(null)
+useEffect(() => {
+  if (!selectedRunId) {
+    ...
+    return
+  }
+
+  void loadRunDetail(selectedRunId)
+  void loadRunSummary(selectedRunId)
+  void loadRunLogs(selectedRunId)
+  void loadRunAnnotations(selectedRunId)
+
+  const intervalId = window.setInterval(() => {
+    void loadRunDetail(selectedRunId, true)
+    void loadRunSummary(selectedRunId)
+    void loadRunAnnotations(selectedRunId)
+  }, POLLING_INTERVAL_MS)
+
+  return () => window.clearInterval(intervalId)
+}, [selectedRunId])
 ```
 
-예를 들어 `loadRunDetail()`은 이렇게 동작한다.
+이 코드가 보여주는 구조는 명확하다.
 
-1. 호출마다 request id 증가
-2. 응답이 돌아왔을 때 request id가 최신인지 확인
-3. 그 사이 사용자가 다른 run을 선택했으면 응답 무시
+- 사용자가 run을 고른다.
+- 프론트가 jobs, summary, logs, annotations를 각각 다른 API로 병렬 조회한다.
+- 그 결과가 화면 카드와 컴포넌트로 분산 렌더링된다.
 
-이 패턴이 없으면 빠르게 run을 바꿀 때 A run의 응답이 B run 화면을 덮어쓰는 문제가 생긴다.
+즉, `GitActionsPage.tsx`는 데이터를 직접 계산하지 않고 여러 백엔드 모듈의 결과를 모아 조합한다.
 
-## 6-4. 폴링 구조
-
-초기 진입 시 전체 run 목록을 15초마다 갱신한다.
+#### 핵심 코드 3: 전체 파이프라인 실행
 
 ```ts
-const POLLING_INTERVAL_MS = 15000
+await apiFetch('/api/github/pipeline/run-all', {
+  method: 'POST',
+  body: JSON.stringify({ ref: targetBranch }),
+})
 ```
 
-선택된 run이 있으면 그 run의 상세도 같은 간격으로 갱신한다.
+이 버튼 하나가 실제로는 다음 흐름을 시작한다.
 
-- `loadRunDetail(selectedRunId, true)`
-- `loadRunSummary(selectedRunId)`
-- `loadRunAnnotations(selectedRunId)`
+`GitActionsPage.tsx` -> `routes/github.ts` -> `github/actions.ts` -> GitHub `workflow_dispatch`
 
-현재 구조는 webhook 실시간 push가 아니라 polling 기반이다. 구현 난이도는 낮지만 API 호출량은 늘어난다.
+즉, 화면 버튼이 workflow를 직접 실행하는 것이 아니라, 백엔드가 GitHub App 권한으로 대신 실행한다.
 
-## 6-5. workflow run 선택 방식
+#### 핵심 코드 4: AI 제안
 
-이 페이지는 모든 run을 그대로 나열하지 않는다. 아래 3개 workflow를 하나의 파이프라인 세션처럼 본다.
+```ts
+const payload = await apiFetch(`/api/github/fix-sessions/${selectedRunId}/suggest`, {
+  method: 'POST',
+  body: JSON.stringify({}),
+})
+setSuggestion(payload)
+```
 
-- `Bootstrap Terraform State`
-- `Terraform Dev Plan and Apply`
-- `Deploy Selected Services to ECS`
+이 코드는 AI 기능의 프론트 시작점이다. 하지만 실제 분석은 여기서 하지 않는다. 이 파일은 "어떤 run을 어떤 방식으로 분석할지"를 백엔드에 전달하고, 받은 결과를 UI에 렌더링한다.
 
-`getVisibleWorkflowRuns()`는 다음 기준으로 run을 묶는다.
+#### 핵심 코드 5: PR 생성
 
-- 같은 브랜치
-- 생성 시각 차이가 20분 이내
-- 위 3개 workflow 이름과 매칭
+```ts
+const result = await apiFetch(`/api/github/fix-sessions/${selectedRunId}/confirm`, {
+  method: 'POST',
+  body: JSON.stringify({
+    files: suggestion.suggestedFiles,
+    commitMessage: `ai fix: Terraform 수정 제안 (run #${selectedRunId})`,
+  }),
+})
+```
 
-즉, 이 페이지는 "raw GitHub run list"가 아니라 "현재 DevSecOps 파이프라인 세션"을 보여주는 화면이다.
+즉, PR 생성도 프론트가 git 작업을 하는 것이 아니라, 수정 파일 목록만 넘기고 실제 branch/commit/PR 생성은 백엔드에 위임한다.
 
-## 6-6. 공통 fetch 함수
+### 3. 화면 표시 전용 컴포넌트: `PipelineGraph.tsx`, `StepTimeline.tsx`
 
-`apiFetch()`는 이 페이지의 공용 fetch 래퍼다.
+이 두 파일은 API를 직접 호출하지 않는다. `GitActionsPage.tsx`가 모아 놓은 데이터를 "운영자가 이해하기 쉬운 UI"로 바꾸는 역할이다.
 
-이 함수가 하는 일:
+#### `PipelineGraph.tsx`
 
-- JSON 응답 자동 파싱
-- HTML이 오면 API 서버 오작동으로 간주
-- `error` 또는 `message` 필드 추출
-- non-JSON 응답 방어
+이 파일은 raw job 목록을 그대로 그리지 않는다. workflow 이름에 따라 job 구조를 재조립한다.
 
-이 로직이 필요한 이유는 API 서버가 죽었거나 프록시가 잘못 연결되면 HTML 에러 페이지가 오는 경우가 있기 때문이다.
+핵심 코드:
 
-## 6-7. 주요 사용자 액션 핸들러
+```ts
+if (/terraform dev plan and apply/i.test(workflowName)) {
+  return [
+    {
+      jobs: [findJob(jobs, /terraform plan & security scan/i) || createPlaceholderJob('terraform-plan', 'Terraform Plan & Security Scan')],
+    },
+    {
+      jobs: [findJob(jobs, /^terraform apply$/i) || createPlaceholderJob('terraform-apply', 'Terraform Apply')],
+    },
+  ]
+}
+```
 
-### 전체 실행
+이 코드의 의미는 다음과 같다.
 
-`handleExecuteworkflow()`는 `/api/github/pipeline/run-all`을 호출한다.
+- GitHub job 이름은 그대로 쓰기엔 들쑥날쑥하다.
+- 운영 화면은 "Plan", "Apply", "Deploy" 같은 단계 중심으로 보여주는 편이 이해하기 쉽다.
+- 실제 job이 아직 생성되지 않았어도 placeholder를 만들어 파이프라인 형태를 유지한다.
 
-핵심 포인트:
+즉, `PipelineGraph.tsx`는 "GitHub의 원본 데이터"를 "운영자가 읽기 쉬운 파이프라인 구조"로 번역하는 컴포넌트다.
 
-- 현재 선택된 브랜치 또는 기본 브랜치 기준 실행
-- 실행 직후 짧은 간격 polling으로 새 run 검색
-- 새 run이 감지되면 자동 선택
+#### `StepTimeline.tsx`
 
-### 재실행
+이 파일은 선택된 job의 step들을 상태 카드로 그린다.
 
-`handleRerun('all' | 'failed')`는 아래 둘 중 하나를 호출한다.
+핵심 코드:
 
-- `/api/github/runs/:runId/rerun`
-- `/api/github/runs/:runId/rerun-failed`
+```tsx
+{steps.map((step, index) => {
+  const active = activeStepNumber === step.number
+  const expandedContent = active ? renderExpandedContent?.(step) : null
+  ...
+})}
+```
 
-### AI 제안
+즉, 이 컴포넌트는 단순한 목록이 아니라:
 
-`handleSuggest()`는 run 단위 분석이고, `handleSuggestAnnotations()`는 특정 job annotation 기반 분석이다.
+- 어떤 step이 현재 선택되었는지
+- 어떤 step이 실패했는지
+- 어떤 step의 확장 로그를 아래에 열지
 
-annotation 기반 분석은 Checkov처럼 파일/라인이 있는 보안 오류에 특히 유용하다.
+를 UI 레벨에서 담당한다.
 
-### PR 생성
+### 4. Express 시작점: `server.ts`
 
-`handleApply()`는 `suggestion.suggestedFiles`를 백엔드 confirm API에 넘긴다.
+`server.ts`는 기능을 직접 수행하지는 않지만, 백엔드 구조를 결정하는 진입점이다.
 
-즉, 프론트는 코드를 직접 생성하지 않고 "AI가 제안한 파일 묶음"을 서버에 전달만 한다.
-
-## 6-8. 로그/annotation 표시 방식
-
-이 페이지의 로그 UI는 단순 `<pre>`가 아니다.
-
-### `LogViewer`
-
-- 로그를 줄 단위로 분리
-- 타임스탬프 파싱
-- `##[error]`, `##[warning]`, `##[group]` 같은 GitHub Actions marker 해석
-- indentation 수준 계산
-- 에러/경고/커맨드 색상 구분
-
-### `buildAnnotationListItems()`
-
-이 함수는 두 소스를 합친다.
-
-1. GitHub annotation API에서 받은 구조화된 에러
-2. 로그 텍스트에서 추출한 terminal error
-
-즉, annotation이 없는 실패라도 최소한 "exit code 1" 같은 terminal error를 UI에 노출한다.
-
-## 6-9. 파이프라인 시각화
-
-### `PipelineGraph.tsx`
-
-이 컴포넌트는 workflow 종류별로 job 구성을 다르게 보여준다.
-
-- bootstrap workflow면 버킷 준비 단계 1개
-- terraform workflow면 plan/apply 2단계
-- deploy workflow면 resolve target + deploy matrix
-
-실제 job이 아직 없으면 placeholder를 보여준다. 그래서 페이지가 로딩 중이어도 전체 모양은 유지된다.
-
-### `StepTimeline.tsx`
-
-이 컴포넌트는 step별 상태를 아이콘과 요약으로 보여준다.
-
-- 실행 중: 파란색
-- 성공: 초록색
-- 실패: 빨간색
-- 건너뜀: 회색
-
-## 7. 백엔드 구현 설명
-
-## 7-1. 서버 부팅과 라우터 구성
-
-`controlplane/api/src/server.ts`는 Express 앱을 띄우고 다음 라우터를 붙인다.
-
-- `healthRouter`
-- `metricsRouter`
-- `githubRouter`
-- `fixRouter`
-- `policyRouter`
-
-핵심은 `githubRouter`와 `fixRouter`다.
+핵심 코드:
 
 ```ts
 app.use(githubRouter)
 app.use(fixRouter)
 ```
 
-또한 CORS origin은 `FRONTEND_ORIGIN`으로 고정한다. 따라서 로컬에서 프론트를 5173으로 띄우면 API도 같은 origin 설정을 맞춰야 한다.
+의미는 단순하다.
 
-## 7-2. 환경변수
+- GitHub 조회/제어 계열 기능은 `githubRouter`
+- AI 제안과 PR 생성은 `fixRouter`
 
-필수값은 `controlplane/api/src/config/env.ts`에서 검증한다.
+로 분리되어 있다.
 
-### 최소 필수
+이 분리가 중요한 이유는, 페이지 기능이 커져도 HTTP 진입점과 실제 서비스 로직을 섞지 않게 해 주기 때문이다.
 
-```env
-PORT=4000
-FRONTEND_ORIGIN=http://localhost:5173
-GITHUB_OWNER=young-ee30
-GITHUB_REPO=aws-security-project
-GITHUB_APP_ID=1234567
-GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----...
+### 5. HTTP 계약 층: `routes/github.ts`
+
+이 파일은 브라우저가 호출하는 API 명세를 담당한다. 이 파일 자체는 로직을 길게 갖지 않고, 대부분의 요청을 서비스 함수로 넘긴다.
+
+핵심 코드:
+
+```ts
+githubRouter.get('/api/github/runs/:runId/logs', async (req, res, next) => {
+  const logs = await getWorkflowRunLogs(runId, jobId)
+  res.json(logs)
+})
 ```
 
-### 선택
+이 구조의 장점은 명확하다.
 
-```env
-GITHUB_WEBHOOK_SECRET=
-LLM_API_KEY=
-LLM_MODEL=
-METRICS_SOURCE_URL=
+- 프론트엔드는 `/api/github/...`라는 일정한 URL만 알면 된다.
+- 실제 GitHub 호출 방식이 바뀌어도 프론트는 안 바뀔 수 있다.
+- route 파일은 request validation과 response formatting만 맡는다.
+
+이 파일이 연결하는 대표 기능은 다음과 같다.
+
+- `/status`
+- `/runs`
+- `/runs/:runId/jobs`
+- `/runs/:runId/logs`
+- `/runs/:runId/annotations`
+- `/runs/:runId/summary`
+- `/pipeline/run-all`
+- `/runs/:runId/rerun`
+- `/pulls/:prNumber`
+- `/pulls/:prNumber/merge`
+- `/pulls/:prNumber/close`
+
+즉, `routes/github.ts`는 "브라우저가 부르는 GitHub 관련 API의 관문"이다.
+
+### 6. AI/PR용 HTTP 계약 층: `routes/fix.ts`
+
+이 파일은 GitHub Actions 페이지의 AI 기능과 PR 생성 기능을 위해 따로 존재한다.
+
+핵심 코드:
+
+```ts
+fixRouter.post('/api/github/fix-sessions/:runId/suggest', async (req, res, next) => {
+  const suggestion = await generateFixSuggestion(runId, { ... })
+  res.json(suggestion)
+})
+
+fixRouter.post('/api/github/fix-sessions/:runId/confirm', async (req, res, next) => {
+  const result = await createPullRequestFromFiles({ ... })
+  res.json(result)
+})
 ```
 
-## 7-3. GitHub App 인증
+여기서 중요한 점은 역할 분리다.
 
-`controlplane/api/src/github/app.ts`는 아래를 처리한다.
+- `suggest`는 분석과 제안 생성
+- `confirm`은 실제 Git 변경과 PR 생성
 
-1. private key 정규화
-2. GitHub App 인스턴스 생성
-3. 저장소 installation 조회
-4. installation octokit 생성
-5. installation token 발급
+즉, "생각하는 단계"와 "반영하는 단계"를 분리해 두었다.
 
-핵심 함수는 아래 4개다.
+### 7. GitHub 인증 층: `github/app.ts`
 
-- `getRepositoryMetadata()`
-- `getInstallationForRepository()`
-- `getRepoOctokit()`
-- `getInstallationToken()`
+이 파일은 모든 GitHub API 호출의 출발점이다. `github/actions.ts`나 `github/changes.ts`는 직접 토큰을 만들지 않고, 이 파일을 통해 인증된 Octokit을 얻는다.
 
-특히 `normalizePrivateKey()`는 다음 두 입력을 모두 지원한다.
+핵심 코드:
 
-- PEM 문자열 자체
-- `.pem` 파일 절대경로
-
-이 설계 덕분에 로컬 개발과 서버 배포 둘 다 대응할 수 있다.
-
-## 7-4. GitHub 관련 REST API
-
-`controlplane/api/src/routes/github.ts`는 프론트가 쓰는 API 계약을 제공한다.
-
-### 상태/조회
-
-| Method | Endpoint | 설명 |
-| --- | --- | --- |
-| `GET` | `/api/github/status` | 저장소와 App 연결 상태 |
-| `GET` | `/api/github/runs` | 최근 run 목록 |
-| `GET` | `/api/github/runs/:runId/jobs` | job/step 목록 |
-| `GET` | `/api/github/runs/:runId/logs` | 선택 run 로그 |
-| `GET` | `/api/github/runs/:runId/annotations` | annotation 목록 |
-| `GET` | `/api/github/runs/:runId/summary` | 사람이 읽기 쉬운 요약 |
-
-### 제어
-
-| Method | Endpoint | 설명 |
-| --- | --- | --- |
-| `POST` | `/api/github/runs/:runId/rerun` | 전체 run 재실행 |
-| `POST` | `/api/github/runs/:runId/rerun-failed` | 실패 job만 재실행 |
-| `POST` | `/api/github/pipeline/run-all` | bootstrap workflow부터 전체 체인 실행 |
-| `POST` | `/api/github/workflows/:workflowId/dispatch` | 특정 workflow dispatch |
-
-### PR 후처리
-
-| Method | Endpoint | 설명 |
-| --- | --- | --- |
-| `GET` | `/api/github/pulls/:prNumber` | PR 상세 조회 |
-| `POST` | `/api/github/pulls/:prNumber/merge` | squash merge |
-| `PATCH` | `/api/github/pulls/:prNumber/close` | PR 닫기 |
-
-## 7-5. workflow run / jobs / logs 수집
-
-이 로직은 `controlplane/api/src/github/actions.ts`에 있다.
-
-### run 목록
-
-`listWorkflowRuns()`는 GitHub REST API `GET /repos/{owner}/{repo}/actions/runs`를 호출해 프론트가 쓰기 쉬운 형태로 정규화한다.
-
-### job 목록
-
-`getWorkflowRunJobs()`는 `GET /actions/runs/{run_id}/jobs`를 호출하고, 각 job에서 `steps[]`까지 꺼낸다.
-
-### 로그 다운로드
-
-여기가 중요한 구현 포인트다.
-
-GitHub job log API는 바로 텍스트를 주지 않고 redirect URL을 준다. 그래서 `fetchJobLogText()`는 2단계로 동작한다.
-
-1. `GET /actions/jobs/{jobId}/logs` with `redirect: 'manual'`
-2. 응답 헤더의 `location`으로 실제 텍스트 다운로드
-
-즉, Octokit 한 번으로 끝나는 구조가 아니라 fetch 기반 수동 redirect 처리다.
-
-### 어떤 job 로그를 가져오나
-
-`getWorkflowRunLogs()`는 모든 job 로그를 다 가져오지 않는다. 우선순위는 아래다.
-
-1. 실패한 job
-2. 실패한 job이 없으면 진행 중 job 최대 3개
-3. 그것도 없으면 앞쪽 job 최대 3개
-
-이 방식은 비용과 응답 시간을 줄이는 대신 "run 전체 raw archive"가 아니라 "지금 중요한 로그"에 집중한다.
-
-## 7-6. annotations
-
-`getWorkflowRunAnnotations()`는 각 job의 `checkRunId`를 추출한 뒤 GitHub check-run annotation API를 호출한다.
-
-구조화된 데이터에는 아래가 포함된다.
-
-- `path`
-- `startLine`, `endLine`
-- `annotationLevel`
-- `message`
-- `title`
-- `rawDetails`
-- `blobHref`
-
-현재 코드에는 `parseCheckovAnnotationsFromLog()` 함수가 정의돼 있지만 실제 fallback 경로로 연결되지는 않았다. 즉, annotation fallback을 더 강화하려면 이 함수를 `getWorkflowRunAnnotations()`에 연결하면 된다.
-
-## 7-7. 사람이 읽기 쉬운 요약
-
-`controlplane/api/src/fix/summarize.ts`는 job/step 이름을 규칙 기반으로 읽어서 자연어 요약을 만든다.
-
-예를 들면:
-
-- `Terraform Plan & Security Scan` -> "인프라 변경 계획"
-- `Checkov` -> "IaC 보안 스캔"
-- `Terraform Apply` -> "실제 적용"
-
-이 요약은 프론트에서 `StepTimeline`과 run summary badge에 사용된다.
-
-## 8. AI 연동 설명
-
-## 8-1. AI 엔드포인트
-
-`controlplane/api/src/routes/fix.ts`는 두 API를 제공한다.
-
-| Method | Endpoint | 설명 |
-| --- | --- | --- |
-| `POST` | `/api/github/fix-sessions/:runId/suggest` | 실패 분석과 수정안 생성 |
-| `POST` | `/api/github/fix-sessions/:runId/confirm` | suggested files를 PR로 반영 |
-
-## 8-2. suggest 전체 흐름
-
-핵심 함수는 `generateFixSuggestion()`이다.
-
-동작 순서는 다음과 같다.
-
-1. `runId` 숫자 검증
-2. jobs 조회
-3. logs 조회
-4. ANSI 제거와 줄바꿈 정규화
-5. annotation 기반인지 일반 로그 기반인지 판단
-6. rule-based 분류
-7. candidate file 추천
-8. 필요하면 Terraform 코드 일부를 추가 컨텍스트로 수집
-9. LLM 호출
-10. 코드 블록에서 suggested files 추출
-
-## 8-3. rule-based 분석
-
-현재 코드에 들어있는 대표 규칙:
-
-- `terraform-resource-already-managed`
-- `terraform-secret-missing`
-- `terraform-state-bucket-missing`
-- `aws-role-assume-failed`
-- `workflow-yaml-invalid`
-- `checkov-annotations`
-- `generic-failed-run`
-
-즉, LLM 없이도 아래 정보는 만들 수 있다.
-
-- summary
-- rootCause
-- riskLevel
-- nextActions
-- candidateFiles
-
-이 구조 덕분에 LLM이 실패해도 페이지는 완전히 망가지지 않는다.
-
-## 8-4. LLM 호출
-
-LLM 호출 코드는 `controlplane/api/src/llm/client.ts`와 `controlplane/api/src/fix/suggest.ts`에 있다.
-
-현재 구현의 실제 동작은 다음과 같다.
-
-- provider는 사실상 `gemini`만 지원
-- Google Generative Language API `generateContent` 호출
-- system prompt + user prompt 조합
-
-중요한 현재 상태:
-
-- `.env.example`에는 `LLM_MODEL=gpt-5.4-mini`라고 되어 있음
-- 하지만 실제 `llm/client.ts`는 Gemini API만 호출함
-
-즉, 현재 코드는 "LLM 변수 이름은 범용처럼 보이지만 실제 구현은 Gemini 전용"이다.
-
-이 부분은 구현 설명 시 반드시 짚어야 한다.
-
-### 발표용 설명
-
-"지금 구조는 LLM provider abstraction을 의도했지만, 현재 adapter 구현은 Gemini 하나만 연결된 상태다. OpenAI를 붙이려면 `callConfiguredLlm()`에 provider 분기를 추가하면 된다."
-
-## 8-5. 프롬프트 구조
-
-`callLlmAnalysis()`는 아래 정보를 prompt에 넣는다.
-
-- rule-based 사전 분석 결과
-- annotation 요약
-- 잘린 실패 로그
-- 관련 Terraform 코드 일부
-
-즉, LLM에게 완전 무지 상태에서 로그를 던지는 것이 아니라, 서버가 1차 구조화를 먼저 한 뒤 컨텍스트를 보강해서 보내는 구조다.
-
-## 8-6. suggested files 파싱
-
-LLM 응답 전체는 `llmAnalysis`로 저장한다. 그리고 `parseSuggestedFiles()`가 코드 블록을 다시 파싱해서 실제 파일 반영용 구조로 바꾼다.
-
-기대 형식:
-
-````text
-#### terraform/modules/ecs/main.tf
-```hcl
-# 전체 수정 코드
-```
-````
-
-파싱 조건:
-
-- 파일 경로가 있어야 함
-- 코드 블록이 너무 짧지 않아야 함
-- `.tf` 또는 `.tfvars` 위주로 추출
-
-즉, "설명 텍스트"와 "실제 반영 가능한 파일"은 별도 개념이다.
-
-## 8-7. suggest API 응답에서 꼭 보는 필드
-
-프론트가 실제로 중요하게 쓰는 응답 필드는 아래다.
-
-```json
-{
-  "ok": true,
-  "runId": "123456789",
-  "mode": "hybrid",
-  "llmStatus": "success",
-  "summary": "Terraform apply 전에 orphan import 단계에서 충돌이 발생했습니다.",
-  "rootCause": "이미 state에 있는 리소스를 다시 import하려고 했습니다.",
-  "riskLevel": "medium",
-  "nextActions": [
-    "terraform state show 체크 추가",
-    "already managed 에러를 skip 처리"
-  ],
-  "candidateFiles": [
-    {
-      "path": ".github/workflows/terraform-dev-plan-apply.yml",
-      "reason": "import 보정 로직이 들어 있습니다."
-    }
-  ],
-  "llmAnalysis": "긴 자연어 분석 결과",
-  "suggestedFiles": [
-    {
-      "path": "terraform/modules/ecs/main.tf",
-      "content": "전체 파일 내용"
-    }
-  ]
+```ts
+export async function getRepoOctokit() {
+  const installation = await getInstallationForRepository()
+  return githubApp.getInstallationOctokit(installation.id)
 }
 ```
 
-UI 기준으로 보면:
+이 파일의 역할은 다음과 같다.
 
-- `summary`, `rootCause`, `riskLevel`은 사람이 읽는 설명
-- `candidateFiles`는 어디를 봐야 하는지 알려주는 힌트
-- `suggestedFiles`는 PR 생성에 바로 쓰는 실제 파일 데이터
+- private key 정규화
+- GitHub App 인스턴스 초기화
+- repository installation 조회
+- installation token 기반 Octokit 생성
 
-## 9. PR 생성 설명
+즉, 이 파일은 나머지 백엔드 모듈이 "안전하게 GitHub를 호출할 수 있게 해 주는 인증 공장"이다.
 
-`controlplane/api/src/github/changes.ts`가 PR 생성을 담당한다.
+### 8. GitHub Actions 어댑터: `github/actions.ts`
 
-## 9-1. 동작 순서
+이 파일은 GitHub API 호출을 실제로 수행하는 핵심 어댑터다. `routes/github.ts`가 이 파일에 거의 전적으로 의존한다.
 
-1. base branch 조회
-2. 새 branch 이름 예약
-3. 각 파일을 Git blob으로 생성
-4. 새 tree 생성
-5. 새 commit 생성
-6. branch ref 업데이트
-7. PR 생성
+이 파일의 역할은 크게 세 묶음이다.
 
-이 방식은 로컬에서 `git clone`을 하지 않고 GitHub Git Data API만으로 커밋을 만든다.
+- 조회
+  run 목록, jobs, logs, annotations, PR 상세
+- 제어
+  rerun, rerun-failed, workflow dispatch
+- 보조
+  repository file content 조회
 
-## 9-2. 핵심 함수
+#### 핵심 코드 1: run 목록 조회
 
-- `reserveBranchName()`
-- `buildTreeEntries()`
-- `createPullRequestFromFiles()`
-
-장점:
-
-- 서버 파일시스템에 repo clone이 필요 없다.
-- 구현이 단순하다.
-- 사용자 승인 후 바로 PR 생성이 가능하다.
-
-주의점:
-
-- suggestedFiles 내용이 "전체 파일 내용"이어야 한다.
-- patch가 아니라 whole-file replacement 방식이다.
-
-## 9-3. confirm API 요청 예시
-
-```json
-{
-  "files": [
-    {
-      "path": "terraform/modules/ecs/main.tf",
-      "content": "전체 파일 내용"
-    }
-  ],
-  "commitMessage": "ai fix: Terraform 수정 제안 (run #123456789)",
-  "prTitle": "AI Fix: run #123456789 에러 수정",
-  "prBody": "GitHub Actions run #123456789 실패에 대한 AI 분석 기반 Terraform 코드 수정입니다."
+```ts
+export async function listWorkflowRuns(limit = 20) {
+  const octokit = await getRepoOctokit()
+  const response = await octokit.request('GET /repos/{owner}/{repo}/actions/runs', {
+    owner: env.githubOwner,
+    repo: env.githubRepo,
+    per_page: limit,
+  })
+  ...
 }
 ```
 
-이 요청이 들어오면 백엔드는 브랜치 생성부터 PR 생성까지 모두 처리한다.
+즉, 프론트가 보는 run 목록은 결국 이 함수가 GitHub REST API에서 가져온 결과다.
 
-## 10. 로컬에서 실행하는 방법
+#### 핵심 코드 2: 로그 다운로드
 
-## 10-1. API 서버
+```ts
+const redirectResponse = await fetch(
+  `https://api.github.com/repos/${env.githubOwner}/${env.githubRepo}/actions/jobs/${jobId}/logs`,
+  { method: 'GET', redirect: 'manual', headers: { Authorization: `Bearer ${token}` } },
+)
 
-```bash
-cd controlplane/api
-npm install
-npm run dev
+if (redirectResponse.status >= 300 && redirectResponse.status < 400) {
+  const location = redirectResponse.headers.get('location')
+  ...
+  const downloadResponse = await fetch(location)
+  return downloadResponse.text()
+}
 ```
 
-기본 포트는 `4000`이다.
+이 코드가 중요한 이유는 GitHub job logs API가 로그 본문을 바로 주지 않고 redirect URL을 줄 수 있기 때문이다. 따라서 `actions.ts`는 단순 REST 호출을 넘어서 "로그 다운로드 프로토콜"까지 감싸고 있다.
 
-## 10-2. 웹 서버
+#### 핵심 코드 3: 어떤 로그를 보여줄지 선택
 
-```bash
-cd controlplane/web
-npm install
-npm run dev
+```ts
+const selectedJobs = requestedJobId
+  ? jobs.filter((job) => job.id === requestedJobId)
+  : jobs.filter(
+      (job) =>
+        job.status === 'completed' &&
+        formatConclusion(job.conclusion) !== 'success' &&
+        formatConclusion(job.conclusion) !== 'skipped',
+    )
 ```
 
-기본 포트는 `5173`이다.
+이 코드의 의미는 다음과 같다.
 
-브라우저에서 열 주소:
+- 사용자가 특정 job을 골랐다면 그 job 로그만 보여준다.
+- 그렇지 않으면 실패한 job 로그를 우선으로 가져온다.
+- 실패 로그가 없으면 진행 중 job이나 앞쪽 job을 보여준다.
 
-- 앱: `http://localhost:5173`
-- 페이지: `http://localhost:5173/git-actions`
+즉, `actions.ts`는 단순히 "로그를 가져오는 모듈"이 아니라, 운영 화면에 어떤 로그가 가장 유용한지도 같이 결정한다.
 
-## 10-3. 필요한 환경변수
+#### 핵심 코드 4: 전체 파이프라인 실행
 
-### `controlplane/api/.env`
-
-```env
-PORT=4000
-FRONTEND_ORIGIN=http://localhost:5173
-GITHUB_OWNER=your-owner
-GITHUB_REPO=aws-security-project
-GITHUB_APP_ID=1234567
-GITHUB_APP_PRIVATE_KEY=C:\absolute\path\to\app.pem
-GITHUB_WEBHOOK_SECRET=optional
-LLM_API_KEY=optional
-LLM_MODEL=gemini-2.5-flash-lite
+```ts
+export async function dispatchFullPipeline(ref?: string) {
+  const result = await dispatchWorkflow(FULL_PIPELINE_ENTRY_WORKFLOW, ref, FULL_PIPELINE_DEFAULT_INPUTS)
+  return {
+    ok: true,
+    workflowId: result.workflowId,
+    ref: result.ref,
+    message: 'Requested full GitHub Actions pipeline from Bootstrap Terraform State',
+  }
+}
 ```
 
-### `controlplane/web/.env`
+즉, 화면에서 "전체 실행" 버튼을 누르면 사실상 이 함수가 `bootstrap-terraform-state.yml` workflow_dispatch를 날리는 구조다.
 
-```env
-VITE_API_BASE_URL=
-VITE_METRICS_URL=
+### 9. 요약 생성 모듈: `fix/summarize.ts`
+
+이 파일은 LLM을 쓰지 않고, job과 step 정보를 사람이 읽기 쉬운 문장으로 바꾼다.
+
+핵심 코드:
+
+```ts
+export async function generateRunSummary(runId: number): Promise<RunSummaryResponse> {
+  const jobs = await getWorkflowRunJobs(runId)
+  ...
+  return {
+    runId,
+    jobs: jobSummaries,
+    overallSummary: buildOverallSummary(jobs),
+    currentPhase: determineCurrentPhase(jobs),
+  }
+}
 ```
 
-로컬에서는 `VITE_API_BASE_URL`을 비워두는 편이 간단하다.
+이 모듈이 필요한 이유는, 운영자는 raw GitHub step 이름만 보는 것보다 "현재 Terraform Apply 중", "Checkov 단계 실패" 같은 요약을 보는 편이 훨씬 빠르게 상황을 이해할 수 있기 때문이다.
 
-## 11. 구현/발표 시 핵심 설명 포인트
+즉, `summarize.ts`는 GitHub 원본 데이터를 운영자 친화적 문장으로 바꾸는 번역기다.
 
-아래 6가지만 정확히 설명할 수 있으면 이 페이지 구조를 거의 다 이해한 것이다.
+### 10. AI 분석 엔진: `fix/suggest.ts`
 
-1. 프론트는 GitHub를 직접 치지 않고 Express API만 호출한다.
-2. 백엔드는 GitHub App installation token으로 Actions/PR/Contents API를 호출한다.
-3. 로그 조회는 redirect URL을 따라가야 해서 일반 JSON API와 다르다.
-4. 실패 분석은 rule-based가 1차, LLM이 2차다.
-5. AI 수정은 바로 적용하지 않고 PR 생성으로 끝낸다.
-6. 실시간 반영은 webhook이 아니라 polling 중심이다.
+이 파일은 Git Actions 페이지의 AI 기능 핵심이다. 하지만 이 파일은 LLM만 호출하지 않는다. 먼저 로그를 분석하고, 후보 파일을 찾고, 필요한 Terraform 코드까지 가져온 뒤, 마지막에 LLM에게 보강 분석을 요청한다.
 
-## 12. 바로 개선할 수 있는 지점
+이 파일의 내부 흐름은 다음과 같다.
 
-### 1. OpenAI/GPT 정식 지원
+```text
+runId 입력
+  -> jobs 조회
+  -> logs 조회
+  -> annotation 정규화
+  -> rule-based 실패 유형 분류
+  -> candidateFiles 추출
+  -> 관련 Terraform 파일 내용 조회
+  -> LLM 분석 요청
+  -> llmAnalysis + suggestedFiles 반환
+```
 
-현재는 env 이름이 범용적이지만 실제 구현은 Gemini 전용이다. `llm/client.ts`에 provider 분기를 추가하면 OpenAI도 바로 붙일 수 있다.
+#### 핵심 코드 1: GitHub 데이터 수집
 
-### 2. annotation fallback 연결
+```ts
+const [jobsResult, logsResult] = await Promise.allSettled([
+  getWorkflowRunJobs(parsedRunId),
+  selectedStepLog ? Promise.resolve(fallbackLogsResponse) : getWorkflowRunLogs(parsedRunId, options?.jobId),
+])
+```
 
-`parseCheckovAnnotationsFromLog()`를 `getWorkflowRunAnnotations()`에 연결하면 check-run annotation이 없는 경우에도 파일/라인 정보를 더 많이 복구할 수 있다.
+즉, 이 모듈은 혼자 판단하지 않고, 먼저 `github/actions.ts`의 결과를 가져다 쓴다.
 
-### 3. webhook 기반 실시간 갱신
+#### 핵심 코드 2: 후보 Terraform 코드까지 읽어 온다
 
-지금은 polling만 쓰므로 지연과 호출량이 있다. GitHub webhook + 서버 push 또는 재조회 트리거를 붙이면 개선된다.
+```ts
+async function fetchTerraformContext(candidateFiles: CandidateFile[]): Promise<string> {
+  const tfFiles = candidateFiles
+    .filter((f) => f.path.endsWith('.tf') || f.path.endsWith('.tfvars'))
+    .slice(0, 3)
 
-### 4. patch 기반 PR 생성
+  const contents = await Promise.all(
+    tfFiles.map(async (f) => {
+      const content = await getFileContent(f.path)
+      ...
+    }),
+  )
+}
+```
 
-지금은 whole-file replacement다. diff patch 기반으로 바꾸면 더 안전해진다.
+이 부분이 중요한 이유는, AI가 로그만 보고 막연히 답하지 않게 하기 위해서다. 실제 관련 Terraform 코드 일부를 같이 보내야 더 현실적인 수정안을 만들 수 있다.
 
-### 5. workflow별 프롬프트 분리
+즉, `suggest.ts`는 `actions.ts`의 `getFileContent()`와도 연결되어 있다.
 
-Terraform 실패, Docker 실패, GitHub Actions YAML 실패는 프롬프트를 따로 두는 편이 분석 품질이 좋다.
+#### 핵심 코드 3: 최종 AI 제안 생성
 
-## 13. 현재 한계와 주의사항
+```ts
+const llmResult = await callLlmAnalysis(joinedLogText, ruleMessage, annotationSummaryText, stepContext, terraformContext)
+llmAnalysis = llmResult.analysis || undefined
+suggestedFiles = llmResult.suggestedFiles.length > 0 ? llmResult.suggestedFiles : undefined
+```
 
-- 이 페이지는 현재 3개 workflow 체인에 최적화되어 있다.
-- 모든 job 로그를 다 가져오지 않는다.
-- LLM suggested files가 파일 경로를 제대로 주지 않으면 PR 생성이 안 된다.
-- PR 생성은 whole-file replacement라 부분 수정에 비해 거칠 수 있다.
-- `.env.example`의 LLM 값과 실제 구현 provider가 완전히 일치하지 않는다.
+이 단계에서 반환되는 값이 실제로 프론트에 보이는 핵심 결과다.
 
-## 14. 함께 읽으면 좋은 문서
+- 원인 요약
+- 위험도
+- 다음 조치
+- 후보 파일
+- 수정된 파일 내용 제안
 
-- `docs/README.md`
-- `docs/github-actions-flow.md`
-- `docs/dashboard-local-to-aws-guide.md`
-- `docs/controlplane-api-aws-deploy-checklist.md`
+즉, 이 파일은 "GitHub 데이터"를 "수정 제안"으로 바꾸는 중심 모듈이다.
+
+### 11. LLM 전송 레이어: `llm/client.ts`
+
+이 파일은 AI 분석의 중심 로직이 아니라, `suggest.ts`가 준비한 프롬프트를 Gemini API로 보내는 전송 계층이다.
+
+핵심 코드:
+
+```ts
+export async function callConfiguredLlm(input: LlmRequest): Promise<LlmResponse | null> {
+  if (!env.llmApiKey) {
+    return null
+  }
+
+  return callGemini(input)
+}
+```
+
+즉, `client.ts`는 "무엇을 분석할지"를 결정하지 않고 "준비된 입력을 어떻게 Gemini에 보낼지"만 담당한다.
+
+이 파일이 분리되어 있는 이유는 다음과 같다.
+
+- `suggest.ts`의 비즈니스 로직과 LLM 통신 로직을 분리하기 위해
+- provider 교체 가능성을 남기기 위해
+- API 키를 프론트에 노출하지 않기 위해
+
+### 12. PR 생성 엔진: `github/changes.ts`
+
+이 파일은 Git Actions 페이지의 "Apply" 버튼 뒤에서 실제 Git 변경을 만든다. 중요한 점은 로컬에서 `git clone`을 하지 않는다는 것이다. 대신 GitHub Git Data API를 직접 사용한다.
+
+핵심 코드:
+
+```ts
+const { branchName, baseCommitSha } = await reserveBranchName(baseBranch, input.branchName || `ai-fix/run-${input.runId}`)
+const tree = await buildTreeEntries(input.files)
+const newTree = await octokit.request('POST /repos/{owner}/{repo}/git/trees', { ... })
+const commit = await octokit.request('POST /repos/{owner}/{repo}/git/commits', { ... })
+await octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', { ... })
+const pullRequest = await octokit.request('POST /repos/{owner}/{repo}/pulls', { ... })
+```
+
+이 코드가 보여주는 구조는 다음과 같다.
+
+1. base branch 기준 새 branch 생성
+2. AI가 제안한 파일들을 blob/tree로 변환
+3. commit 생성
+4. branch ref 업데이트
+5. PR 생성
+
+즉, `changes.ts`는 "AI가 만든 수정안"을 "실제 GitHub PR"로 바꾸는 마지막 엔진이다.
+
+### 13. 배포 workflow와의 연결: `.github/workflows/ex-ecs-deploy.yml`
+
+Git Actions 페이지는 이 workflow를 직접 수정하지는 않지만, run 목록과 job/step 화면에서 이 workflow를 주요 파이프라인 일부로 보여준다.
+
+이 workflow가 중요한 이유는:
+
+- Git Actions 페이지가 모니터링하는 대표 workflow 3개 중 하나이기 때문이다.
+- `PipelineGraph.tsx`가 deploy workflow를 별도 모양으로 그리기 때문이다.
+- 전체 파이프라인 설명에서 배포 단계가 실제 어디서 수행되는지 보여 주기 때문이다.
+
+핵심 코드:
+
+```yaml
+jobs:
+  resolve-targets:
+    name: Resolve Deployment Targets
+  deploy-selected:
+    strategy:
+      matrix: ${{ fromJson(needs.resolve-targets.outputs.matrix) }}
+```
+
+즉, 이 workflow는:
+
+- 먼저 어떤 서비스를 배포할지 결정하고
+- 그 결과를 matrix로 만들고
+- 서비스별 배포 job을 병렬 실행한다.
+
+### 14. 실제 ECS 배포 엔진: `.github/actions/deploy-ecs-service/action.yml`
+
+이 파일은 페이지를 구성하는 UI 파일은 아니지만, deploy workflow가 실제로 어떤 일을 하는지 설명할 때 반드시 필요하다.
+
+핵심 코드:
+
+```yaml
+- name: Build and tag Docker image
+  run: |
+    docker build ...
+
+- name: Push image to Amazon ECR
+  run: |
+    docker push ...
+
+- name: Deploy Amazon ECS task definition
+  uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+```
+
+이 action의 역할은 다음과 같다.
+
+- AWS 자격 증명 설정
+- ECR 로그인
+- Docker 이미지 build / push
+- Trivy 스캔
+- ECS task definition 갱신
+- ECS 서비스 배포
+
+즉, `.github/workflows/ex-ecs-deploy.yml`이 "배포 대상을 결정하는 오케스트레이터"라면, `.github/actions/deploy-ecs-service/action.yml`은 "서비스 1개를 실제로 배포하는 실행 엔진"이다.
+
+## 발표할 때 설명 순서
+
+이 페이지를 설명할 때는 파일 단위보다 연결 구조로 설명하는 편이 좋다.
+
+1. `App.tsx`가 `/git-actions`를 `GitActionsPage.tsx`에 연결한다.
+2. `GitActionsPage.tsx`가 화면의 컨트롤러로서 모든 API 호출과 상태를 관리한다.
+3. `server.ts`가 `githubRouter`, `fixRouter`를 붙여 브라우저 요청을 받는다.
+4. `routes/github.ts`는 조회/실행 계열 API를, `routes/fix.ts`는 AI 제안/PR 생성 API를 처리한다.
+5. `github/app.ts`가 GitHub App 인증을 담당하고, 그 위에서 `github/actions.ts`와 `github/changes.ts`가 실제 GitHub API를 호출한다.
+6. `fix/suggest.ts`는 logs와 annotations를 바탕으로 분석하고, 필요하면 `llm/client.ts`를 통해 Gemini를 호출한다.
+7. 최종적으로 `github/changes.ts`가 branch, commit, PR을 만들어 수정안을 GitHub에 반영한다.
+
+짧게 한 문장으로 정리하면 다음과 같다.
+
+> Git Actions 페이지는 `GitActionsPage.tsx`가 여러 백엔드 모듈을 조합해 GitHub Actions 관제, AI 분석, PR 생성을 한 화면에서 수행하도록 만든 운영 대시보드다.

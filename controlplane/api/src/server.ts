@@ -8,20 +8,36 @@ import { metricsRouter } from './routes/metrics.js'
 import { policyRouter } from './routes/policy.js'
 
 const app = express()
+const normalizedBasePath = normalizeBasePath(env.apiBasePath)
+const allowedOrigins = env.frontendOrigin
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+const allowAnyOrigin = allowedOrigins.includes('*')
 
 app.use(
   cors({
-    origin: env.frontendOrigin,
-    credentials: true,
+    origin(origin, callback) {
+      if (!origin || allowAnyOrigin || allowedOrigins.includes(origin)) {
+        callback(null, true)
+        return
+      }
+
+      callback(new Error(`Origin not allowed by CORS: ${origin}`))
+    },
+    credentials: !allowAnyOrigin,
   }),
 )
 app.use(express.json({ limit: '20mb' }))
 
 app.use(healthRouter)
-app.use(metricsRouter)
-app.use(githubRouter)
-app.use(fixRouter)
-app.use(policyRouter)
+mountWithOptionalBasePath(metricsRouter)
+mountWithOptionalBasePath(githubRouter)
+mountWithOptionalBasePath(fixRouter)
+mountWithOptionalBasePath(policyRouter)
+if (normalizedBasePath !== '/') {
+  app.use(normalizedBasePath, healthRouter)
+}
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const message = err instanceof Error ? err.message : 'Unexpected server error'
@@ -36,3 +52,21 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 app.listen(env.port, () => {
   console.log(`controlplane-api listening on http://localhost:${env.port}`)
 })
+
+function normalizeBasePath(rawPath?: string) {
+  const trimmed = rawPath?.trim()
+  if (!trimmed || trimmed === '/') {
+    return '/'
+  }
+
+  return `/${trimmed.replace(/^\/+|\/+$/g, '')}`
+}
+
+function mountWithOptionalBasePath(router: express.Router) {
+  if (normalizedBasePath === '/') {
+    app.use(router)
+    return
+  }
+
+  app.use(normalizedBasePath, router)
+}

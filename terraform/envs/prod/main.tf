@@ -1,6 +1,10 @@
 data "aws_caller_identity" "current" {}
 
 locals {
+  service_secret_arns = distinct(flatten([
+    for _, svc in var.services : values(try(svc.secrets, {}))
+  ]))
+
   alb_services = {
     for name, svc in var.services : name => {
       priority      = svc.priority
@@ -27,6 +31,7 @@ locals {
       desired_count  = svc.desired_count
       image          = svc.image
       environment    = svc.environment
+      secrets        = try(svc.secrets, {})
       command        = try(svc.command, null)
     }
   }
@@ -58,13 +63,14 @@ module "bastion" {
 }
 
 module "security" {
-  source                     = "../../modules/security"
-  name_prefix                = var.name_prefix
-  vpc_id                     = module.network.vpc_id
-  app_ports                  = distinct([for _, svc in var.services : svc.container_port])
-  reviews_bucket_arn         = local.reviews_bucket_arn
-  reviews_dynamodb_table_arn = local.reviews_table_arn
-  tags                       = var.tags
+  source                         = "../../modules/security"
+  name_prefix                    = var.name_prefix
+  vpc_id                         = module.network.vpc_id
+  app_ports                      = distinct([for _, svc in var.services : svc.container_port])
+  reviews_bucket_arn             = local.reviews_bucket_arn
+  reviews_dynamodb_table_arn     = local.reviews_table_arn
+  ecs_task_execution_secret_arns = local.service_secret_arns
+  tags                           = var.tags
 }
 
 module "ecr" {

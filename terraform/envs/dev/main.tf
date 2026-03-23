@@ -6,6 +6,7 @@ locals {
   reviews_table_name  = "${var.name_prefix}-reviews"
   reviews_table_arn   = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/${local.reviews_table_name}"
   enable_bastion      = var.enable_bastion
+  always_on_services  = ["frontend", "controlplane-api"]
   private_subnet_keys = toset([
     for idx, _ in var.private_subnet_cidrs : substr(var.azs[idx], length(var.azs[idx]) - 1, 1)
   ])
@@ -13,9 +14,10 @@ locals {
   active_backend_public_path_patterns = ["/api/*", "/uploads/*"]
 
   service_specific_path_patterns = {
-    "api-node"   = ["/api/node*", "/node*"]
-    "api-python" = try(var.services["api-python"].path_patterns, ["/api/python*", "/python*"])
-    "api-spring" = try(var.services["api-spring"].path_patterns, ["/api/spring*", "/spring*"])
+    "api-node"         = ["/api/node*", "/node*"]
+    "api-python"       = try(var.services["api-python"].path_patterns, ["/api/python*", "/python*"])
+    "api-spring"       = try(var.services["api-spring"].path_patterns, ["/api/spring*", "/spring*"])
+    "controlplane-api" = try(var.services["controlplane-api"].path_patterns, ["/controlplane/*"])
   }
 
   effective_service_path_patterns = {
@@ -23,8 +25,8 @@ locals {
       name == "frontend"
       ? svc.path_patterns
       : name == var.active_backend
-      ? distinct(concat(local.active_backend_public_path_patterns, local.service_specific_path_patterns[name]))
-      : local.service_specific_path_patterns[name]
+      ? distinct(concat(local.active_backend_public_path_patterns, try(local.service_specific_path_patterns[name], svc.path_patterns)))
+      : try(local.service_specific_path_patterns[name], svc.path_patterns)
     )
   }
 
@@ -95,12 +97,15 @@ locals {
     "api-node"   = local.backend_env_node
     "api-python" = local.backend_env_python
     "api-spring" = local.backend_env_spring
-    "frontend"   = {}
   }
+
+  service_secret_arns = distinct(flatten([
+    for _, svc in var.services : values(try(svc.secrets, {}))
+  ]))
 
   service_desired_counts = {
     for name, svc in var.services : name => (
-      name == "frontend"
+      contains(local.always_on_services, name)
       ? max(svc.desired_count, 1)
       : name == var.active_backend
       ? max(svc.desired_count, 1)
@@ -118,7 +123,8 @@ locals {
       environment = name == "frontend" ? merge(svc.environment, {
         VITE_API_URL = "http://${module.alb.alb_dns_name}"
         API_UPSTREAM = module.alb.alb_dns_name
-      }) : merge(svc.environment, local.service_backend_envs[name])
+      }) : merge(svc.environment, try(local.service_backend_envs[name], {}))
+      secrets = try(svc.secrets, {})
       command = try(svc.command, null)
     }
   }
@@ -150,13 +156,14 @@ module "bastion" {
 }
 
 module "security" {
-  source                     = "../../modules/security"
-  name_prefix                = var.name_prefix
-  vpc_id                     = module.network.vpc_id
-  app_ports                  = distinct([for _, svc in var.services : svc.container_port])
-  reviews_bucket_arn         = local.reviews_bucket_arn
-  reviews_dynamodb_table_arn = local.reviews_table_arn
-  tags                       = var.tags
+  source                         = "../../modules/security"
+  name_prefix                    = var.name_prefix
+  vpc_id                         = module.network.vpc_id
+  app_ports                      = distinct([for _, svc in var.services : svc.container_port])
+  reviews_bucket_arn             = local.reviews_bucket_arn
+  reviews_dynamodb_table_arn     = local.reviews_table_arn
+  ecs_task_execution_secret_arns = local.service_secret_arns
+  tags                           = var.tags
 }
 
 module "ecr" {

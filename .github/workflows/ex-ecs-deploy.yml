@@ -11,6 +11,11 @@ on:
         required: true
         default: true
         type: boolean
+      deploy_controlplane_api:
+        description: Deploy controlplane-api
+        required: true
+        default: true
+        type: boolean
       deploy_active_backend:
         description: Deploy backend selected by terraform/envs/dev/terraform.tfvars active_backend
         required: true
@@ -95,6 +100,7 @@ jobs:
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             [ "${{ inputs.deploy_frontend }}" = "true" ] && add_target "frontend"
+            [ "${{ inputs.deploy_controlplane_api }}" = "true" ] && add_target "controlplane-api"
             [ "${{ inputs.deploy_active_backend }}" = "true" ] && add_target "$ACTIVE_BACKEND"
 
             if [ "${#TARGETS[@]}" -eq 0 ]; then
@@ -104,15 +110,18 @@ jobs:
           else
             if ! git rev-parse "${{ steps.context.outputs.head_sha }}^" >/dev/null 2>&1; then
               add_target "frontend"
+              add_target "controlplane-api"
               add_target "$ACTIVE_BACKEND"
             else
               CHANGED_FILES=$(git diff --name-only "${{ steps.context.outputs.head_sha }}^" "${{ steps.context.outputs.head_sha }}")
 
               if echo "$CHANGED_FILES" | grep -Eq '^(terraform/|\.github/actions/|\.github/workflows/)'; then
                 add_target "frontend"
+                add_target "controlplane-api"
                 add_target "$ACTIVE_BACKEND"
               else
                 echo "$CHANGED_FILES" | grep -Eq '^services/frontend/ecommerce-app-frontend/frontend/' && add_target "frontend"
+                echo "$CHANGED_FILES" | grep -Eq '^controlplane/api/' && add_target "controlplane-api"
 
                 case "$ACTIVE_BACKEND" in
                   api-node)
@@ -208,6 +217,14 @@ jobs:
               echo "ecs_cluster=devsecops-dev-cluster" >> "$GITHUB_OUTPUT"
               echo "ecs_task_definition=devsecops-dev-api-spring" >> "$GITHUB_OUTPUT"
               echo "container_name=api-spring" >> "$GITHUB_OUTPUT"
+              ;;
+            controlplane-api)
+              echo "app_path=controlplane/api" >> "$GITHUB_OUTPUT"
+              echo "ecr_repository=devsecops-dev/controlplane-api" >> "$GITHUB_OUTPUT"
+              echo "ecs_service=devsecops-dev-controlplane-api" >> "$GITHUB_OUTPUT"
+              echo "ecs_cluster=devsecops-dev-cluster" >> "$GITHUB_OUTPUT"
+              echo "ecs_task_definition=devsecops-dev-controlplane-api" >> "$GITHUB_OUTPUT"
+              echo "container_name=controlplane-api" >> "$GITHUB_OUTPUT"
               ;;
             frontend)
               echo "app_path=services/frontend/ecommerce-app-frontend/frontend" >> "$GITHUB_OUTPUT"

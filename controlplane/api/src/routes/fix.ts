@@ -20,6 +20,7 @@ interface SuggestRequestBody {
   stepName?: string
   stepNumber?: number
   stepStatus?: string
+  stepConclusion?: string | null
   stepLog?: string
   annotations?: Array<{
     title?: string | null
@@ -41,6 +42,7 @@ fixRouter.post('/api/github/fix-sessions/:runId/suggest', async (req, res, next)
       stepName: typeof body.stepName === 'string' ? body.stepName : undefined,
       stepNumber: typeof body.stepNumber === 'number' && !Number.isNaN(body.stepNumber) ? body.stepNumber : undefined,
       stepStatus: typeof body.stepStatus === 'string' ? body.stepStatus : undefined,
+      stepConclusion: typeof body.stepConclusion === 'string' ? body.stepConclusion : undefined,
       stepLog: typeof body.stepLog === 'string' ? body.stepLog : undefined,
       annotations: Array.isArray(body.annotations)
         ? body.annotations

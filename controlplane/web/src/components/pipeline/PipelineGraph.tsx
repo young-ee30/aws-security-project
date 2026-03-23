@@ -248,63 +248,65 @@ export default function PipelineGraph({ workflowName, jobs, activeJobId, onJobCl
         <p className="mt-1 text-sm text-gray-600">{workflowName}</p>
       </div>
 
-      <div className="flex items-center gap-0 overflow-x-auto pb-2">
-        {groups.map((group, groupIndex) => (
-          <div key={`group-${groupIndex}`} className="flex items-center gap-0">
-            {groupIndex > 0 && (
-              <div className="flex items-center px-1">
-                <div
-                  className={cn(
-                    'h-0.5 w-8 rounded-full',
-                    getConnectorColor(
-                      groups[groupIndex - 1].jobs[0].conclusion,
-                      groups[groupIndex - 1].jobs[0].status,
-                      !!groups[groupIndex - 1].jobs[0].isPlaceholder,
-                    ),
-                  )}
-                />
-                <div className="h-0 w-0 border-y-[4px] border-l-[6px] border-y-transparent border-l-gray-300" />
-              </div>
-            )}
-
-            <div className={cn('flex', group.jobs.length > 1 ? 'flex-col gap-2' : '')}>
-              {group.jobs.map((job) => {
-                const isPlaceholder = !!job.isPlaceholder
-                const isActive = !isPlaceholder && activeJobId === job.id
-                const duration = formatDuration(job.startedAt, job.completedAt)
-                const isClickable = !isPlaceholder && job.id > 0
-
-                return (
-                  <button
-                    key={job.key}
-                    type="button"
-                    disabled={!isClickable}
-                    onClick={() => {
-                      if (isClickable) {
-                        onJobClick(job.id)
-                      }
-                    }}
+      <div className="overflow-x-auto pb-2">
+        <div className="mx-auto flex w-max items-center gap-0">
+          {groups.map((group, groupIndex) => (
+            <div key={`group-${groupIndex}`} className="flex items-center gap-0">
+              {groupIndex > 0 && (
+                <div className="flex items-center px-1">
+                  <div
                     className={cn(
-                      'flex items-center gap-2 rounded-xl border-2 px-4 py-2.5 text-left transition-all',
-                      isClickable ? 'hover:shadow-md' : 'cursor-default',
-                      getJobBorderColor(job.status, job.conclusion, isActive, isPlaceholder),
-                      getJobBgColor(job.status, job.conclusion, isActive, isPlaceholder),
+                      'h-0.5 w-8 rounded-full',
+                      getConnectorColor(
+                        groups[groupIndex - 1].jobs[0].conclusion,
+                        groups[groupIndex - 1].jobs[0].status,
+                        !!groups[groupIndex - 1].jobs[0].isPlaceholder,
+                      ),
                     )}
-                  >
-                    {getJobStatusIcon(job.status, job.conclusion)}
-                    <div className="min-w-0">
-                      <span className={cn('block text-sm font-medium leading-tight', isPlaceholder ? 'text-gray-500' : 'text-gray-800')}>
-                        {job.displayName}
-                      </span>
-                      <span className="mt-1 block text-xs leading-4 text-gray-400">{job.description}</span>
-                    </div>
-                    {duration && <span className="shrink-0 whitespace-nowrap text-xs text-gray-400">{duration}</span>}
-                  </button>
-                )
-              })}
+                  />
+                  <div className="h-0 w-0 border-y-[4px] border-l-[6px] border-y-transparent border-l-gray-300" />
+                </div>
+              )}
+
+              <div className={cn('flex', group.jobs.length > 1 ? 'flex-col gap-2' : '')}>
+                {group.jobs.map((job) => {
+                  const isPlaceholder = !!job.isPlaceholder
+                  const isActive = !isPlaceholder && activeJobId === job.id
+                  const duration = formatDuration(job.startedAt, job.completedAt)
+                  const isClickable = !isPlaceholder && job.id > 0
+
+                  return (
+                    <button
+                      key={job.key}
+                      type="button"
+                      disabled={!isClickable}
+                      onClick={() => {
+                        if (isClickable) {
+                          onJobClick(job.id)
+                        }
+                      }}
+                      className={cn(
+                        'flex items-center gap-2 rounded-xl border-2 px-4 py-2.5 text-left transition-all',
+                        isClickable ? 'hover:shadow-md' : 'cursor-default',
+                        getJobBorderColor(job.status, job.conclusion, isActive, isPlaceholder),
+                        getJobBgColor(job.status, job.conclusion, isActive, isPlaceholder),
+                      )}
+                    >
+                      {getJobStatusIcon(job.status, job.conclusion)}
+                      <div className="min-w-0">
+                        <span className={cn('block text-sm font-medium leading-tight', isPlaceholder ? 'text-gray-500' : 'text-gray-800')}>
+                          {job.displayName}
+                        </span>
+                        <span className="mt-1 block text-xs leading-4 text-gray-400">{job.description}</span>
+                      </div>
+                      {duration && <span className="shrink-0 whitespace-nowrap text-xs text-gray-400">{duration}</span>}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
     </div>
   )
