@@ -1,11 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   parsePrometheus,
+  parsePrometheusHelp,
   aggregateRequestsByRoute,
   calcPercentile,
+  filterSamples,
   type MetricSample,
 } from '@/lib/parsePrometheus'
-import { METRICS_URL } from '@/lib/env'
+
+// 브라우저 CORS 우회 — 로컬 대시보드 백엔드(4000)가 CloudFront에서 대신 가져옴
+const DASHBOARD_BASE = (import.meta as any).env?.VITE_DASHBOARD_URL ?? 'http://localhost:4000'
+const METRICS_URL = `${DASHBOARD_BASE}/dashboard/metrics/prometheus`
 
 const POLL_INTERVAL = 15_000 // 15초
 const HISTORY_SIZE = 30     // 최대 30개 스냅샷
@@ -29,6 +34,32 @@ export interface TrendPoint {
   [route: string]: number | string
 }
 
+export interface NodeRuntime {
+  rssBytes: number
+  heapUsedBytes: number
+  heapTotalBytes: number
+  externalBytes: number
+  cpuUserSec: number
+  cpuSystemSec: number
+  eventLoopLagMs: number
+  eventLoopP50Ms: number
+  eventLoopP90Ms: number
+  eventLoopP99Ms: number
+  gcMinorCount: number
+  gcMajorCount: number
+  gcMinorAvgMs: number
+  gcMajorAvgMs: number
+  activeHandles: number
+  nodeVersion: string
+}
+
+/** 스냅샷 히스토리 기반 — 활성 핸들·대기 요청 추이(이름 없이 수치만) */
+export interface HandlesRequestsTrendPoint {
+  time: string
+  handles: number
+  requests: number
+}
+
 export interface MetricsState {
   loading: boolean
   error: string | null
@@ -39,6 +70,12 @@ export interface MetricsState {
   routes: RouteMetric[]
   requestTrend: TrendPoint[]   // 시계열 (시간 순)
   errorBarData: Array<{ endpoint: string; '4xx': number; '5xx': number }>
+  runtime: NodeRuntime | null
+  /** 최근 스냅샷들의 활성 핸들·active requests (관제 세부 지표용) */
+  handlesRequestsTrend: HandlesRequestsTrendPoint[]
+  // Prometheus 원문 스냅샷(HELP 설명 + 값)을 추가로 제공
+  samples: MetricSample[]
+  helpByName: Record<string, string>
 }
 
 // ── 스냅샷 타입 ────────────────────────────────────────────────────────────
@@ -47,6 +84,39 @@ interface Snapshot {
   ts: number
   samples: MetricSample[]
   byRoute: ReturnType<typeof aggregateRequestsByRoute>
+}
+
+// ── 런타임 파싱 헬퍼 ────────────────────────────────────────────────────────
+
+function getGauge(samples: MetricSample[], name: string, labels?: Record<string, string>): number {
+  const s = filterSamples(samples, name, labels)
+  return s[0]?.value ?? 0
+}
+
+function parseRuntime(samples: MetricSample[]): NodeRuntime {
+  const gcMinorCount = getGauge(samples, 'nodejs_gc_duration_seconds_count', { kind: 'minor' })
+  const gcMajorCount = getGauge(samples, 'nodejs_gc_duration_seconds_count', { kind: 'major' })
+  const gcMinorSumMs = getGauge(samples, 'nodejs_gc_duration_seconds_sum', { kind: 'minor' }) * 1000
+  const gcMajorSumMs = getGauge(samples, 'nodejs_gc_duration_seconds_sum', { kind: 'major' }) * 1000
+
+  return {
+    rssBytes:        getGauge(samples, 'process_resident_memory_bytes'),
+    heapUsedBytes:   getGauge(samples, 'nodejs_heap_size_used_bytes'),
+    heapTotalBytes:  getGauge(samples, 'nodejs_heap_size_total_bytes'),
+    externalBytes:   getGauge(samples, 'nodejs_external_memory_bytes'),
+    cpuUserSec:      getGauge(samples, 'process_cpu_user_seconds_total'),
+    cpuSystemSec:    getGauge(samples, 'process_cpu_system_seconds_total'),
+    eventLoopLagMs:  getGauge(samples, 'nodejs_eventloop_lag_seconds') * 1000,
+    eventLoopP50Ms:  getGauge(samples, 'nodejs_eventloop_lag_p50_seconds') * 1000,
+    eventLoopP90Ms:  getGauge(samples, 'nodejs_eventloop_lag_p90_seconds') * 1000,
+    eventLoopP99Ms:  getGauge(samples, 'nodejs_eventloop_lag_p99_seconds') * 1000,
+    gcMinorCount,
+    gcMajorCount,
+    gcMinorAvgMs: gcMinorCount > 0 ? gcMinorSumMs / gcMinorCount : 0,
+    gcMajorAvgMs: gcMajorCount > 0 ? gcMajorSumMs / gcMajorCount : 0,
+    activeHandles:   getGauge(samples, 'nodejs_active_handles_total'),
+    nodeVersion:     filterSamples(samples, 'nodejs_version_info')[0]?.labels?.version ?? '',
+  }
 }
 
 // ── 훅 ────────────────────────────────────────────────────────────────────
@@ -63,6 +133,10 @@ export function useMetrics(): MetricsState {
     routes: [],
     requestTrend: [],
     errorBarData: [],
+    runtime: null,
+    handlesRequestsTrend: [],
+    samples: [],
+    helpByName: {},
   })
 
   const fetchAndUpdate = useCallback(async () => {
@@ -71,6 +145,7 @@ export function useMetrics(): MetricsState {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const text = await res.text()
       const samples = parsePrometheus(text)
+      const helpByName = parsePrometheusHelp(text)
       const byRoute = aggregateRequestsByRoute(samples)
       const now = Date.now()
 
@@ -135,7 +210,14 @@ export function useMetrics(): MetricsState {
         .filter((r) => r['4xx'] + r['5xx'] > 0)
         .map((r) => ({ endpoint: r.endpoint.replace('/api/', ''), '4xx': r['4xx'], '5xx': r['5xx'] }))
 
+      const handlesRequestsTrend: HandlesRequestsTrendPoint[] = history.map((h) => ({
+        time: new Date(h.ts).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        handles: getGauge(h.samples, 'nodejs_active_handles_total'),
+        requests: getGauge(h.samples, 'nodejs_active_requests_total'),
+      }))
+
       const lastUpdated = new Date(now).toLocaleTimeString('ko-KR')
+      const runtime = parseRuntime(samples)
 
       setState({
         loading: false,
@@ -147,6 +229,10 @@ export function useMetrics(): MetricsState {
         routes,
         requestTrend,
         errorBarData,
+        runtime,
+        handlesRequestsTrend,
+        samples,
+        helpByName,
       })
     } catch (err) {
       setState((prev) => ({

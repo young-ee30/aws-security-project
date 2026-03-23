@@ -116,3 +116,25 @@ export function calcPercentile(
 
   return buckets[buckets.length - 2]?.le ?? 0
 }
+
+/**
+ * Prometheus 텍스트에서 "# HELP <metric_name> <description>" 라인을 파싱해
+ * metric 이름별 설명(HELP)을 반환합니다.
+ */
+export function parsePrometheusHelp(text: string): Record<string, string> {
+  const help: Record<string, string> = {}
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('# HELP ')) continue
+
+    // # HELP metric_name description...
+    const match = trimmed.match(/^# HELP\s+([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(.*)$/)
+    if (!match) continue
+    const name = match[1]
+    const desc = match[2] ?? ''
+    help[name] = desc
+  }
+
+  return help
+}
