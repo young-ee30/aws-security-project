@@ -14,7 +14,7 @@ ecr_repositories = [
   "frontend"
 ]
 
-active_backend = "api-node"
+active_backend = "api-python"
 
 services = {
   api-node = {
