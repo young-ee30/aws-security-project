@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
   Check,
@@ -19,13 +19,15 @@ import ChartCard from '@/components/common/ChartCard'
 import { type PolicyStatus, type PolicyTemplate } from '@/data/mockData'
 import { API_BASE_URL } from '@/lib/env'
 
-type ProviderLabel = 'gemini'
+type ProviderLabel = 'gemini' | 'fallback'
+type PolicyOrigin = 'llm' | 'fallback'
 type PolicySeverity = 'INFO' | 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 
 interface GeneratedPolicyItem {
   sourcePolicyId?: string
   sourcePolicyTitle?: string
   sourceExcerpt?: string
+  origin: PolicyOrigin
   policyName: string
   description: string
   summary: string
@@ -40,6 +42,7 @@ interface GeneratedPolicyItem {
 interface StoredPolicy extends PolicyTemplate {
   policyPath: string
   provider: ProviderLabel
+  origin: PolicyOrigin
   policyId: string
   category: string
   severity: PolicySeverity
@@ -56,7 +59,7 @@ interface ApiErrorPayload {
 
 interface GeneratedPolicyResponse {
   ok: boolean
-  mode: 'llm'
+  mode: 'llm' | 'fallback'
   provider: ProviderLabel
   llmError?: string
   fileName: string
@@ -276,9 +279,8 @@ function buildStoredPolicy(
 ): StoredPolicy {
   const createdAt = new Date().toISOString()
   const generatedPolicyName = getGeneratedPolicyDisplayName(policy)
-  const generatedFileName = getPreviewPolicyFileName(policy)
 
-  return {
+  const storedPolicy: StoredPolicy = {
     id: `policy-${Date.now()}-${policy.policyId}`,
     name: generatedPolicyName,
     description: policy.description,
@@ -288,8 +290,9 @@ function buildStoredPolicy(
     status: 'draft',
     lastUpdated: formatTimestamp(),
     yaml: policy.yaml,
-    policyPath: `security/checkov/custom_policies/${generatedFileName}`,
+    policyPath: policy.policyPath,
     provider,
+    origin: policy.origin as PolicyOrigin,
     policyId: policy.policyId,
     category: policy.category,
     severity: policy.severity,
@@ -297,6 +300,8 @@ function buildStoredPolicy(
     sourcePolicyId: policy.sourcePolicyId,
     sourcePolicyTitle: policy.sourcePolicyTitle,
   }
+
+  return storedPolicy
 }
 
 function formatSourcePolicyKey(value?: string | null) {
@@ -316,25 +321,162 @@ function getPreviewPolicyTitle(policy: GeneratedPolicyItem) {
   return getGeneratedPolicyDisplayName(policy)
 }
 
-function getPolicyFileName(policyPath: string) {
-  return policyPath.split('/').pop() || policyPath
+function normalizePreviewText(text: string) {
+  return text
+    .replace(/--\s*\d+\s+of\s+\d+\s*--/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
-function normalizePreviewText(text: string) {
-  return text.replace(/\s+/g, ' ').trim()
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+const previewSectionLabels = [
+  '점검 내용',
+  '점검 목적',
+  '개요',
+  '보안 위협',
+  '조치 방법',
+  '진단 기준',
+] as const
+
+const previewSectionBoundaries = [
+  ...previewSectionLabels,
+  '참고',
+  '점검 대상 및 진단 기준',
+  '대상',
+  '양호',
+  '취약',
+  '조치 영향',
+  '점검 및 조치 여부',
+] as const
+
+function extractPreviewSection(text: string, label: string) {
+  const boundaryPattern = previewSectionBoundaries
+    .filter((candidate) => candidate !== label)
+    .map((candidate) => escapeRegExp(candidate))
+    .join('|')
+
+  const regex = new RegExp(
+    `${escapeRegExp(label)}\\s*[:竊?]?\\s*(.+?)(?=\\s*(?:${boundaryPattern})\\s*(?:[:竊?]|$)|$)`,
+    'i',
+  )
+  const matched = text.match(regex)
+  if (!matched?.[1]) {
+    return null
+  }
+
+  return normalizePreviewText(matched[1])
+}
+
+function getPreviewExcerpt(text: string) {
+  const normalized = normalizePreviewText(text)
+  if (!normalized) {
+    return ''
+  }
+
+  for (const label of previewSectionLabels) {
+    const section = extractPreviewSection(normalized, label)
+    if (section) {
+      return `${label}: ${section}`
+    }
+  }
+
+  return normalized
+}
+
+function cleanDisplayDescription(text: string) {
+  const normalized = normalizePreviewText(text)
+    .replace(/^(점검 내용|점검 목적|보안 위협|조치 방법|진단 기준|판단 기준|중요도)\s*[:：]?\s*/i, '')
+    .trim()
+
+  return normalized.length > 120 ? `${normalized.slice(0, 117).trimEnd()}...` : normalized
 }
 
 function getDisplayDescription(policy: GeneratedPolicyItem | StoredPolicy) {
+  const description = cleanDisplayDescription(policy.description)
+  if (description) {
+    return description
+  }
+
   const sourceExcerpt = 'sourceExcerpt' in policy && typeof policy.sourceExcerpt === 'string'
     ? policy.sourceExcerpt
     : ''
 
-  return normalizePreviewText(sourceExcerpt || policy.description)
+  return sourceExcerpt ? getPreviewExcerpt(sourceExcerpt) : description
 }
 
-function getPreviewPolicyFileName(policy: GeneratedPolicyItem) {
-  const sourceKey = formatSourcePolicyKey(policy.sourcePolicyId)
-  return sourceKey ? `custom_policy_${sourceKey}.yaml` : getPolicyFileName(policy.policyPath)
+function getOriginTone(origin: PolicyOrigin) {
+  return origin === 'llm'
+    ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
+    : 'border-amber-200 bg-amber-50 text-amber-700'
+}
+
+function getOriginLabel(origin: PolicyOrigin) {
+  return `origin: ${origin}`
+}
+
+function formatPolicyGenerationErrors(errorMessage: string) {
+  const grouped = new Map<
+    string,
+    {
+      sourcePolicyId: string | null
+      missingSeverity: boolean
+      missingResourceTypes: boolean
+      messages: string[]
+    }
+  >()
+
+  for (const rawPart of errorMessage.split(/\s+\|\s+/).map((part) => part.trim()).filter(Boolean)) {
+    const match = rawPart.match(/^([A-Z]+-\d+(?:-\d+)?)\s*:\s*(.+)$/i)
+    const sourcePolicyId = match?.[1]?.toUpperCase() || null
+    const detail = match?.[2] || rawPart
+    const key = sourcePolicyId || '__global__'
+    const current = grouped.get(key) || {
+      sourcePolicyId,
+      missingSeverity: false,
+      missingResourceTypes: false,
+      messages: [],
+    }
+
+    if (/metadata\.severity is missing from YAML/i.test(detail)) {
+      current.missingSeverity = true
+    } else if (/definition\.resource_types is missing from YAML/i.test(detail)) {
+      current.missingResourceTypes = true
+    } else if (/Gemini is not configured/i.test(detail)) {
+      current.messages.push('LLM API 키가 설정되지 않았습니다.')
+    } else if (/Gemini returned no usable content/i.test(detail)) {
+      current.messages.push(`${sourcePolicyId ? `${sourcePolicyId} 정책에서 ` : ''}LLM이 사용할 수 있는 정책 결과를 반환하지 않았습니다.`)
+    } else {
+      current.messages.push(detail)
+    }
+
+    grouped.set(key, current)
+  }
+
+  const messages: string[] = []
+
+  for (const group of grouped.values()) {
+    const prefix = group.sourcePolicyId ? `${group.sourcePolicyId} 정책에서 ` : ''
+
+    if (group.missingSeverity && group.missingResourceTypes) {
+      messages.push(`${prefix}필수 severity와 definition.resource_types가 모두 비어 있어 유효한 Checkov 정책을 만들 수 없습니다.`)
+      continue
+    }
+
+    if (group.missingSeverity) {
+      messages.push(`${prefix}severity 값이 비어 있어 Checkov 정책으로 사용할 수 없습니다.`)
+    }
+
+    if (group.missingResourceTypes) {
+      messages.push(`${prefix}검사 대상 Terraform resource_types가 비어 있어 어떤 리소스를 검사할지 결정할 수 없습니다.`)
+    }
+
+    messages.push(...group.messages)
+  }
+
+  return messages
 }
 
 function BatchPreviewList({
@@ -381,6 +523,9 @@ function BatchPreviewList({
                     {formatSourcePolicyKey(policy.sourcePolicyId)}
                   </span>
                 )}
+                <span className={`rounded-full border px-2.5 py-1 text-xs ${getOriginTone(policy.origin)}`}>
+                  {getOriginLabel(policy.origin)}
+                </span>
                 <span className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700">
                   {policy.severity}
                 </span>
@@ -512,7 +657,7 @@ function PolicyUploadCard({
       await onCreate([buildStoredPolicy(selectedFile.name, policy, preview.provider)])
       setCreatedPolicyIds((current) => (current.includes(policy.policyId) ? current : [...current, policy.policyId]))
     } catch (err) {
-      const message = err instanceof Error ? err.message : '?뺤콉 ??μ뿉 ?ㅽ뙣?덉뒿?덈떎.'
+      const message = err instanceof Error ? err.message : '정책 목록에 추가하지 못했습니다.'
       setError(message)
     }
   }
@@ -537,17 +682,15 @@ function PolicyUploadCard({
             }}
             onDragLeave={() => setDragOver(false)}
             onClick={() => inputRef.current?.click()}
-            className={`cursor-pointer rounded-2xl border-2 border-dashed p-10 text-center transition-all ${dragOver ? 'border-indigo-400 bg-indigo-50' : 'border-gray-300 hover:border-indigo-300 hover:bg-indigo-50/50'
-              }`}
+            className={`cursor-pointer rounded-2xl border-2 border-dashed p-10 text-center transition-all ${dragOver ? 'border-indigo-400 bg-indigo-50' : 'border-gray-300 hover:border-indigo-300 hover:bg-indigo-50/50'}`}
           >
             <div
-              className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border ${dragOver ? 'border-indigo-200 bg-indigo-100' : 'border-gray-200 bg-gray-100'
-                }`}
+              className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border ${dragOver ? 'border-indigo-200 bg-indigo-100' : 'border-gray-200 bg-gray-100'}`}
             >
               <Upload className={`h-7 w-7 ${dragOver ? 'text-indigo-600' : 'text-gray-400'}`} />
             </div>
             <p className="text-base font-medium text-gray-800">PDF를 드래그하거나 클릭해서 업로드</p>
-            <p className="mt-1 text-sm text-gray-500">PDF 내용을 상세 분석하여 새로운 점검 정책을 만듭니다.</p>
+            <p className="mt-1 text-sm text-gray-500">PDF 내용을 분석해 정책 초안과 YAML 결과를 미리 확인합니다.</p>
             <span className="mt-4 inline-flex rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white">
               파일 선택
             </span>
@@ -594,9 +737,9 @@ function PolicyUploadCard({
           <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-5">
             <div className="flex items-center gap-2 text-sm font-medium text-indigo-700">
               <Sparkles className="h-4 w-4" />
-              <span>새로운 점검 정책 생성 중</span>
+              <span>정책 생성 중</span>
             </div>
-            <p className="mt-1 text-xs text-indigo-600/80">정책 적용을 위한 새로운 yaml 파일 생성중입니다.</p>
+            <p className="mt-1 text-xs text-indigo-600/80">원문 정책을 분해하고 YAML 초안을 만드는 중입니다.</p>
           </div>
         )}
 
@@ -615,11 +758,9 @@ function PolicyUploadCard({
         {preview && !generating && (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="h-4 w-4 text-indigo-600" />
-                  <p className="text-sm font-medium text-indigo-700">Checkov custom policy 생성 완료</p>
-                </div>
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-indigo-600" />
+                <p className="text-sm font-medium text-indigo-700">Checkov custom policy 생성 완료</p>
               </div>
               <span className="rounded-lg border border-gray-200 bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600">
                 생성 {preview.policyCount}건
@@ -630,12 +771,12 @@ function PolicyUploadCard({
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Generated</p>
                 <p className="mt-1 text-lg font-semibold text-gray-900">{preview.policyCount}</p>
-                <p className="mt-1 text-xs text-gray-500">생성 완료 정책</p>
+                <p className="mt-1 text-xs text-gray-500">생성된 정책</p>
               </div>
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Skipped</p>
                 <p className="mt-1 text-lg font-semibold text-gray-900">{preview.skippedPolicies?.length || 0}</p>
-                <p className="mt-1 text-xs text-gray-500">생성 실패 정책</p>
+                <p className="mt-1 text-xs text-gray-500">건너뛴 정책</p>
               </div>
               <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Source File</p>
@@ -643,10 +784,19 @@ function PolicyUploadCard({
                 <p className="mt-1 text-xs text-gray-500">업로드한 문서</p>
               </div>
             </div>
+
             {preview.llmError && (
               <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
-                <p className="text-sm font-medium text-amber-800">Gemini 호출에 실패했습니다.</p>
-                <p className="mt-1 text-xs text-amber-700">{preview.llmError}</p>
+                <p className="text-sm font-medium text-amber-800">
+                  {preview.policyCount > 0
+                    ? '일부 정책 생성 결과를 검증하지 못했습니다.'
+                    : 'LLM 생성 중 오류가 있었습니다.'}
+                </p>
+                <div className="mt-2 space-y-1 text-xs text-amber-700">
+                  {formatPolicyGenerationErrors(preview.llmError).map((message, index) => (
+                    <p key={`${index}-${message}`}>{message}</p>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -664,6 +814,7 @@ function PolicyUploadCard({
                 </div>
               </div>
             )}
+
             <BatchPreviewList
               policies={preview.policies}
               openId={openPreviewId}
@@ -710,7 +861,7 @@ function PolicyList({
     return (
       <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 px-6 py-10 text-center">
         <p className="text-sm font-medium text-gray-700">아직 등록된 정책이 없습니다.</p>
-        <p className="mt-1 text-xs text-gray-500">PDF를 업로드해 새로운 점검 정책을 만들어 보세요.</p>
+        <p className="mt-1 text-xs text-gray-500">PDF를 업로드해 새로운 정책을 추가해보세요.</p>
       </div>
     )
   }
@@ -748,8 +899,9 @@ function PolicyList({
             </div>
 
             <div className="space-y-4 px-5 py-4">
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
                 {[
+                  { label: 'Origin', value: policy.origin },
                   { label: '카테고리', value: policy.category },
                   { label: '심각도', value: policy.severity },
                   { label: '마지막 갱신', value: policy.lastUpdated },
@@ -946,7 +1098,7 @@ export default function PolicyPage() {
     <div>
       <PageHeader
         title="보안 정책"
-        subtitle="KISA 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드 PDF를 분석해 Checkov custom policy YAML을 만들고 이를 반영합니다."
+        subtitle="KISA 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드 PDF를 분석해 Checkov custom policy YAML을 만들고 반영합니다."
         lastUpdated={lastPolicyInsertedAt}
         lastUpdatedLabel="마지막 정책 등록"
         titleAction={
@@ -980,3 +1132,4 @@ export default function PolicyPage() {
     </div>
   )
 }
+

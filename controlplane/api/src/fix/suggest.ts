@@ -1,4 +1,4 @@
-import { env } from '../config/env.js'
+﻿import { env } from '../config/env.js'
 import { getWorkflowRunJobs, getWorkflowRunLogs, getFileContent } from '../github/actions.js'
 import { callConfiguredLlm } from '../llm/client.js'
 
@@ -525,8 +525,6 @@ Output format exactly:
 - ...
 [Impact]
 - ...
-[Next]
-- ...
 [Fix]
 - ...
 Constraints:
@@ -534,10 +532,19 @@ Constraints:
 - Each bullet must be one short sentence.
 - No introduction or conclusion.
 - Do not use markdown headings like ###.
-- Only include code change guidance when the log clearly supports it.`,
+- Only include code change guidance when the log clearly supports it.
+- In [Fix], include the most credible recovery or code/config change.
+- In [Fix], prefer the smallest actionable fix over generic advice.
+- If evidence is insufficient, say "insufficient evidence from log".`,
     userPrompt: `${prefix}
 
 ${annotationSummary}
+
+[Task]
+- Explain the failure for an operator who needs a fast root-cause summary and a concrete fix.
+- Prefer concrete evidence from the log, annotations, and related Terraform/workflow files.
+- If multiple causes are possible, mention the most likely one only.
+- Do not output a separate next-step section.
 
 [Failure log]
 \`\`\`
@@ -571,38 +578,6 @@ async function callLlmAnalysis(
     truncatedLog,
     terraformContext,
   )
-
-  const systemPrompt = `당신은 AWS 클라우드 아키텍처 및 Terraform 프로비저닝에 정통한 시니어 DevOps 엔지니어입니다.
-현재 CI/CD PIPELINE(GitHub Actions)에서 Terraform 코드를 실행하던 중 에러가 발생했습니다.
-선택된 step 정보가 주어지면 반드시 그 step이 하려던 작업, 실패 지점, 관련 workflow/Terraform 코드에 집중해서 분석하세요.
-
-아래 제공된 [에러 로그]와 [관련 Terraform 코드]를 분석하여 다음 형식에 맞춰 답변해 주세요.
-
-### 🚨 에러 원인 분석
-(에러가 발생한 근본적인 원인을 2~3줄로 명확하고 알기 쉽게 요약해 주세요.)
-
-### 💡 해결 방안
-(에러를 해결하기 위한 구체적이고 단계적인 조치 사항을 번호 리스트로 설명해 주세요.)
-
-### 🛠️ Terraform 코드 수정 제안
-(Terraform 코드 수정이 필요한 경우, 수정할 파일 경로를 명시하고 전체 수정된 코드를 \`\`\`hcl 코드 블록으로 작성해 주세요. 코드 블록 바로 위에 파일 경로를 적어주세요.
-수정이 필요 없다면 "코드 수정 불필요"라고 명시하고 그 이유를 적어주세요.)
-
-중요: 코드 수정 제안 시 반드시 파일 경로를 코드 블록 위에 명시해 주세요.
-예시:
-#### \`terraform/modules/ecs/main.tf\`
-\`\`\`hcl
-# 수정된 전체 코드
-\`\`\``
-
-  const userPrompt = `${stepContext}${stepContext ? '\n\n' : ''}Rule-based 사전 분석: ${ruleBasedSummary}
-
-${annotationSummary}
-
-[에러 로그]
-\`\`\`
-${truncatedLog}
-\`\`\`${terraformContext}`
 
   try {
     const response = await callConfiguredLlm({
@@ -801,3 +776,4 @@ export async function generateFixSuggestion(
     suggestedFiles,
   }
 }
+

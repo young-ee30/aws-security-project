@@ -5,6 +5,7 @@ import { dashboardRouter } from './routes/dashboard.js'
 import { fixRouter } from './routes/fix.js'
 import { githubRouter } from './routes/github.js'
 import { healthRouter } from './routes/health.js'
+import { incidentRouter } from './routes/incident.js'
 import { metricsRouter } from './routes/metrics.js'
 import { policyRouter } from './routes/policy.js'
 
@@ -36,6 +37,7 @@ mountWithOptionalBasePath(dashboardRouter)
 mountWithOptionalBasePath(metricsRouter)
 mountWithOptionalBasePath(githubRouter)
 mountWithOptionalBasePath(fixRouter)
+mountWithOptionalBasePath(incidentRouter)
 mountWithOptionalBasePath(policyRouter)
 if (normalizedBasePath !== '/') {
   app.use(normalizedBasePath, healthRouter)

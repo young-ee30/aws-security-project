@@ -1,10 +1,12 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
+import IncidentAiSummaryDialog from '@/components/incident/IncidentAiSummaryDialog'
 import { PageHeader } from '@/components/layout/Header'
 import LogPageHeaderActions from '@/components/layout/LogPageHeaderActions'
 import InfraAwsTabs, { type InfraAwsScope } from '@/components/common/InfraAwsTabs'
 import InfraDataSummaryCards from '@/components/common/InfraDataSummaryCards'
-import { useDashboardData } from '@/hooks/useDashboardData'
-import { useMetrics } from '@/hooks/useMetrics'
+import { useDashboardData, type DashboardData } from '@/hooks/useDashboardData'
+import { useMetrics, type MetricsState } from '@/hooks/useMetrics'
+import type { GwanjeInfraCard } from '@/hooks/useGwanjeInfraCards'
 import { useHaeInfraLogCards } from '@/hooks/useHaeInfraLogCards'
 import { useHaeAwsLogCards } from '@/hooks/useHaeAwsLogCards'
 import HaeAuthLogDetailSection from '@/components/charts/HaeAuthLogDetailSection'
@@ -12,10 +14,99 @@ import HaeAwsCloudTrailDetailCards from '@/components/charts/HaeAwsCloudTrailDet
 import HaeAwsVpcFlowDetailCards from '@/components/charts/HaeAwsVpcFlowDetailCards'
 import HaeAwsWafDetailCards from '@/components/charts/HaeAwsWafDetailCards'
 import HaeAwsGuardDutyDetailCards from '@/components/charts/HaeAwsGuardDutyDetailCards'
+import {
+  requestIncidentAiAnalysis,
+  type IncidentAiAnalysisRequest,
+  type IncidentAiAnalysisResponse,
+  type IncidentAiLogLine,
+  type IncidentAiSeverity,
+} from '@/lib/incidentAi'
+import { exportIncidentReport } from '@/lib/incidentReport'
+
+function normalizeCards(cards: GwanjeInfraCard[]) {
+  return cards.slice(0, 16).map((card) => ({
+    title: card.title,
+    value: card.value,
+    sub: card.sub,
+    source: card.source,
+  }))
+}
+
+function inferTrailSeverity(eventName: string): IncidentAiSeverity {
+  if (/CreateLoginProfile|DeleteTrail|StopLogging|AttachUserPolicy|AuthorizeSecurityGroupIngress|RevokeSecurityGroupEgress/i.test(eventName)) {
+    return 'high'
+  }
+
+  if (/ConsoleLogin Failure|Decrypt|WAF|Unauthorized|403|401|Discovery|ListBuckets/i.test(eventName)) {
+    return 'medium'
+  }
+
+  return 'low'
+}
+
+function inferVpcSeverity(message: string): IncidentAiSeverity {
+  if (/reject|deny|drop|blocked/i.test(message)) {
+    return 'medium'
+  }
+
+  return 'info'
+}
+
+function buildHaeAnalysisRequest(
+  dash: DashboardData,
+  metrics: MetricsState,
+  infraCards: GwanjeInfraCard[],
+  awsCards: GwanjeInfraCard[],
+  lastUpdated: string,
+): IncidentAiAnalysisRequest {
+  const logLines: IncidentAiLogLine[] = [
+    ...dash.cloudTrail.slice(0, 20).map((event) => ({
+      time: event.event_time,
+      text: `${event.event_name} by ${event.username || 'unknown'} from ${event.source_ip || '-'}`,
+      severity: inferTrailSeverity(event.event_name),
+      source: 'cloudtrail',
+    })),
+    ...dash.guardDuty.slice(0, 10).map((finding) => ({
+      time: finding.updated_at,
+      text: `${finding.severity_label} ${finding.title} (${finding.type}) in ${finding.region}`,
+      severity: (finding.severity >= 7 ? 'high' : finding.severity >= 4 ? 'medium' : 'low') as IncidentAiSeverity,
+      source: 'cloudwatch',
+    })),
+    ...dash.vpcLogs.slice(0, 20).map((log) => ({
+      time: log.timestamp ? new Date(log.timestamp > 1_000_000_000_000 ? log.timestamp : log.timestamp * 1000).toLocaleString('ko-KR') : undefined,
+      text: log.message,
+      severity: inferVpcSeverity(log.message),
+      source: 'cloudwatch',
+    })),
+    ...metrics.routes
+      .filter((route) => route['4xx'] > 0 || route['5xx'] > 0)
+      .slice(0, 8)
+      .map((route) => ({
+        time: metrics.lastUpdated,
+        text: `${route.endpoint} 4xx ${route['4xx']}, 5xx ${route['5xx']}, error rate ${route.errorRate}, p95 ${route.p95}ms`,
+        severity: (route['5xx'] > 0 ? 'high' : 'medium') as IncidentAiSeverity,
+        source: 'prometheus',
+      })),
+  ]
+
+  return {
+    page: 'hae',
+    title: '침해 전체 로그 AI 분석',
+    context: '침해 페이지 전체 로그를 기준으로 권한 변경, 보안 탐지, 네트워크 로그, 애플리케이션 오류를 함께 요약한다.',
+    lastUpdated,
+    summaryCards: [...normalizeCards(infraCards), ...normalizeCards(awsCards)].slice(0, 16),
+    logLines: logLines.slice(0, 80),
+  }
+}
 
 /** 침해 — 인프라적 로그 / AWS 리소스 로그 · 요약 지표(CloudWatch·Prometheus·CloudTrail 범위) */
 export default function IncidentHaePage() {
   const [scope, setScope] = useState<InfraAwsScope>('infra')
+  const [analysisOpen, setAnalysisOpen] = useState(false)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [analysisError, setAnalysisError] = useState<string | null>(null)
+  const [analysis, setAnalysis] = useState<IncidentAiAnalysisResponse | null>(null)
+  const [reportLoading, setReportLoading] = useState(false)
   const dash = useDashboardData()
   const metrics = useMetrics()
   const infraLog = useHaeInfraLogCards(dash, metrics)
@@ -27,6 +118,43 @@ export default function IncidentHaePage() {
     if (dash.lastUpdated) return dash.lastUpdated.toLocaleTimeString('ko-KR')
     return metrics.lastUpdated !== '-' ? metrics.lastUpdated : '—'
   }, [headerLoading, dash.lastUpdated, metrics.lastUpdated])
+
+  const requestAnalysis = useCallback(async () => {
+    return requestIncidentAiAnalysis(
+      buildHaeAnalysisRequest(dash, metrics, infraLog.cards, awsLog.cards, lastUpdatedStr),
+    )
+  }, [awsLog.cards, dash, infraLog.cards, lastUpdatedStr, metrics])
+
+  const handleAnalyze = useCallback(async () => {
+    setAnalysisOpen(true)
+    setAnalysisLoading(true)
+    setAnalysisError(null)
+
+    try {
+      const result = await requestAnalysis()
+      setAnalysis(result)
+    } catch (error) {
+      setAnalysis(null)
+      setAnalysisError(error instanceof Error ? error.message : 'AI 분석 요청에 실패했습니다.')
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }, [requestAnalysis])
+
+  const handleReport = useCallback(async () => {
+    setReportLoading(true)
+
+    try {
+      const request = buildHaeAnalysisRequest(dash, metrics, infraLog.cards, awsLog.cards, lastUpdatedStr)
+      const result = await requestAnalysis()
+      setAnalysis(result)
+      exportIncidentReport({ request, analysis: result })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '보고서 출력에 실패했습니다.')
+    } finally {
+      setReportLoading(false)
+    }
+  }, [awsLog.cards, dash, infraLog.cards, lastUpdatedStr, metrics, requestAnalysis])
 
   const haeAuthDetailRef = useRef<HTMLDivElement>(null)
   const haeAwsTrailDetailRef = useRef<HTMLDivElement>(null)
@@ -72,7 +200,15 @@ export default function IncidentHaePage() {
         title="침해"
         subtitle="침해 사고 측면에서 수집 가능한 로그·지표 요약입니다. CloudWatch·Prometheus·CloudTrail로 제공되는 범위만 표시합니다."
         lastUpdated={lastUpdatedStr}
-        actions={<LogPageHeaderActions page="hae" />}
+        actions={
+          <LogPageHeaderActions
+            page="hae"
+            onReport={() => void handleReport()}
+            reportLoading={reportLoading}
+            onAnalyze={() => void handleAnalyze()}
+            analysisLoading={analysisLoading}
+          />
+        }
       />
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <InfraAwsTabs
@@ -167,6 +303,13 @@ export default function IncidentHaePage() {
           </div>
         </section>
       )}
+      <IncidentAiSummaryDialog
+        open={analysisOpen}
+        loading={analysisLoading}
+        error={analysisError}
+        analysis={analysis}
+        onClose={() => setAnalysisOpen(false)}
+      />
     </div>
   )
 }

@@ -4,51 +4,69 @@ import { cn } from '@/lib/utils'
 type PageKind = 'monitoring' | 'incident' | 'gwanje' | 'hae'
 
 interface LogPageHeaderActionsProps {
-  /** 추후 보고서/AI API 구분용 */
   page: PageKind
   className?: string
+  onReport?: () => void
+  reportLoading?: boolean
+  onAnalyze?: () => void
+  analysisLoading?: boolean
 }
 
 function reportContextLabel(page: PageKind): string {
   if (page === 'monitoring' || page === 'gwanje') return '관제'
   if (page === 'hae') return '침해'
-  return '침해사고'
+  return '관제·침해'
 }
 
-/**
- * 관제측면 로그 / 침해사고 측면 로그 / 관제·침해 요약 페이지 공통 — 보고서 출력 · AI 분석
- * (동작은 추후 연동; 현재는 플레이스홀더)
- */
-export default function LogPageHeaderActions({ page, className }: LogPageHeaderActionsProps) {
+export default function LogPageHeaderActions({
+  page,
+  className,
+  onReport,
+  reportLoading = false,
+  onAnalyze,
+  analysisLoading = false,
+}: LogPageHeaderActionsProps) {
   const label = reportContextLabel(page)
 
   return (
-    <div className={cn('flex items-center gap-2 flex-wrap justify-end', className)}>
+    <div className={cn('flex flex-wrap items-center justify-end gap-2', className)}>
       <button
         type="button"
         className={cn(
           'inline-flex items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-medium',
-          'text-gray-800 shadow-sm transition-colors hover:bg-gray-50',
+          'text-gray-800 shadow-sm transition-colors hover:bg-gray-50 disabled:cursor-wait disabled:opacity-80',
         )}
         onClick={() => {
+          if (onReport) {
+            onReport()
+            return
+          }
+
           window.alert(`「${label}」보고서 출력은 준비 중입니다.`)
         }}
+        disabled={reportLoading}
       >
-        <FileDown className="w-4 h-4 shrink-0 text-gray-600" aria-hidden />
-        보고서 출력
+        <FileDown className="h-4 w-4 shrink-0 text-gray-600" aria-hidden />
+        {reportLoading ? '보고서 생성중...' : '보고서 출력'}
       </button>
       <button
         type="button"
         className={cn(
           'inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-600 px-3 py-2 text-sm font-medium',
-          'text-white shadow-sm transition-colors hover:bg-indigo-700',
+          'text-white shadow-sm transition-colors hover:bg-indigo-700 disabled:cursor-wait disabled:opacity-80',
         )}
         onClick={() => {
+          if (onAnalyze) {
+            onAnalyze()
+            return
+          }
+
           window.alert(`「${label}」AI 분석은 준비 중입니다.`)
         }}
+        disabled={analysisLoading}
       >
-        <Sparkles className="w-4 h-4 shrink-0" aria-hidden />
-        AI 분석
+        <Sparkles className="h-4 w-4 shrink-0" aria-hidden />
+        {analysisLoading ? 'AI 분석중...' : 'AI 분석'}
       </button>
     </div>
   )

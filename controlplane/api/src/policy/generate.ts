@@ -120,6 +120,7 @@ interface LocalPolicyClassificationResult {
 }
 
 interface ExtractedPolicySections {
+  checkDescription?: string
   purpose?: string
   inspectionCriteria?: string
   risk?: string
@@ -168,6 +169,7 @@ interface GeneratedPolicyArtifact {
   sourcePolicyId: string
   sourcePolicyTitle: string
   sourceExcerpt?: string
+  origin: PolicyGenerationMode
   policyName: string
   description: string
   summary: string
@@ -515,6 +517,82 @@ function cleanPolicyTitle(value: string) {
     .replace(/\s{2,}/g, ' ')
 }
 
+function stripLeadingSourcePolicyId(value: string, sourcePolicyId: string) {
+  const escapedId = sourcePolicyId
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/-/g, '[-_ ]?')
+
+  return cleanPolicyTitle(value.replace(new RegExp(`^${escapedId}(?:\\s*[:.)-]\\s*|\\s+)?`, 'i'), ''))
+}
+
+function looksLikeSectionHeading(line: string) {
+  return /^(importance|severity|inspection purpose|purpose|inspection criteria|criteria|risk|remediation|reference|notes?)\b/i.test(line)
+    || /^(점검 내용|점검목적|점검 목적|목적|보안 위협|위협|조치 방법|조치방안|조치 사항|진단 기준|판단 기준|참고|중요도|양호|취약)\b/.test(line)
+}
+
+function stripSectionLabelPrefix(value: string) {
+  return cleanPolicyTitle(
+    value.replace(/^(점검 내용|점검 목적|점검목적|보안 위협|조치 방법|조치방안|조치 사항|진단 기준|판단 기준|중요도|inspection purpose|purpose|inspection criteria|criteria|risk|remediation)\s*[:：]?\s*/i, ''),
+  )
+}
+
+function normalizeTitleCandidate(value: string) {
+  return cleanPolicyTitle(
+    value
+      .replace(/^[^A-Za-z가-힣0-9]+/, '')
+      .replace(/^(클라우드|aws|azure|gcp)\s*>\s*/i, '')
+      .replace(/^\d+\.\s*/, '')
+      .replace(/^[>/-]+\s*/, '')
+      .replace(/\s*>\s*/g, ' ')
+      .replace(/\s{2,}/g, ' '),
+  )
+}
+
+function looksLikeNarrativeTitle(line: string) {
+  return /(위함|차단하기|수행하기|확인하기|점검하기|존재함|가능함|필요함|해야 함|해야함|한다|함)$/.test(line)
+    || /[.!?]$/.test(line)
+}
+
+function isUsableTitleLine(line: string) {
+  if (line.length < 4 || line.length > 80) {
+    return false
+  }
+
+  if (/^extracted policy\b/i.test(line)) {
+    return false
+  }
+
+  if (looksLikeSectionHeading(line) || looksLikeNarrativeTitle(line)) {
+    return false
+  }
+
+  return true
+}
+
+function deriveSourcePolicyTitle(content: string, sourcePolicyId: string) {
+  const lines = normalizeWhitespace(content)
+    .split('\n')
+    .map((line) => normalizeTitleCandidate(stripSectionLabelPrefix(stripLeadingSourcePolicyId(line, sourcePolicyId))))
+    .filter(Boolean)
+
+  const titleLine = lines.find((line) => isUsableTitleLine(line))
+
+  if (titleLine) {
+    return titleLine
+  }
+
+  const summary = normalizeTitleCandidate(stripSectionLabelPrefix(stripLeadingSourcePolicyId(pickSummarySentence(content), sourcePolicyId)))
+  if (!summary) {
+    return ''
+  }
+
+  if (!isUsableTitleLine(summary)) {
+    return ''
+  }
+
+  return summary
+}
+
 function parseSourcePolicyHeading(line: string) {
   const match = line.match(/^\s*(?:\d+\.\s*)?(?<id>[A-Z]{1,6}[-_ ]?\d{2,4}(?:[-_ ]?\d{1,4})?)(?:\s*[:.)-]\s*|\s+)(?<title>.+)?$/i)
   if (!match?.groups?.id) {
@@ -593,6 +671,28 @@ function pickSummarySentence(text: string) {
   return longFallback.length > 220 ? `${longFallback.slice(0, 217).trimEnd()}...` : longFallback
 }
 
+function toPolicyCardDescription(text: string, fallback: string) {
+  const normalized = normalizeWhitespace(text)
+    .replace(/^(점검 내용|점검 목적|점검목적|보안 위협|조치 방법|조치방안|조치 사항|진단 기준|판단 기준|중요도)\s*[:：]?\s*/i, '')
+    .trim()
+
+  const firstSentence = normalized.split(/(?<=[.!?])\s+|\n+/)[0]?.trim() || ''
+  const candidate = firstSentence || normalized || fallback
+  return candidate.length > 110 ? `${candidate.slice(0, 107).trimEnd()}...` : candidate
+}
+
+function buildSourcePolicyDescription(sourcePolicy: SourcePolicyItem, fallback: string) {
+  const sections = extractPolicySections(sourcePolicy)
+  const candidate =
+    sections.checkDescription ||
+    sections.purpose ||
+    sections.inspectionCriteria ||
+    pickSummarySentence(sourcePolicy.content) ||
+    fallback
+
+  return toPolicyCardDescription(candidate, fallback)
+}
+
 function extractSourcePolicies(fileName: string, text: string): SourcePolicyItem[] {
   const lines = normalizeWhitespace(text)
     .split('\n')
@@ -640,12 +740,13 @@ function extractSourcePolicies(fileName: string, text: string): SourcePolicyItem
         const contentStart = start
         const contentEnd = index + 1 < regexMatches.length ? (regexMatches[index + 1].index ?? text.length) : text.length
         const content = normalizeWhitespace(text.slice(contentStart, contentEnd))
-        const titleCandidate = cleanPolicyTitle(content.slice(fullMatch.length).split('\n')[0] || '')
+        const firstLineTitle = cleanPolicyTitle(content.slice(fullMatch.length).split('\n')[0] || '')
+        const titleCandidate = firstLineTitle || deriveSourcePolicyTitle(content, sourcePolicyId)
 
         return {
           ordinal: index + 1,
           sourcePolicyId,
-          sourcePolicyTitle: titleCandidate || `Extracted Policy ${sourcePolicyId}`,
+          sourcePolicyTitle: titleCandidate || sourcePolicyId,
           content: content || `${sourcePolicyId} ${titleCandidate}`.trim(),
         }
       })
@@ -676,10 +777,7 @@ function extractSourcePolicies(fileName: string, text: string): SourcePolicyItem
 
   return candidates.map((candidate, index) => {
     const body = candidate.lines.join('\n').trim()
-    const fallbackTitle = body
-      .split('\n')
-      .map((line) => cleanPolicyTitle(line))
-      .find((line) => line.length >= 4 && line.length <= 120)
+    const fallbackTitle = deriveSourcePolicyTitle(body, candidate.sourcePolicyId)
     const baseId = candidate.sourcePolicyId || `POLICY-${index + 1}`
     const seenCount = seenIds.get(baseId) || 0
     seenIds.set(baseId, seenCount + 1)
@@ -688,7 +786,7 @@ function extractSourcePolicies(fileName: string, text: string): SourcePolicyItem
     return {
       ordinal: index + 1,
       sourcePolicyId,
-      sourcePolicyTitle: candidate.sourcePolicyTitle || fallbackTitle || `Extracted Policy ${index + 1}`,
+      sourcePolicyTitle: candidate.sourcePolicyTitle || fallbackTitle || sourcePolicyId,
       content: body || candidate.sourcePolicyTitle || sourcePolicyId,
     }
   })
@@ -801,6 +899,15 @@ function extractPolicySections(sourcePolicy: SourcePolicyItem): ExtractedPolicyS
     .filter(Boolean)
 
   return {
+    checkDescription: extractSectionByLabels(lines, [
+      '\uC810\uAC80 \uB0B4\uC6A9',
+      '\uC810\uAC80\uB0B4\uC6A9',
+      '\uC810\uAC80 \uD56D\uBAA9',
+      '\uC810\uAC80\uD56D\uBAA9',
+      '\uAC80\uD1A0 \uB0B4\uC6A9',
+      '\uAC80\uD1A0\uB0B4\uC6A9',
+      'inspection description',
+    ]),
     purpose: extractSectionByLabels(lines, ['점검 목적', '점검목적', '목적', 'inspection purpose']),
     inspectionCriteria: extractSectionByLabels(lines, [
       '판단 기준',
@@ -1027,6 +1134,7 @@ function buildNormalizedControl(
   const summarySentence = pickSummarySentence(sourcePolicy.content)
   const combinedText = [
     sourcePolicy.sourcePolicyTitle,
+    sections.checkDescription,
     sections.purpose,
     sections.inspectionCriteria,
     sections.risk,
@@ -1059,7 +1167,12 @@ function buildNormalizedControl(
     target_format: 'checkov_yaml',
     terraform_applicability: terraformApplicability,
     coverage_mode: coverageMode,
-    control_objective: sections.purpose || sections.inspectionCriteria || summarySentence || sourcePolicy.sourcePolicyTitle,
+    control_objective:
+      sections.checkDescription ||
+      sections.purpose ||
+      sections.inspectionCriteria ||
+      summarySentence ||
+      sourcePolicy.sourcePolicyTitle,
     pass_conditions: splitConditionSentences(sections.inspectionCriteria),
     fail_conditions: splitConditionSentences(sections.risk),
     implementation_examples: splitConditionSentences(sections.remediation),
@@ -1124,21 +1237,22 @@ function classifySourcePolicyLocally(
 
 function buildPolicyUserPrompt(normalizedControl: NormalizedControl) {
   return [
-    'Generate Terraform static-analysis policy artifacts from the following normalized control input.',
+    '아래의 정규화된 통제 항목 입력을 바탕으로 Terraform 정적 분석 정책 산출물을 생성하세요.',
     '',
     '[CONTROL]',
     JSON.stringify(compactJsonObject(normalizedControl as unknown as JsonObject)),
     '',
-    'Requirements:',
-    '- target format must follow target_format',
-    '- provider must follow provider',
-    '- use only resource_candidates',
-    '- use only allowed_evidence_fields',
-    '- never use forbidden_inferred_evidence',
-    '- do not hardcode Terraform resource names',
-    '- report uncovered conditions when coverage_mode is partial',
-    '- if sufficient grounded evidence does not exist, return cannot_generate',
-    '- output JSON only',
+    '요구사항:',
+    '- target_format 값을 반드시 따르세요.',
+    '- provider 값을 반드시 따르세요.',
+    '- 정책 로직은 control_objective, pass_conditions, fail_conditions, enforceable_conditions를 기준으로 판단하고, resource_candidates는 리소스 타입 선택의 참고 범위로 사용하세요.',
+    '- 다만 입력 근거 없이 resource_candidates 범위를 벗어나는 새 리소스 타입은 추가하지 마세요.',
+    '- allowed_evidence_fields에 포함된 증거 필드만 사용하세요.',
+    '- forbidden_inferred_evidence에 해당하는 추론 근거는 절대 사용하지 마세요.',
+    '- Terraform 로컬 리소스 이름을 하드코딩하지 마세요.',
+    '- coverage_mode가 partial이면 커버하지 못한 조건을 반드시 보고하세요.',
+    '- 근거 있는 정책 로직을 만들 수 없으면 status를 cannot_generate로 반환하세요.',
+    '- 응답은 JSON만 반환하세요.',
   ].join('\n')
 }
 
@@ -1148,7 +1262,7 @@ function buildRepairUserPrompt(
   errors: string[],
 ) {
   return [
-    'Repair the policy package using the validator errors below.',
+    '아래 validator 오류를 반영해 정책 패키지를 수정하세요.',
     '',
     '[NORMALIZED_CONTROL]',
     JSON.stringify(compactJsonObject(normalizedControl as unknown as JsonObject)),
@@ -1291,8 +1405,6 @@ function inferFallbackDefinition(text: string, provider: CheckovProvider): JsonO
 function buildFallbackDraftForSourcePolicy(fileName: string, sourcePolicy: SourcePolicyItem): ResolvedPolicyDraft | null {
   const text = sourcePolicy.content
   const provider = detectProvider(text)
-  const sourceTitle = humanizeFileName(fileName)
-  const summarySentence = pickSummarySentence(text)
   const template = selectBestFallbackTemplate(text)
   const normalizedSourcePolicyId = normalizeSourcePolicyId(sourcePolicy.sourcePolicyId)
 
@@ -1306,9 +1418,7 @@ function buildFallbackDraftForSourcePolicy(fileName: string, sourcePolicy: Sourc
     sourcePolicyId: normalizedSourcePolicyId,
     sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
     policyName,
-    description:
-      summarySentence ||
-      `${template.description} Source: ${sourceTitle} ${normalizedSourcePolicyId}.`,
+    description: buildSourcePolicyDescription(sourcePolicy, template.description),
     summary: template.summary,
     policyId: getGeneratedPolicyId(normalizedSourcePolicyId),
     category: template.category,
@@ -1349,9 +1459,10 @@ function buildBaseDraftForSourcePolicy(fileName: string, sourcePolicy: SourcePol
     sourcePolicyId: normalizedSourcePolicyId,
     sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
     policyName,
-    description:
-      pickSummarySentence(sourcePolicy.content) ||
-      `Derived from ${humanizeFileName(fileName)} ${normalizedSourcePolicyId}. Review before applying.`,
+    description: buildSourcePolicyDescription(
+      sourcePolicy,
+      `Terraform AWS control for ${normalizedSourcePolicyId}.`,
+    ),
     summary: `Derived a Terraform AWS control from ${normalizedSourcePolicyId}.`,
     policyId: getGeneratedPolicyId(normalizedSourcePolicyId),
     category: 'GENERAL_SECURITY',
@@ -1465,10 +1576,6 @@ function normalizeGeneratedPolicyPackagePolicy(value: unknown): GeneratedPolicyP
   }
 
   if (
-    typeof value.id !== 'string' ||
-    typeof value.file_name !== 'string' ||
-    typeof value.title !== 'string' ||
-    typeof value.rationale !== 'string' ||
     !Array.isArray(value.resource_types) ||
     typeof value.content !== 'string'
   ) {
@@ -1476,10 +1583,10 @@ function normalizeGeneratedPolicyPackagePolicy(value: unknown): GeneratedPolicyP
   }
 
   return {
-    id: value.id.trim(),
-    file_name: value.file_name.trim(),
-    title: value.title.trim(),
-    rationale: value.rationale.trim(),
+    id: typeof value.id === 'string' ? value.id.trim() : '',
+    file_name: typeof value.file_name === 'string' ? value.file_name.trim() : '',
+    title: typeof value.title === 'string' ? value.title.trim() : '',
+    rationale: typeof value.rationale === 'string' ? value.rationale.trim() : '',
     resource_types: normalizeStringArray(value.resource_types),
     content: value.content.trim(),
   }
@@ -1586,6 +1693,249 @@ function extractYamlResourceTypes(yamlContent: string): string[] {
   return [...new Set(resourceTypes)]
 }
 
+function resolveGeneratedPolicyResourceTypes(
+  policyResourceTypes: string[],
+  fallbackResourceTypes: string[],
+  candidateResourceTypes: string[],
+) {
+  const allowed = new Set(candidateResourceTypes)
+  const fromPolicy = normalizeStringArray(policyResourceTypes).filter((resourceType) => allowed.has(resourceType))
+  if (fromPolicy.length > 0) {
+    return fromPolicy
+  }
+
+  const fromFallback = fallbackResourceTypes.filter((resourceType) => allowed.has(resourceType))
+  if (fromFallback.length > 0) {
+    return [...new Set(fromFallback)]
+  }
+
+  return candidateResourceTypes.length > 0 ? [...new Set(candidateResourceTypes)] : [...new Set(fallbackResourceTypes)]
+}
+
+function setYamlMetadataSeverity(yamlContent: string, severity: string) {
+  const lines = normalizeGeneratedYamlContent(yamlContent).split(/\r?\n/)
+  const metadataIndex = lines.findIndex((line) => /^(\s*)metadata:\s*$/.test(line))
+  if (metadataIndex < 0) {
+    return normalizeGeneratedYamlContent(yamlContent)
+  }
+
+  const metadataIndent = lines[metadataIndex].match(/^\s*/)?.[0].length || 0
+  let insertIndex = lines.length
+  let severityIndex = -1
+
+  for (let index = metadataIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    const trimmed = line.trim()
+    const indent = line.match(/^\s*/)?.[0].length || 0
+
+    if (trimmed && indent <= metadataIndent) {
+      insertIndex = index
+      break
+    }
+
+    if (/^\s*severity:\s*/.test(line)) {
+      severityIndex = index
+    }
+  }
+
+  const severityLine = `${' '.repeat(metadataIndent + 2)}severity: ${severity}`
+  if (severityIndex >= 0) {
+    lines[severityIndex] = severityLine
+  } else {
+    lines.splice(insertIndex, 0, severityLine)
+  }
+
+  return normalizeGeneratedYamlContent(lines.join('\n'))
+}
+
+function setYamlDefinitionResourceTypes(yamlContent: string, resourceTypes: string[]) {
+  if (resourceTypes.length === 0) {
+    return normalizeGeneratedYamlContent(yamlContent)
+  }
+
+  const lines = normalizeGeneratedYamlContent(yamlContent).split(/\r?\n/)
+  const definitionIndex = lines.findIndex((line) => /^(\s*)definition:\s*$/.test(line))
+  if (definitionIndex < 0) {
+    return normalizeGeneratedYamlContent(yamlContent)
+  }
+
+  const definitionIndent = lines[definitionIndex].match(/^\s*/)?.[0].length || 0
+  let insertIndex = definitionIndex + 1
+  let resourceTypeStart = -1
+  let resourceTypeEnd = -1
+
+  for (let index = definitionIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    const trimmed = line.trim()
+    const indent = line.match(/^\s*/)?.[0].length || 0
+
+    if (trimmed && indent <= definitionIndent) {
+      insertIndex = index
+      break
+    }
+
+    if (/^\s*resource_types:\s*\[.*\]\s*$/.test(line)) {
+      resourceTypeStart = index
+      resourceTypeEnd = index + 1
+      break
+    }
+
+    const blockMatch = line.match(/^(\s*)resource_types:\s*$/)
+    if (blockMatch) {
+      resourceTypeStart = index
+      resourceTypeEnd = index + 1
+      const blockIndent = blockMatch[1].length
+
+      for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+        const nextLine = lines[nextIndex]
+        const nextTrimmed = nextLine.trim()
+        const nextIndent = nextLine.match(/^\s*/)?.[0].length || 0
+
+        if (nextTrimmed && nextIndent <= blockIndent) {
+          resourceTypeEnd = nextIndex
+          break
+        }
+
+        resourceTypeEnd = nextIndex + 1
+      }
+      break
+    }
+  }
+
+  const resourceTypeLines = [
+    `${' '.repeat(definitionIndent + 2)}resource_types:`,
+    ...resourceTypes.map((resourceType) => `${' '.repeat(definitionIndent + 4)}- ${resourceType}`),
+  ]
+
+  if (resourceTypeStart >= 0) {
+    lines.splice(resourceTypeStart, resourceTypeEnd - resourceTypeStart, ...resourceTypeLines)
+  } else {
+    lines.splice(insertIndex, 0, ...resourceTypeLines)
+  }
+
+  return normalizeGeneratedYamlContent(lines.join('\n'))
+}
+
+function stripGeneratedYamlDocumentMarker(yamlContent: string) {
+  return yamlContent.replace(/\r/g, '').replace(/^---\s*\n?/, '').trim()
+}
+
+function indentYamlBlock(content: string, spaces: number) {
+  const prefix = ' '.repeat(spaces)
+  return content
+    .split('\n')
+    .map((line) => (line.trim() ? `${prefix}${line}` : ''))
+    .join('\n')
+}
+
+function buildPolicyMetadataSection(draft: ResolvedPolicyDraft, severity: CheckovSeverity) {
+  return serializeYaml({
+    metadata: {
+      id: draft.policyId,
+      name: draft.policyName,
+      category: draft.category,
+      severity,
+      ...(draft.guideline ? { guideline: draft.guideline } : {}),
+    },
+  }).trim()
+}
+
+function buildPolicyScopeSection(draft: ResolvedPolicyDraft) {
+  return serializeYaml({
+    scope: {
+      provider: draft.provider,
+    },
+  }).trim()
+}
+
+function buildCanonicalPolicyYamlContent(
+  yamlContent: string,
+  fallbackDraft: ResolvedPolicyDraft,
+  severity: CheckovSeverity,
+  resourceTypes: string[],
+) {
+  const fallbackDefinition = {
+    ...fallbackDraft.definition,
+    ...(resourceTypes.length > 0 ? { resource_types: resourceTypes } : {}),
+  }
+
+  const rawBody = stripGeneratedYamlDocumentMarker(yamlContent)
+  if (!rawBody) {
+    return buildCustomPolicyYaml({
+      ...fallbackDraft,
+      severity,
+      definition: fallbackDefinition,
+    })
+  }
+
+  let canonicalYaml = normalizeGeneratedYamlContent(yamlContent)
+  const hasMetadata = /^(\s*)metadata:\s*$/m.test(canonicalYaml)
+  const hasScope = /^(\s*)scope:\s*$/m.test(canonicalYaml)
+  const hasDefinition = /^(\s*)definition:\s*$/m.test(canonicalYaml)
+
+  if (!hasDefinition) {
+    canonicalYaml = normalizeGeneratedYamlContent(
+      [
+        buildPolicyMetadataSection(fallbackDraft, severity),
+        buildPolicyScopeSection(fallbackDraft),
+        'definition:',
+        indentYamlBlock(rawBody, 2),
+      ].join('\n'),
+    )
+  } else if (!hasMetadata || !hasScope) {
+    const sections: string[] = []
+    if (!hasMetadata) {
+      sections.push(buildPolicyMetadataSection(fallbackDraft, severity))
+    }
+    if (!hasScope) {
+      sections.push(buildPolicyScopeSection(fallbackDraft))
+    }
+    sections.push(stripGeneratedYamlDocumentMarker(canonicalYaml))
+    canonicalYaml = normalizeGeneratedYamlContent(sections.join('\n'))
+  }
+
+  canonicalYaml = setYamlMetadataSeverity(canonicalYaml, severity)
+  canonicalYaml = setYamlDefinitionResourceTypes(canonicalYaml, resourceTypes)
+  return canonicalYaml
+}
+
+function applyFallbackDefaultsToPolicyPackage(
+  packageCandidate: JsonObject,
+  fallbackDraft: ResolvedPolicyDraft,
+  normalizedControl: NormalizedControl,
+) {
+  const normalizedPackage = normalizeGeneratedPolicyPackage(packageCandidate)
+  if (!normalizedPackage) {
+    return packageCandidate
+  }
+
+  const fallbackResourceTypes = findResourceTypes(fallbackDraft.definition)
+  const canonicalSeverity = normalizedControl.source_severity || fallbackDraft.severity
+
+  return {
+    ...normalizedPackage,
+    policies: normalizedPackage.policies.map((policy) => {
+      const canonicalResourceTypes = resolveGeneratedPolicyResourceTypes(
+        policy.resource_types,
+        fallbackResourceTypes,
+        normalizedControl.resource_candidates,
+      )
+      const content = buildCanonicalPolicyYamlContent(
+        policy.content,
+        fallbackDraft,
+        canonicalSeverity,
+        canonicalResourceTypes,
+      )
+
+      return {
+        ...policy,
+        resource_types: canonicalResourceTypes,
+        content,
+      }
+    }),
+  } as JsonObject
+}
+
 function containsForbiddenInventedAttrs(yamlContent: string, normalizedControl: NormalizedControl) {
   const forbiddenEvidence = new Set(normalizedControl.forbidden_inferred_evidence)
   if (![...forbiddenEvidence].some((value) => /tags/i.test(value))) {
@@ -1655,7 +2005,7 @@ function validatePolicyPackage(pkg: JsonObject, normalizedControl: NormalizedCon
       return
     }
 
-    const requiredPolicyKeys = ['id', 'file_name', 'title', 'rationale', 'resource_types', 'content']
+    const requiredPolicyKeys = ['resource_types', 'content']
     const missingPolicyKeys = requiredPolicyKeys.filter((key) => !(key in policyValue))
     if (missingPolicyKeys.length > 0) {
       errors.push(`policy[${index}] missing key(s): ${missingPolicyKeys.join(', ')}`)
@@ -1665,6 +2015,11 @@ function validatePolicyPackage(pkg: JsonObject, normalizedControl: NormalizedCon
     const normalizedPolicy = normalizeGeneratedPolicyPackagePolicy(policyValue)
     if (!normalizedPolicy) {
       errors.push(`policy[${index}] has invalid field types`)
+      return
+    }
+
+    if (!normalizedPolicy.content) {
+      errors.push(`policy[${index}] content is empty`)
       return
     }
 
@@ -2041,7 +2396,9 @@ function buildBatchSummary(fileName: string, count: number, mode: PolicyGenerati
 
 const POLICY_CLASSIFICATION_ATTEMPTS = [{ maxTokens: 1200 }] as const
 const POLICY_PACKAGE_MAX_TOKENS = 2400
+const POLICY_PACKAGE_RETRY_MAX_TOKENS = 3600
 const POLICY_REPAIR_MAX_TOKENS = 2400
+const POLICY_REPAIR_RETRY_MAX_TOKENS = 3600
 
 function buildPolicyClassificationSystemPrompt() {
   return [
@@ -2084,53 +2441,52 @@ function buildPolicyClassificationSystemPrompt() {
 
 function buildPolicyDefinitionSystemPrompt() {
   return [
-    'You are a Terraform static-analysis policy generator.',
+    '당신은 Terraform 정적 분석 정책 생성기입니다.',
     '',
-    'You receive one compact normalized control object produced by deterministic code.',
-    'You must generate policy artifacts only from the provided JSON input.',
-    'Do not assume access to the original PDF, raw source text, or any unstated context.',
+    '당신은 결정적 코드가 만든 하나의 간결한 normalized control 객체를 입력으로 받습니다.',
+    '제공된 JSON 입력만 근거로 정책 산출물을 생성해야 합니다.',
+    '원본 PDF, 원문 텍스트, 혹은 입력에 없는 맥락을 알고 있다고 가정하지 마세요.',
     '',
-    'Hard rules:',
-    '1. Generate policy logic from:',
+    '강제 규칙:',
+    '1. 정책 로직은 반드시 아래 항목을 근거로 생성하세요:',
     '   - control_objective',
     '   - pass_conditions',
     '   - fail_conditions',
     '   - enforceable_conditions',
-    '   not from implementation_examples alone.',
-    '2. Treat implementation_examples as hints, not as mandatory logic, unless explicitly stated as mandatory in the input.',
-    '3. Use only resource types listed in resource_candidates.',
-    '4. Use only allowed_evidence_fields.',
-    '5. Never use forbidden_inferred_evidence.',
-    '6. Never invent tagging schemes or classification attributes such as:',
+    '   implementation_examples만으로 정책 로직을 만들면 안 됩니다.',
+    '2. implementation_examples는 힌트로만 사용하세요. 입력에서 명시적으로 필수라고 한 경우가 아니면 강제 로직으로 취급하지 마세요.',
+    '3. 정책 로직은 control_objective, pass_conditions, fail_conditions, enforceable_conditions를 기준으로 만들고, resource_candidates는 리소스 타입 선택의 참고 범위로 사용하세요.',
+    '4. 입력 근거 없이 resource_candidates 범위를 벗어나는 새 리소스 타입은 추가하지 마세요.',
+    '5. allowed_evidence_fields에 포함된 필드만 사용하세요.',
+    '6. forbidden_inferred_evidence에 해당하는 추론은 절대 사용하지 마세요.',
+    '7. 아래와 같은 태깅 체계나 분류 속성을 임의로 만들어내지 마세요:',
     '   - tags.NetworkType',
     '   - tags.subnet_type',
     '   - tags.public_private',
-    '   unless explicitly present in the input as allowed evidence.',
-    '7. Never infer public/private separation from tags, labels, or naming conventions alone.',
-    '8. For topology or segmentation controls, prefer route tables, subnet associations, routing paths, and gateway attachments over tag checks.',
-    '9. Never hardcode Terraform local resource names such as:',
+    '   입력에 허용된 증거로 명시된 경우가 아니면 사용하면 안 됩니다.',
+    '8. 태그, 라벨, 이름 규칙만으로 public/private 분리를 추론하지 마세요.',
+    '9. 토폴로지나 네트워크 분리 통제는 태그 검사보다 route table, subnet association, routing path, gateway attachment 같은 실제 연결 정보를 우선 사용하세요.',
+    '10. 아래와 같은 Terraform 로컬 리소스 이름을 하드코딩하지 마세요:',
     '   - aws_route_table.public',
     '   - aws_nat_gateway.example',
     '   - aws_subnet.private',
     '   - aws_security_group.main',
-    '10. If terraform_applicability is "partial", generate only the enforceable subset and explicitly report uncovered conditions.',
-    '11. Do not convert operational, governance, approval, review-frequency, or human-process requirements into code.',
-    '12. Reject tautological logic, always-true logic, and always-false logic.',
-    '13. If the control requires evidence that is not available from the input, return status="cannot_generate".',
-    '14. Preserve source_severity unless explicitly overridden in the input.',
-    '15. Output valid JSON only. No markdown. No explanation.',
+    '11. terraform_applicability가 "partial"이면 실제로 강제 가능한 조건만 생성하고, 커버하지 못한 조건을 명시적으로 보고하세요.',
+    '12. 운영 절차, 거버넌스, 승인, 검토 주기, 사람의 수동 프로세스 요구사항을 코드 규칙으로 변환하지 마세요.',
+    '13. 항상 참/항상 거짓/의미 없는 중복 조건 같은 tautology 로직을 만들지 마세요.',
+    '14. 입력만으로 확보할 수 없는 증거가 필요하면 status="cannot_generate"를 반환하세요.',
+    '15. 입력에서 별도 지시가 없는 한 source_severity를 유지하세요.',
+    '16. 유효한 JSON만 반환하세요. Markdown이나 설명 문장은 넣지 마세요.',
+    '17. id, file name, title, severity, provider 같은 정책 메타데이터는 서버가 생성합니다.',
+    '18. 당신은 메타데이터가 아니라 정책 로직만 생성해야 합니다.',
     '',
-    'Return exactly this schema:',
+    '반드시 아래 스키마만 그대로 반환하세요:',
     '{',
     '  "status": "ok | cannot_generate",',
     '  "policy_format": "string",',
     '  "coverage_mode": "full | partial",',
     '  "policies": [',
     '    {',
-    '      "id": "string",',
-    '      "file_name": "string",',
-    '      "title": "string",',
-    '      "rationale": "string",',
     '      "resource_types": ["string"],',
     '      "content": "string"',
     '    }',
@@ -2146,34 +2502,39 @@ function buildPolicyDefinitionSystemPrompt() {
 
 function buildPolicyRepairSystemPrompt() {
   return [
-    'You are a policy-package repair engine.',
+    '당신은 정책 패키지 수정 엔진입니다.',
     '',
-    'You receive:',
-    '1. a previously generated policy package',
-    '2. validator errors',
-    '3. the original normalized control input',
+    '입력으로 다음 세 가지를 받습니다:',
+    '1. 이전에 생성된 정책 패키지',
+    '2. validator 오류 목록',
+    '3. 원래 normalized control 입력',
     '',
-    'Fix only the reported issues while preserving valid parts.',
+    '정상인 부분은 유지하고, 보고된 문제만 수정하세요.',
     '',
-    'Rules:',
-    '1. Do not change the output JSON schema.',
-    '2. Do not introduce hardcoded Terraform resource names.',
-    '3. Do not introduce invented tag-based evidence or naming-based classification.',
-    '4. Do not add policy intent beyond the normalized control input.',
-    '5. If safe repair is not possible, return status="cannot_generate".',
-    '6. Output valid JSON only.',
+    '규칙:',
+    '1. 출력 JSON 스키마를 바꾸지 마세요.',
+    '1a. id, file name, title, severity, provider 같은 메타데이터는 서버가 관리합니다. 정책 로직만 수정하세요.',
+    '2. Terraform 로컬 리소스 이름을 하드코딩하지 마세요.',
+    '3. 태그 기반 증거나 이름 기반 분류를 임의로 추가하지 마세요.',
+    '4. normalized control 입력을 넘어서는 정책 의도를 덧붙이지 마세요.',
+    '5. 안전한 수정이 불가능하면 status="cannot_generate"를 반환하세요.',
+    '6. 유효한 JSON만 반환하세요.',
   ].join('\n')
 }
 void POLICY_CLASSIFICATION_ATTEMPTS
 void buildPolicyClassificationSystemPrompt
 
 function formatLlmJsonError(content: string, finishReason?: string) {
-  const preview = content.replace(/\s+/g, ' ').slice(0, 220)
   if (finishReason === 'MAX_TOKENS') {
-    return `Gemini response was truncated at MAX_TOKENS before valid JSON could be parsed. Preview: ${preview}`
+    return 'Gemini exceeded MAX_TOKENS before valid JSON could be parsed.'
   }
 
+  const preview = content.replace(/\s+/g, ' ').slice(0, 160)
   return `Gemini returned non-JSON content. Preview: ${preview}${finishReason ? ` (finishReason: ${finishReason})` : ''}`
+}
+
+function isMaxTokensError(error?: string) {
+  return typeof error === 'string' && /MAX_TOKENS/i.test(error)
 }
 
 async function requestPolicyPackage(
@@ -2217,7 +2578,6 @@ function normalizeGeneratedPolicyId(policyId: string, fallback: string) {
   const normalized = policyId.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
   return normalized || fallback
 }
-
 function normalizeGeneratedYamlContent(content: string) {
   const normalized = content.replace(/\r/g, '').trim()
   if (!normalized) {
@@ -2241,15 +2601,15 @@ function resolveGeneratedPolicyPackageDraft(
   return {
     sourcePolicyId: sourcePolicy.sourcePolicyId,
     sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
-    policyName: policy.title || fallback.policyName,
-    description: policy.rationale || fallback.description,
+    policyName: fallback.policyName,
+    description: buildSourcePolicyDescription(sourcePolicy, fallback.description),
     summary: notCoveredSummary,
-    policyId: normalizeGeneratedPolicyId(policy.id, fallback.policyId),
+    policyId: fallback.policyId,
     category: fallback.category,
     severity: fallback.severity,
     provider: fallback.provider,
     guideline: fallback.guideline,
-    fileName: normalizeGeneratedFileName(policy.file_name, fallback.fileName),
+    fileName: fallback.fileName,
     definition: fallback.definition,
     yamlContent: normalizeGeneratedYamlContent(policy.content),
   }
@@ -2277,11 +2637,19 @@ async function generateWithLlm(
         continue
       }
 
-      const initialResult = await requestPolicyPackage(
+      let initialResult = await requestPolicyPackage(
         buildPolicyDefinitionSystemPrompt(),
         buildPolicyUserPrompt(localClassification.normalizedControl),
         POLICY_PACKAGE_MAX_TOKENS,
       )
+
+      if (!initialResult.parsed && isMaxTokensError(initialResult.error)) {
+        initialResult = await requestPolicyPackage(
+          buildPolicyDefinitionSystemPrompt(),
+          buildPolicyUserPrompt(localClassification.normalizedControl),
+          POLICY_PACKAGE_RETRY_MAX_TOKENS,
+        )
+      }
 
       if (!initialResult.parsed) {
         const definitionError = `${sourcePolicy.sourcePolicyId}: ${initialResult.error || 'Gemini returned no usable content.'}`
@@ -2294,7 +2662,11 @@ async function generateWithLlm(
         continue
       }
 
-      let packageCandidate = initialResult.parsed
+      let packageCandidate = applyFallbackDefaultsToPolicyPackage(
+        initialResult.parsed,
+        localClassification.fallbackDraft,
+        localClassification.normalizedControl,
+      )
       const initialStatus = typeof packageCandidate.status === 'string' ? packageCandidate.status.trim().toLowerCase() : ''
       if (initialStatus === 'cannot_generate') {
         skippedPolicies.push({
@@ -2307,11 +2679,19 @@ async function generateWithLlm(
 
       let validationErrors = validatePolicyPackage(packageCandidate, localClassification.normalizedControl)
       if (validationErrors.length > 0) {
-        const repairResult = await requestPolicyPackage(
+        let repairResult = await requestPolicyPackage(
           buildPolicyRepairSystemPrompt(),
           buildRepairUserPrompt(localClassification.normalizedControl, packageCandidate, validationErrors),
           POLICY_REPAIR_MAX_TOKENS,
         )
+
+        if (!repairResult.parsed && isMaxTokensError(repairResult.error)) {
+          repairResult = await requestPolicyPackage(
+            buildPolicyRepairSystemPrompt(),
+            buildRepairUserPrompt(localClassification.normalizedControl, packageCandidate, validationErrors),
+            POLICY_REPAIR_RETRY_MAX_TOKENS,
+          )
+        }
 
         if (!repairResult.parsed) {
           const repairError = `${sourcePolicy.sourcePolicyId}: ${repairResult.error || 'Gemini repair returned no usable content.'}`
@@ -2324,7 +2704,11 @@ async function generateWithLlm(
           continue
         }
 
-        packageCandidate = repairResult.parsed
+        packageCandidate = applyFallbackDefaultsToPolicyPackage(
+          repairResult.parsed,
+          localClassification.fallbackDraft,
+          localClassification.normalizedControl,
+        )
         const repairedStatus = typeof packageCandidate.status === 'string' ? packageCandidate.status.trim().toLowerCase() : ''
         if (repairedStatus === 'cannot_generate') {
           skippedPolicies.push({
@@ -2442,11 +2826,27 @@ export async function generatePolicyFromPdf(input: GeneratePolicyRequest): Promi
   const sourcePolicies = extractSourcePolicies(input.fileName, text)
   const sourcePolicyMap = new Map(sourcePolicies.map((sourcePolicy) => [sourcePolicy.sourcePolicyId, sourcePolicy]))
   const llmResult = await generateWithLlm(input.fileName, sourcePolicies)
-  const resolvedDrafts = llmResult?.drafts || []
-  const policies = resolvedDrafts.map((draft) => ({
+  const resolvedDrafts = uniquifyDrafts(llmResult?.drafts || [])
+  const generatedSourcePolicyIds = new Set(resolvedDrafts.map((draft) => draft.sourcePolicyId))
+  const skippedReasonMap = new Map<string, string>()
+
+  for (const item of llmResult?.skippedPolicies || []) {
+    skippedReasonMap.set(item.sourcePolicyId, item.reason)
+  }
+
+  const skippedPolicies = sourcePolicies
+    .filter((sourcePolicy) => !generatedSourcePolicyIds.has(sourcePolicy.sourcePolicyId))
+    .map((sourcePolicy) => ({
+      sourcePolicyId: sourcePolicy.sourcePolicyId,
+      sourcePolicyTitle: sourcePolicy.sourcePolicyTitle,
+      reason: skippedReasonMap.get(sourcePolicy.sourcePolicyId) || '정책을 생성하지 못했습니다.',
+    }))
+
+  const policies: GeneratedPolicyArtifact[] = resolvedDrafts.map((draft) => ({
     sourcePolicyId: draft.sourcePolicyId,
     sourcePolicyTitle: draft.sourcePolicyTitle,
     sourceExcerpt: sourcePolicyMap.get(draft.sourcePolicyId)?.content,
+    origin: (draft.yamlContent ? 'llm' : 'fallback') as PolicyGenerationMode,
     policyName: draft.policyName,
     description: draft.description,
     summary: draft.summary,
@@ -2458,16 +2858,18 @@ export async function generatePolicyFromPdf(input: GeneratePolicyRequest): Promi
     yaml: draft.yamlContent || buildCustomPolicyYaml(draft),
   }))
 
+  const shouldSurfaceLlmError = policies.length === 0
+
   return {
     ok: true,
     mode: 'llm',
     provider: llmResult?.provider || 'gemini',
     attemptedProvider: llmResult?.attemptedProvider,
-    llmError: llmResult?.error,
+    llmError: shouldSurfaceLlmError ? llmResult?.error : undefined,
     fileName: input.fileName,
     summary: llmResult?.summary || buildBatchSummary(input.fileName, policies.length, 'llm'),
     policyCount: policies.length,
     policies,
-    skippedPolicies: llmResult?.skippedPolicies || [],
+    skippedPolicies,
   }
 }

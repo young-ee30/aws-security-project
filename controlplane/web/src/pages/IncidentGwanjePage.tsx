@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
+import IncidentAiSummaryDialog from '@/components/incident/IncidentAiSummaryDialog'
 import { PageHeader } from '@/components/layout/Header'
 import LogPageHeaderActions from '@/components/layout/LogPageHeaderActions'
 import InfraAwsTabs, { type InfraAwsScope } from '@/components/common/InfraAwsTabs'
@@ -8,9 +9,9 @@ import GwanjeMemoryTrendCards from '@/components/charts/GwanjeMemoryTrendCards'
 import GwanjeDiskIoTrendCards from '@/components/charts/GwanjeDiskIoTrendCards'
 import GwanjeNodeRuntimeDetailCards from '@/components/charts/GwanjeNodeRuntimeDetailCards'
 import GwanjeAlbResponseTimeCard from '@/components/charts/GwanjeAlbResponseTimeCard'
-import { useDashboardData } from '@/hooks/useDashboardData'
-import { useMetrics } from '@/hooks/useMetrics'
-import { useGwanjeInfraCards } from '@/hooks/useGwanjeInfraCards'
+import { useDashboardData, type DashboardData } from '@/hooks/useDashboardData'
+import { useMetrics, type MetricsState } from '@/hooks/useMetrics'
+import { useGwanjeInfraCards, type GwanjeInfraCard } from '@/hooks/useGwanjeInfraCards'
 import { useGwanjeAwsResourceCards } from '@/hooks/useGwanjeAwsResourceCards'
 import GwanjeAwsNetworkDetailCards from '@/components/charts/GwanjeAwsNetworkDetailCards'
 import GwanjeAwsRpsDetailCards from '@/components/charts/GwanjeAwsRpsDetailCards'
@@ -18,10 +19,129 @@ import GwanjeAwsHttpDetailCards from '@/components/charts/GwanjeAwsHttpDetailCar
 import GwanjeAwsConnectionHealthDetailCards from '@/components/charts/GwanjeAwsConnectionHealthDetailCards'
 import LogsMetricsErrorBoundary from '@/components/LogsMetricsErrorBoundary'
 import PrometheusHttpCard from '@/components/charts/PrometheusHttpCard'
+import {
+  requestIncidentAiAnalysis,
+  type IncidentAiAnalysisRequest,
+  type IncidentAiAnalysisResponse,
+  type IncidentAiLogLine,
+  type IncidentAiSeverity,
+} from '@/lib/incidentAi'
+import { exportIncidentReport } from '@/lib/incidentReport'
+
+function formatTimestamp(value?: number) {
+  if (!value || !Number.isFinite(value)) {
+    return undefined
+  }
+
+  const epochMs = value > 1_000_000_000_000 ? value : value * 1000
+  return new Date(epochMs).toLocaleString('ko-KR')
+}
+
+function inferMonitoringSeverity(text: string): IncidentAiSeverity {
+  const lower = text.toLowerCase()
+
+  if (/error|fatal|panic|exception|5xx|unhealthy|timeout|failed|alarm/i.test(lower)) {
+    return 'error'
+  }
+
+  if (/warn|warning|retry|lag|latency|high|spike|burst/i.test(lower)) {
+    return 'warn'
+  }
+
+  return 'info'
+}
+
+function normalizeCards(cards: GwanjeInfraCard[]) {
+  return cards.slice(0, 16).map((card) => ({
+    title: card.title,
+    value: card.value,
+    sub: card.sub,
+    source: card.source,
+  }))
+}
+
+function buildGwanjeAnalysisRequest(
+  dash: DashboardData,
+  metrics: MetricsState,
+  infraCards: GwanjeInfraCard[],
+  awsCards: GwanjeInfraCard[],
+  lastUpdated: string,
+): IncidentAiAnalysisRequest {
+  const logLines: IncidentAiLogLine[] = [
+    ...dash.ecsLogs.slice(0, 20).map((log) => ({
+      time: formatTimestamp(log.timestamp),
+      text: log.message,
+      severity: inferMonitoringSeverity(log.message),
+      source: 'cloudwatch',
+    })),
+    ...dash.vpcLogs.slice(0, 20).map((log) => ({
+      time: formatTimestamp(log.timestamp),
+      text: log.message,
+      severity: inferMonitoringSeverity(log.message),
+      source: 'cloudwatch',
+    })),
+    ...(dash.alarms?.alarms || []).slice(0, 8).map((alarm) => ({
+      time: alarm.updated_at,
+      text: `${alarm.name} ${alarm.state}: ${alarm.reason}`,
+      severity: (alarm.state === 'ALARM' ? 'error' : 'warn') as IncidentAiSeverity,
+      source: 'cloudwatch',
+    })),
+    ...metrics.routes.slice(0, 8).map((route) => ({
+      time: metrics.lastUpdated,
+      text: `${route.endpoint} RPS ${route.rps}, 4xx ${route['4xx']}, 5xx ${route['5xx']}, p95 ${route.p95}ms`,
+      severity: (route['5xx'] > 0 ? 'error' : route['4xx'] > 0 ? 'warn' : 'info') as IncidentAiSeverity,
+      source: 'prometheus',
+    })),
+  ]
+
+  if (metrics.runtime) {
+    logLines.push({
+      time: metrics.lastUpdated,
+      text: `Node runtime event loop p99 ${Math.round(metrics.runtime.eventLoopP99Ms)}ms, handles ${Math.round(metrics.runtime.activeHandles)}`,
+      severity: metrics.runtime.eventLoopP99Ms >= 200 ? 'warn' : 'info',
+      source: 'prometheus',
+    })
+  }
+
+  if (dash.albMetrics?.current) {
+    logLines.push({
+      time: lastUpdated,
+      text: `ALB response ${Math.round(dash.albMetrics.current.response_time_ms || 0)}ms, healthy ${dash.albMetrics.current.healthy_hosts}, unhealthy ${dash.albMetrics.current.unhealthy_hosts}, 5xx ${dash.albMetrics.current.http_5xx_last_bucket || 0}`,
+      severity:
+        (dash.albMetrics.current.unhealthy_hosts || 0) > 0 || (dash.albMetrics.current.http_5xx_last_bucket || 0) > 0
+          ? 'error'
+          : 'info',
+      source: 'cloudwatch',
+    })
+  }
+
+  if (dash.rdsMetrics?.current) {
+    logLines.push({
+      time: lastUpdated,
+      text: `RDS CPU ${dash.rdsMetrics.current.cpu_percent}%, connections ${dash.rdsMetrics.current.connections}, read latency ${dash.rdsMetrics.current.read_latency_ms}ms, write latency ${dash.rdsMetrics.current.write_latency_ms}ms`,
+      severity: dash.rdsMetrics.current.cpu_percent >= 80 ? 'warn' : 'info',
+      source: 'cloudwatch',
+    })
+  }
+
+  return {
+    page: 'gwanje',
+    title: '관제 전체 로그 AI 분석',
+    context: '관제 페이지 전체 로그와 성능 지표를 함께 요약한다. 현재 탭과 무관하게 페이지 전체 데이터를 기준으로 본다.',
+    lastUpdated,
+    summaryCards: [...normalizeCards(infraCards), ...normalizeCards(awsCards)].slice(0, 16),
+    logLines: logLines.slice(0, 80),
+  }
+}
 
 /** 관제 — 인프라 / AWS 리소스 탭 */
 export default function IncidentGwanjePage() {
   const [scope, setScope] = useState<InfraAwsScope>('infra')
+  const [analysisOpen, setAnalysisOpen] = useState(false)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [analysisError, setAnalysisError] = useState<string | null>(null)
+  const [analysis, setAnalysis] = useState<IncidentAiAnalysisResponse | null>(null)
+  const [reportLoading, setReportLoading] = useState(false)
   const dash = useDashboardData()
   const metrics = useMetrics()
   const infra = useGwanjeInfraCards(dash, metrics)
@@ -33,6 +153,43 @@ export default function IncidentGwanjePage() {
     if (dash.lastUpdated) return dash.lastUpdated.toLocaleTimeString('ko-KR')
     return metrics.lastUpdated !== '-' ? metrics.lastUpdated : '—'
   }, [headerLoading, dash.lastUpdated, metrics.lastUpdated])
+
+  const requestAnalysis = useCallback(async () => {
+    return requestIncidentAiAnalysis(
+      buildGwanjeAnalysisRequest(dash, metrics, infra.cards, awsResource.cards, lastUpdatedStr),
+    )
+  }, [awsResource.cards, dash, infra.cards, lastUpdatedStr, metrics])
+
+  const handleAnalyze = useCallback(async () => {
+    setAnalysisOpen(true)
+    setAnalysisLoading(true)
+    setAnalysisError(null)
+
+    try {
+      const result = await requestAnalysis()
+      setAnalysis(result)
+    } catch (error) {
+      setAnalysis(null)
+      setAnalysisError(error instanceof Error ? error.message : 'AI 분석 요청에 실패했습니다.')
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }, [requestAnalysis])
+
+  const handleReport = useCallback(async () => {
+    setReportLoading(true)
+
+    try {
+      const request = buildGwanjeAnalysisRequest(dash, metrics, infra.cards, awsResource.cards, lastUpdatedStr)
+      const result = await requestAnalysis()
+      setAnalysis(result)
+      exportIncidentReport({ request, analysis: result })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '보고서 출력에 실패했습니다.')
+    } finally {
+      setReportLoading(false)
+    }
+  }, [awsResource.cards, dash, infra.cards, lastUpdatedStr, metrics, requestAnalysis])
 
   const cpuDetailRef = useRef<HTMLDivElement>(null)
   const memoryDetailRef = useRef<HTMLDivElement>(null)
@@ -105,7 +262,15 @@ export default function IncidentGwanjePage() {
             : 'AWS 리소스(CloudWatch ALB·ECS 등) 요약입니다.'
         }
         lastUpdated={lastUpdatedStr}
-        actions={<LogPageHeaderActions page="gwanje" />}
+        actions={
+          <LogPageHeaderActions
+            page="gwanje"
+            onReport={() => void handleReport()}
+            reportLoading={reportLoading}
+            onAnalyze={() => void handleAnalyze()}
+            analysisLoading={analysisLoading}
+          />
+        }
       />
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <InfraAwsTabs value={scope} onChange={setScope} />
@@ -250,6 +415,13 @@ export default function IncidentGwanjePage() {
           </section>
         </div>
       )}
+      <IncidentAiSummaryDialog
+        open={analysisOpen}
+        loading={analysisLoading}
+        error={analysisError}
+        analysis={analysis}
+        onClose={() => setAnalysisOpen(false)}
+      />
     </div>
   )
 }

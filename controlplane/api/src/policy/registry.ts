@@ -3,6 +3,7 @@ import path from 'node:path'
 
 export type PolicyStatus = 'active' | 'draft' | 'paused'
 export type PolicyProvider = 'gemini' | 'fallback'
+export type PolicyOrigin = 'llm' | 'fallback'
 export type PolicySeverity = 'INFO' | 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 
 export interface RegistryPullRequest {
@@ -23,6 +24,7 @@ export interface RegistryPolicy {
   yaml: string
   policyPath: string
   provider: PolicyProvider
+  origin: PolicyOrigin
   policyId: string
   category: string
   severity: PolicySeverity
@@ -91,6 +93,14 @@ function normalizePolicy(value: unknown): RegistryPolicy | null {
     return null
   }
 
+  const provider = value.provider as PolicyProvider
+  const origin =
+    value.origin === 'llm' || value.origin === 'fallback'
+      ? value.origin
+      : provider === 'fallback'
+        ? 'fallback'
+        : 'llm'
+
   return {
     id: value.id,
     name: value.name,
@@ -102,7 +112,8 @@ function normalizePolicy(value: unknown): RegistryPolicy | null {
     lastUpdated: value.lastUpdated,
     yaml: value.yaml,
     policyPath: value.policyPath,
-    provider: value.provider as PolicyProvider,
+    provider,
+    origin,
     policyId: value.policyId,
     category: value.category,
     severity: value.severity as PolicySeverity,
