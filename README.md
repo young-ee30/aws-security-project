@@ -23,7 +23,7 @@
 
 ## 프로젝트 개요
 
-`aws-security-project`는 단순한 샘플 애플리케이션 저장소가 아니라, 애플리케이션 개발, 인프라 provisioning, 배포 자동화, 보안 점검, 운영 관제를 하나의 저장소 안에서 함께 다루는 DevSecOps 통합 실습 프로젝트입니다.
+`aws-devsecops-controlplane-terraform`는 단순한 샘플 애플리케이션 저장소가 아니라, 애플리케이션 개발, 인프라 provisioning, 배포 자동화, 보안 점검, 운영 관제를 하나의 저장소 안에서 함께 다루는 DevSecOps 통합 실습 프로젝트입니다.
 
 이 저장소에는 다음이 함께 들어 있습니다.
 
