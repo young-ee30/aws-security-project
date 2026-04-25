@@ -2,7 +2,7 @@
   <img src="controlplane/web/public/icon.svg" alt="aws-devsecops-controlplane-terraform" width="88" />
 </p>
 
-<h1 align="center">AWS Security Project</h1>
+<h1 align="center">aws-devsecops-controlplane-terraform</h1>
 
 <p align="center">
   GitHub Actions, AWS 보안 관제, Checkov 정책 자동화를 하나로 묶은 DevSecOps Control Plane
